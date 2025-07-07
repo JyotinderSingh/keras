@@ -834,6 +834,54 @@ class DenseTest(testing.TestCase):
         new_model.load_weights(temp_filepath)
         self.assertAllClose(model.predict(x), new_model.predict(x))
 
+    @pytest.mark.skipif(testing.tensorflow_uses_gpu(), reason="Segfault")
+    def test_quantize_int4_weights_only(self):
+        """Basic correctness / serialization test for int4 quantization."""
+        layer = layers.Dense(units=16)
+        layer.build((None, 8))
+
+        # Reference (float32) output.
+        x = np.random.random((2, 8))
+        y_float = layer(x)
+
+        # Quantize to int4 and validate kernel dtype / scale dtype.
+        layer.quantize("int4")
+        layer.quantize_activations = False
+        self.assertEqual(
+            backend.standardize_dtype(layer._kernel.dtype),
+            "int8",  # Packed int4 values are stored as int8
+        )
+        self.assertEqual(
+            backend.standardize_dtype(layer.kernel_scale.dtype),
+            layer.variable_dtype,
+        )
+
+        y_quantized = layer(x)
+        mse = ops.mean(ops.square(y_float - y_quantized))
+        self.assertLess(mse, 15e-4)  # Weak correctness check
+
+        # Check model save / load round-trip.
+        model = models.Sequential([layer])
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_int4_weights_only_model.keras"
+        )
+        model.save(temp_filepath)
+        new_model = saving.load_model(temp_filepath)
+        new_model.layers[0].quantize_activations = False
+        self.assertAllClose(model.predict(x), new_model.predict(x))
+
+        # Check weights-only save / load round-trip.
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_int4_weights_only_model.weights.h5"
+        )
+        model.save_weights(temp_filepath)
+        new_model = models.Sequential([layers.Dense(units=16)])
+        new_model.build((None, 8))
+        new_model.quantize("int4")
+        new_model.layers[0].quantize_activations = False
+        new_model.load_weights(temp_filepath)
+        self.assertAllClose(model.predict(x), new_model.predict(x))
+
     def test_quantize_int4_on_unbuilt_layer(self):
         layer = layers.Dense(units=2)
         with self.assertRaisesRegex(
@@ -882,6 +930,87 @@ class DenseTest(testing.TestCase):
     @pytest.mark.requires_trainable_backend
     @pytest.mark.skipif(testing.tensorflow_uses_gpu(), reason="Segfault")
     def test_quantize_int4_when_lora_enabled(self):
+        config = dict(units=16)
+        layer = layers.Dense(**config)
+        layer.build((None, 8))
+        layer.enable_lora(4)
+        layer.quantize("int4")
+        self.assertLen(layer.trainable_weights, 3)
+        self.assertLen(layer.non_trainable_weights, 2)
+        if backend.backend() == "torch":
+            self.assertLen(layer.torch_params, 5)
+
+        # Try calling fit()
+        init_lora_a_kernel_value = layer.lora_kernel_a.numpy()
+        init_lora_b_kernel_value = layer.lora_kernel_b.numpy()
+        x = np.random.random((64, 8))
+        y = np.random.random((64, 16))
+        model = models.Sequential([layer])
+        model.compile(optimizer="sgd", loss="mse")
+        model.fit(x, y, epochs=2)
+
+        final_lora_a_kernel_value = layer.lora_kernel_a.numpy()
+        final_lora_b_kernel_value = layer.lora_kernel_b.numpy()
+        diff_a = np.max(
+            np.abs(init_lora_a_kernel_value - final_lora_a_kernel_value)
+        )
+        diff_b = np.max(
+            np.abs(init_lora_b_kernel_value - final_lora_b_kernel_value)
+        )
+        self.assertGreater(diff_a, 0.0)
+        self.assertGreater(diff_b, 0.0)
+
+        # Save & reload full model
+        model = models.Sequential([layer])
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_int4_lora_model.keras"
+        )
+        model.save(temp_filepath)
+        new_model = saving.load_model(temp_filepath)
+        self.assertTrue(new_model.layers[0].lora_enabled)
+        self.assertAllClose(model.predict(x), new_model.predict(x), atol=0.5)
+
+        # Save & reload weights only
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_int4_lora_model.weights.h5"
+        )
+        model.save_weights(temp_filepath)
+        new_model = models.Sequential([layers.Dense(**config)])
+        new_model.build((None, 8))
+        new_model.quantize("int4")
+        new_model.load_weights(temp_filepath)
+        self.assertFalse(new_model.layers[0].lora_enabled)
+        self.assertAllClose(model.predict(x), new_model.predict(x), atol=0.5)
+
+        # Try loading a normal checkpoint into a lora model
+        new_model.save_weights(temp_filepath)
+        model.load_weights(temp_filepath)
+        self.assertAllClose(model.predict(x), new_model.predict(x), atol=0.5)
+
+        # Test export and TFSMLayer reloading when using tensorflow backend
+        if backend.backend() == "tensorflow":
+            import tensorflow as tf
+
+            temp_filepath = os.path.join(self.get_temp_dir(), "exported_model")
+            ref_input = tf.random.normal((2, 8))
+            ref_output = model(ref_input)
+            model.export(temp_filepath, format="tf_saved_model")
+            reloaded_layer = export.TFSMLayer(temp_filepath)
+            self.assertAllClose(
+                reloaded_layer(ref_input), ref_output, atol=1e-7
+            )
+            self.assertLen(reloaded_layer.weights, len(model.weights))
+            self.assertLen(
+                reloaded_layer.trainable_weights, len(model.trainable_weights)
+            )
+            self.assertLen(
+                reloaded_layer.non_trainable_weights,
+                len(model.non_trainable_weights),
+            )
+
+    @pytest.mark.requires_trainable_backend
+    @pytest.mark.skipif(testing.tensorflow_uses_gpu(), reason="Segfault")
+    def test_quantize_int4_weights_only_when_lora_enabled(self):
         config = dict(units=16)
         layer = layers.Dense(**config)
         layer.build((None, 8))

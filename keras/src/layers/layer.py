@@ -1265,6 +1265,14 @@ class Layer(BackendLayer, Operation, KerasSaveable):
         raise self._not_implemented_error(self.quantized_build)
 
     def quantize(self, mode, type_check=True):
+        """Quantize the layer.
+
+        Args:
+            mode: The quantization mode to use.
+            type_check: Whether to check the type of the layer.
+            quantize_activations: Whether to quantize the activations
+                during the forward pass.
+        """
         raise self._not_implemented_error(self.quantize)
 
     def _check_quantize_args(self, mode, compute_dtype):

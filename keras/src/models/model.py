@@ -434,6 +434,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         from keras.src.dtype_policies import QUANTIZATION_MODES
 
         type_check = kwargs.pop("type_check", True)
+
         if kwargs:
             raise ValueError(
                 "Unrecognized keyword arguments "
@@ -449,7 +450,10 @@ class Model(Trainer, base_trainer.Trainer, Layer):
             list_of_sublayers = list(layer._flatten_layers())
             if len(list_of_sublayers) == 1:  # leaves of the model
                 try:
-                    layer.quantize(mode, type_check=type_check)
+                    layer.quantize(
+                        mode,
+                        type_check=type_check,
+                    )
                     mode_changed = True
                 except NotImplementedError as e:
                     warnings.warn(str(e))

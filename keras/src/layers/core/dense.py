@@ -104,6 +104,7 @@ class Dense(Layer):
         self.lora_enabled = False
         self.input_spec = InputSpec(min_ndim=2)
         self.supports_masking = True
+        self.quantize_activations = True
 
     def build(self, input_shape):
         kernel_shape = (input_shape[-1], self.units)
@@ -359,10 +360,10 @@ class Dense(Layer):
         `ceil(input_dim/2)` because two int4 values are packed into a single
         int8 byte.
         """
-        # Per-channel int8 quantizer for the last axis (features).
-        self.inputs_quantizer = quantizers.AbsMaxQuantizer(
-            axis=-1,
-        )
+        if self.quantize_activations:
+            # Per-channel int8 quantizer for the last axis (features).
+            self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
+
         input_dim, output_dim = kernel_shape
         packed_rows = (input_dim + 1) // 2  # ceil for odd dims
 
@@ -501,7 +502,11 @@ class Dense(Layer):
                 inputs_grad = ops.matmul(upstream, ops.transpose(float_kernel))
                 return (inputs_grad, None, None)
 
-            inputs, inputs_scale = self.inputs_quantizer(inputs)
+            if self.quantize_activations:
+                inputs, inputs_scale = self.inputs_quantizer(inputs)
+            else:
+                inputs_scale = 1.0
+
             x = ops.matmul(inputs, unpacked_kernel)
             x = ops.cast(x, self.compute_dtype)
             x = ops.divide(x, ops.multiply(inputs_scale, kernel_scale))
