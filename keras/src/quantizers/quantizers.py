@@ -79,7 +79,10 @@ def abs_max_quantize(
         axis = standardize_axis_for_numpy(axis)
         scale = np.divide(
             value_range[1],
-            np.add(np.max(np.abs(inputs), axis=axis, keepdims=True), epsilon),
+            np.add(
+                np.percentile(np.abs(inputs), 99.99, axis=axis, keepdims=True),
+                epsilon,
+            ),
         )
         outputs = np.multiply(inputs, scale)
         outputs = np.clip(np.round(outputs), value_range[0], value_range[1])
