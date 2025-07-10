@@ -359,6 +359,7 @@ class Dense(Layer):
         `ceil(input_dim/2)` because two int4 values are packed into a single
         int8 byte.
         """
+        self._unpacked_kernel_cached = False
         # Per-channel int8 quantizer for the last axis (features).
         self.inputs_quantizer = quantizers.AbsMaxQuantizer(
             axis=-1,
@@ -487,29 +488,36 @@ class Dense(Layer):
             compute the gradient.
             """
 
-            unpacked_kernel = quantizers.unpack_int4(
-                kernel, self._orig_input_dim
-            )
-
             def grad_fn(*args, upstream=None):
                 if upstream is None:
                     (upstream,) = args
                 float_kernel = ops.divide(
-                    ops.cast(unpacked_kernel, dtype=self.compute_dtype),
+                    ops.cast(self._unpacked_kernel, dtype=self.compute_dtype),
                     kernel_scale,
                 )
                 inputs_grad = ops.matmul(upstream, ops.transpose(float_kernel))
                 return (inputs_grad, None, None)
 
             inputs, inputs_scale = self.inputs_quantizer(inputs)
-            x = ops.matmul(inputs, unpacked_kernel)
+            x = ops.matmul(inputs, self._unpacked_kernel)
             x = ops.cast(x, self.compute_dtype)
             x = ops.divide(x, ops.multiply(inputs_scale, kernel_scale))
             return x, grad_fn
 
+        # When `training` is False, we may be in a different `tf.function`
+        # context (e.g., `predict` vs `fit`). Re-unpack the kernel to avoid
+        # using a tensor from a different function graph.
+        if not training:
+            self._unpacked_kernel_cached = False
+
+        if not self._unpacked_kernel_cached:
+            self._unpacked_kernel = quantizers.unpack_int4(
+                self._kernel, self._orig_input_dim
+            )
+            self._unpacked_kernel_cached = True
         x = matmul_with_inputs_gradient(
             inputs,
-            ops.convert_to_tensor(self._kernel),
+            ops.convert_to_tensor(self._unpacked_kernel),
             ops.convert_to_tensor(self.kernel_scale),
         )
 
