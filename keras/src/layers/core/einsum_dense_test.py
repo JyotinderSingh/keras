@@ -1014,3 +1014,19 @@ class EinsumDenseTest(testing.TestCase):
         y_inference = layer(x, training=False)
         y_training = layer(x, training=True)
         self.assertAllClose(y_inference, y_training)
+
+    def test_quantize_int4_groupwise(self):
+        layer = layers.EinsumDense(
+            equation="ab,bc->ac",
+            output_shape=260,  # > 128 to test grouping
+            bias_axes="c",
+        )
+        layer.build((None, 16))
+        x = np.random.random((2, 16))
+        y_float = layer(x)
+        layer.quantize("int4")
+        y_quantized = layer(x)
+
+        self.assertEqual(y_quantized.shape, y_float.shape)
+        # A weak correctness test
+        self.assertLess(ops.mean(ops.square(y_float - y_quantized)), 0.001)

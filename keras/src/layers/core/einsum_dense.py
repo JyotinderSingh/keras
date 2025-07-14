@@ -827,28 +827,87 @@ class EinsumDense(Layer):
             kernel_scale = self._adjust_scale_for_quant(kernel_scale)
             del self._kernel
         elif mode == "int4":
-            # Quantize to int4 values (stored in int8 dtype, range [-8, 7])
-            kernel_value_int4, kernel_scale = quantizers.abs_max_quantize(
-                self._kernel,
-                axis=self._kernel_reduced_axes,
-                value_range=(-8, 7),
-                dtype="int8",
-                to_numpy=True,
-            )
-            kernel_scale = self._adjust_scale_for_quant(kernel_scale)
+            # Group-wise quantization (int4)
+            # Instead of a single scale per output channel or tensor, we
+            # compute one scale for each fixed-size group of output channels
+            # (columns). This provides a finer granularity while keeping the
+            # quantization metadata reasonably small.
+            #
+            # For now we hard-code the group size.
+            group_size = 128
 
-            # Pack along the first kernel-reduced axis.
+            # The kernel is a backend tensor.
+            kernel_tensor = self._kernel
+            orig_shape = kernel_tensor.shape
+            output_dim = orig_shape[-1]
+
+            # Compute number of groups (last group may be smaller).
+            num_groups = (output_dim + group_size - 1) // group_size
+
+            # Build a list of scales for each group and concatenate them.
+            scale_slices = []
+            for g in range(num_groups):
+                start = g * group_size
+                end = min((g + 1) * group_size, output_dim)
+                # Slice for the current group (all rows, [start:end] cols)
+                group_slice = kernel_tensor[..., start:end]
+                # Guard against empty slices (should not happen).
+                if ops.size(group_slice) == 0:
+                    continue
+                # Compute per-column (within group) max to get finer scaling
+                # Get absolute max per column (axis corresponding to output dim)
+                max_abs = ops.max(
+                    ops.abs(group_slice),
+                    axis=tuple(range(len(orig_shape) - 1)),
+                )
+                # Avoid division by zero.
+                scale_val = 7.0 / (max_abs + 1e-8)
+                scale_slices.append(scale_val)
+            per_column_scale = ops.concatenate(scale_slices, axis=0)
+
+            # Apply the per-column scales to obtain int4 values (stored in int8)
+            kernel_scaled = (
+                kernel_tensor * per_column_scale
+            )  # Broadcast on cols
+            kernel_value_int4 = ops.clip(ops.round(kernel_scaled), -8, 7)
+            kernel_value_int4 = ops.cast(kernel_value_int4, "int8")
+
+            # Pack along the first kernel-reduced axis
             pack_axis = self._kernel_reduced_axes[0]
             packed_kernel_value, _, _ = quantizers.pack_int4(
                 kernel_value_int4, axis=pack_axis
             )
             kernel_value = packed_kernel_value
             del self._kernel
+
+            # Prepare the scale tensor. Shape should match the un-transformed
+            # kernel layout *before* `_adjust_scale_for_quant`.
+            # For a typical dense kernel (in_dim, out_dim) and per-column
+            # reduction over axis 0, the raw scale shape is `(out_dim,)`.
+            kernel_scale_raw = ops.cast(per_column_scale, "float32")
+
+            # Reshape scale to have the same rank as the kernel so that
+            # subsequent transpose / expand / squeeze operations work.
+            kernel_rank = len(orig_shape)
+            reshape_shape = [1] * (kernel_rank - 1) + [output_dim]
+            kernel_scale_raw = ops.reshape(kernel_scale_raw, reshape_shape)
+
+            # Convert to tensor before the helper so that backend ops work.
+            kernel_scale_raw_tensor = ops.convert_to_tensor(kernel_scale_raw)
+            # Let the helper handle the necessary transpose/expand/squeeze so
+            # that the final shape matches `self.kernel_scale`.
+            kernel_scale = self._adjust_scale_for_quant(kernel_scale_raw_tensor)
+
         self.quantized_build(kernel_shape, mode)
 
         # Assign values to the newly created variables.
         if mode in ("int8", "int4"):
             self._kernel.assign(kernel_value)
+            # Ensure scale matches variable's shape via broadcasting
+            if mode == "int4":
+                kernel_scale = ops.broadcast_to(
+                    kernel_scale, self.kernel_scale.shape
+                )
             self.kernel_scale.assign(kernel_scale)
 
         # Set new dtype policy
