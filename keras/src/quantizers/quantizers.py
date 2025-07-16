@@ -63,40 +63,133 @@ class Quantizer:
         raise NotImplementedError(f"{self} does not implement get_config()")
 
 
+def standardize_axis_for_numpy(axis):
+    """Converts a potentially Keras-internal list to a numpy-compatible tuple."""
+    if isinstance(axis, int):
+        return axis
+    # Handles lists, TrackedLists, and tuples
+    return tuple(axis)
+
 @keras_export("keras.quantizers.abs_max_quantize")
 def abs_max_quantize(
     inputs,
     axis,
     value_range=(-127, 127),
     dtype="int8",
-    epsilon=backend.epsilon(),
+    epsilon=1e-6,
     to_numpy=False,
+    group_size=None,
 ):
+    """
+    Computes absolute maximum quantization for an input tensor.
+
+    Supports group-wise quantization and maintains separate,
+    optimized paths for numpy (CPU) and GPU execution.
+    """
+    # Path 1: Pure NumPy execution for weights on CPU
     if to_numpy:
-        # Save memory on the device using numpy
         original_dtype = backend.standardize_dtype(inputs.dtype)
-        inputs = ops.convert_to_numpy(inputs)
-        axis = standardize_axis_for_numpy(axis)
-        scale = np.divide(
-            value_range[1],
-            np.add(np.max(np.abs(inputs), axis=axis, keepdims=True), epsilon),
-        )
-        outputs = np.multiply(inputs, scale)
+        inputs_np = ops.convert_to_numpy(inputs)
+        
+        # Standard per-axis quantization (NumPy)
+        if not (group_size and group_size > 0):
+            safe_axis = standardize_axis_for_numpy(axis)
+            scale = np.divide(
+                value_range[1],
+                np.add(np.max(np.abs(inputs_np), axis=safe_axis, keepdims=True), epsilon),
+            )
+            outputs = np.multiply(inputs_np, scale)
+
+        # Group-wise quantization (NumPy)
+        else:
+            input_shape = inputs_np.shape
+            axes_to_group = standardize_axis_for_numpy(axis)
+            if isinstance(axes_to_group, int):
+                axes_to_group = (axes_to_group,)
+
+            paddings = [[0, 0] for _ in range(inputs_np.ndim)]
+            for ax in axes_to_group:
+                dim = input_shape[ax]
+                if dim % group_size != 0:
+                    paddings[ax][1] = group_size - (dim % group_size)
+            
+            padded_inputs = np.pad(inputs_np, paddings, mode='constant')
+            current_tensor = padded_inputs
+            reduction_axes, offset = [], 0
+
+            for ax_orig in sorted(axes_to_group):
+                ax = ax_orig + offset
+                shape = list(current_tensor.shape)
+                dim = shape.pop(ax)
+                new_shape = shape[:ax] + [dim // group_size, group_size] + shape[ax:]
+                current_tensor = current_tensor.reshape(new_shape)
+                reduction_axes.append(ax + 1)
+                offset += 1
+            
+            abs_max = np.max(np.abs(current_tensor), axis=tuple(reduction_axes), keepdims=True)
+            scale = np.divide(value_range[1], np.add(abs_max, epsilon))
+            quantized_grouped = np.multiply(current_tensor, scale)
+            quantized_padded = quantized_grouped.reshape(padded_inputs.shape)
+            slicer = tuple(slice(0, dim) for dim in input_shape)
+            outputs = quantized_padded[slicer]
+            scale = np.squeeze(scale, axis=tuple(reduction_axes))
+
         outputs = np.clip(np.round(outputs), value_range[0], value_range[1])
         outputs = outputs.astype(dtype)
         return ops.convert_to_tensor(outputs), ops.convert_to_tensor(
             scale, dtype=original_dtype
         )
 
+    # Path 2: Backend-agnostic execution for activations (GPU, dynamic shapes)
     inputs = ops.convert_to_tensor(inputs)
-    scale = ops.divide(
-        value_range[1],
-        ops.add(ops.max(ops.abs(inputs), axis=axis, keepdims=True), epsilon),
-    )
-    scale = ops.cast(scale, backend.standardize_dtype(inputs.dtype))
-    outputs = ops.multiply(inputs, scale)
-    outputs = ops.clip(ops.round(outputs), value_range[0], value_range[1])
-    outputs = ops.cast(outputs, dtype)
+
+    # Standard per-axis quantization (Ops)
+    if not (group_size and group_size > 0):
+        scale = ops.divide(
+            value_range[1],
+            ops.add(ops.max(ops.abs(inputs), axis=axis, keepdims=True), epsilon),
+        )
+        outputs = ops.multiply(inputs, scale)
+
+    # Group-wise quantization (Ops)
+    else:
+        original_shape = ops.shape(inputs)
+        axes_to_group = axis
+        if isinstance(axes_to_group, int):
+            axes_to_group = (axes_to_group,)
+
+        paddings = [[0, 0] for _ in range(len(original_shape))]
+        for ax in axes_to_group:
+            dim = original_shape[ax]
+            if dim % group_size != 0:
+                paddings[ax][1] = group_size - (dim % group_size)
+        
+        padded_x = ops.pad(inputs, paddings, mode='constant')
+        current_tensor, offset, reduction_axes = padded_x, 0, []
+
+        for ax_orig in sorted(axes_to_group):
+            ax = ax_orig + offset
+            shape_tensor = ops.array(ops.shape(current_tensor), dtype="int32")
+            dim_to_group = shape_tensor[ax]
+            num_groups = dim_to_group // group_size
+            
+            group_shape_tensor = ops.array([num_groups, group_size], dtype="int32")
+            new_shape = ops.concatenate([
+                shape_tensor[:ax], group_shape_tensor, shape_tensor[ax+1:]
+            ])
+            current_tensor = ops.reshape(current_tensor, new_shape)
+            reduction_axes.append(ax + 1)
+            offset += 1
+        
+        abs_max = ops.max(ops.abs(current_tensor), axis=tuple(reduction_axes), keepdims=True)
+        scale = ops.divide(value_range[1], ops.add(abs_max, epsilon))
+        quantized_grouped = ops.multiply(current_tensor, scale)
+        quantized_padded = ops.reshape(quantized_grouped, ops.shape(padded_x))
+        outputs = ops.slice(quantized_padded, [0] * len(original_shape), original_shape)
+        scale = ops.squeeze(scale, axis=tuple(reduction_axes))
+
+    outputs = ops.cast(ops.round(outputs), dtype)
+    scale = ops.cast(scale, inputs.dtype)
     return outputs, scale
 
 

@@ -131,6 +131,7 @@ class EinsumDense(Layer):
         bias_constraint=None,
         lora_rank=None,
         lora_alpha=None,
+        group_size=256,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -150,6 +151,7 @@ class EinsumDense(Layer):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank
         self.lora_enabled = False
+        self.group_size = group_size
 
     def build(self, input_shape):
         shape_data = _analyze_einsum_string(
@@ -768,7 +770,10 @@ class EinsumDense(Layer):
         if mode == "int8":
             # Quantize `self._kernel` to int8 and compute corresponding scale
             kernel_value, kernel_scale = quantizers.abs_max_quantize(
-                self._kernel, axis=self._kernel_reduced_axes, to_numpy=True
+                self._kernel,
+                axis=self._kernel_reduced_axes,
+                to_numpy=True,
+                group_size=self.group_size,
             )
             kernel_scale = self._adjust_scale_for_quant(kernel_scale, "kernel")
             del self._kernel
@@ -780,6 +785,7 @@ class EinsumDense(Layer):
                 value_range=(-8, 7),
                 dtype="int8",
                 to_numpy=True,
+                group_size=self.group_size,
             )
             kernel_scale = self._adjust_scale_for_quant(kernel_scale, "kernel")
 
@@ -803,21 +809,22 @@ class EinsumDense(Layer):
             self.dtype_policy = policy
 
     def _get_kernel_scale_shape(self, kernel_shape):
-        """Get the shape of the kernel scale tensor.
-
-        The kernel scale tensor is used to scale the kernel tensor.
-        The shape of the kernel scale tensor is the same as the shape of the
-        kernel tensor, but with the reduced axes set to 1 and the transpose
-        axes set to the original axes
-
-        Args:
-            kernel_shape: The shape of the kernel tensor.
-
-        Returns:
-            The shape of the kernel scale tensor.
-        """
+        """Get the shape of the kernel scale tensor."""
         kernel_scale_shape = np.array(kernel_shape)
-        kernel_scale_shape[self._kernel_reduced_axes] = 1
+
+        # Adjust shape for group-wise quantization if group_size is specified
+        if self.group_size and self.group_size > 0:
+            for axis in self._kernel_reduced_axes:
+                dim = kernel_shape[axis]
+                # The dimension of the scale tensor is the number of groups.
+                # np.ceil correctly calculates this for both divisible and
+                # non-divisible cases (e.g., ceil(130 / 64) = 3 groups).
+                num_groups = ops.ceil(dim / self.group_size)
+                kernel_scale_shape[axis] = num_groups
+        else:
+            # Original behavior: reduce the axes to 1
+            kernel_scale_shape[self._kernel_reduced_axes] = 1
+
         kernel_scale_shape = kernel_scale_shape[self._kernel_transpose_axes]
         kernel_scale_shape = kernel_scale_shape.tolist()
         for a in sorted(self._kernel_expand_axes):
@@ -902,6 +909,7 @@ class EinsumDense(Layer):
                 value_range=(-8, 7),
                 dtype="int8",
                 to_numpy=True,
+                group_size=self.group_size,
             )
             # Pack back to int4
             new_kernel, _, _ = quantizers.pack_int4(
@@ -912,6 +920,7 @@ class EinsumDense(Layer):
                 merged_kernel_fp,
                 axis=self._kernel_reduced_axes,
                 to_numpy=True,
+                group_size=self.group_size,
             )
 
         # Adjust the new scale tensor to the required layout.

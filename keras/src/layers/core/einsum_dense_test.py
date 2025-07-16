@@ -1014,3 +1014,45 @@ class EinsumDenseTest(testing.TestCase):
         y_inference = layer(x, training=False)
         y_training = layer(x, training=True)
         self.assertAllClose(y_inference, y_training)
+
+    @parameterized.named_parameters(
+        ("int8", "int8"),
+        ("float8", "float8"),
+        ("int4", "int4"),
+    )
+    def test_quantize_group_size(self, mode):
+        """Tests quantization with weights large enough to be grouped."""
+        config = dict(
+            equation="ab,bcd->acd",
+            output_shape=(800, 96),
+            bias_axes="d",
+            group_size=256,
+        )
+        layer = layers.EinsumDense(**config)
+        layer.build((None, 3))
+        layer.quantize(mode)
+
+        x = np.random.random((64, 3))
+        y = np.random.random((64, 800, 96))
+        model = models.Sequential([layer])
+        model.compile(optimizer="sgd", loss="mse")
+        model.fit(x, y, epochs=2)
+
+        # Try saving and reloading the model
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_lora_model.keras"
+        )
+        model.save(temp_filepath)
+        new_model = saving.load_model(temp_filepath)
+        self.assertAllClose(model.predict(x), new_model.predict(x))
+        
+        # Try saving and reloading the model's weights only
+        temp_filepath = os.path.join(
+            self.get_temp_dir(), "quantized_lora_model.weights.h5"
+        )
+        model.save_weights(temp_filepath)
+        new_model = models.Sequential([layers.EinsumDense(**config)])
+        new_model.build((None, 3))
+        new_model.quantize(mode)
+        new_model.load_weights(temp_filepath)
+        self.assertAllClose(model.predict(x), new_model.predict(x))
