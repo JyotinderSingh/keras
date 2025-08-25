@@ -1,0 +1,747 @@
+diff --git a/keras/src/dtype_policies/dtype_policy.py b/keras/src/dtype_policies/dtype_policy.py
+index 975b6a293..714f6b971 100644
+--- a/keras/src/dtype_policies/dtype_policy.py
++++ b/keras/src/dtype_policies/dtype_policy.py
+@@ -83,6 +83,8 @@ class DTypePolicy:
+             return "float16", "float32"
+         elif name == "mixed_bfloat16":
+             return "bfloat16", "float32"
++        elif name == "gptq":
++            return "int8", "int8"
+         try:
+             dtype = backend.standardize_dtype(name)
+             return dtype, dtype
+@@ -350,7 +352,11 @@ def _get_quantized_dtype_policy_by_str(policy):
+             f"Received: policy={policy}"
+         )
+     mode, source_name = split_name
+-    if policy.startswith("int8") or policy.startswith("int4"):
++    if (
++        policy.startswith("int8")
++        or policy.startswith("int4")
++        or policy.startswith("gptq")
++    ):
+         return QuantizedDTypePolicy(mode, source_name)
+     elif policy.startswith("float8"):
+         return QuantizedFloat8DTypePolicy(mode, source_name)
+diff --git a/keras/src/layers/core/dense.py b/keras/src/layers/core/dense.py
+index 317d6bbd2..2da768760 100644
+--- a/keras/src/layers/core/dense.py
++++ b/keras/src/layers/core/dense.py
+@@ -109,7 +109,7 @@ class Dense(Layer):
+         kernel_shape = (input_shape[-1], self.units)
+         if self.quantization_mode:
+             self.quantized_build(kernel_shape, mode=self.quantization_mode)
+-        if self.quantization_mode not in ("int8", "int4"):
++        if self.quantization_mode not in ("int8", "int4", "gptq"):
+             # If the layer is quantized to int8 or int4, `self._kernel` will be
+             # added in `self._int8_build` or `_int4_build`. Therefore, we skip
+             # it here.
+@@ -332,10 +332,36 @@ class Dense(Layer):
+             self._int4_build(kernel_shape)
+         elif mode == "float8":
+             self._float8_build()
++        elif mode == "gptq":
++            self._gptq_build(kernel_shape)
+         else:
+             raise self._quantization_mode_error(mode)
+         self._is_quantized = True
+ 
++    def _gptq_build(self, kernel_shape):
++        self._kernel = self.add_weight(
++            name="kernel",
++            shape=kernel_shape,
++            # TODO: choose this based on weight bits
++            dtype="int8",
++            initializer="zeros",
++            trainable=False,
++        )
++        self.kernel_scale = self.add_weight(
++            name="scale",
++            shape=(kernel_shape),
++            dtype="float32",
++            initializer="zeros",
++            trainable=False,
++        )
++        self.zero_point = self.add_weight(
++            name="zero_point",
++            shape=(kernel_shape),
++            dtype="float32",
++            initializer="zeros",
++            trainable=False,
++        )
++
+     def _int8_build(self, kernel_shape):
+         self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
+         self._kernel = self.add_weight(
+@@ -526,6 +552,13 @@ class Dense(Layer):
+             x = self.activation(x)
+         return x
+ 
++    def _gptq_call(self, inputs, training=None):
++        del training
++        x = ops.matmul(inputs, ops.subtract(self._kernel, self.zero_point))
++        x = ops.cast(x, self.compute_dtype)
++        x = ops.matmul(x, self.kernel_scale)
++        return x
++
+     def _float8_call(self, inputs, training=None):
+         if self.lora_enabled:
+             raise NotImplementedError(
+@@ -654,6 +687,9 @@ class Dense(Layer):
+             self.kernel_scale.assign(kernel_scale)
+         elif mode == "float8":
+             self.quantized_build(kernel_shape, mode)
++        elif mode == "gptq":
++            del self._kernel
++            self.quantized_build(kernel_shape, mode)
+         else:
+             raise self._quantization_mode_error(mode)
+ 
+diff --git a/keras/src/layers/core/einsum_dense.py b/keras/src/layers/core/einsum_dense.py
+index 39100486c..87b3dfc05 100644
+--- a/keras/src/layers/core/einsum_dense.py
++++ b/keras/src/layers/core/einsum_dense.py
+@@ -167,7 +167,7 @@ class EinsumDense(Layer):
+         # quantized to int8 or int4, because `quantized_build` has created the
+         # appropriate kernel variable. For other modes (e.g., float8 or no
+         # quantization), we still need the floating-point kernel.
+-        if self.quantization_mode not in ("int8", "int4"):
++        if self.quantization_mode not in ("int8", "int4", "gptq"):
+             # If the layer is quantized to int8, `self._kernel` will be added
+             # in `self._int8_build`. Therefore, we skip it here.
+             self._kernel = self.add_weight(
+@@ -396,6 +396,8 @@ class EinsumDense(Layer):
+             self._int4_build(kernel_shape)
+         elif mode == "float8":
+             self._float8_build()
++        elif mode == "gptq":
++            self._gptq_build(kernel_shape)
+         else:
+             raise self._quantization_mode_error(mode)
+         self._is_quantized = True
+@@ -420,6 +422,31 @@ class EinsumDense(Layer):
+             trainable=False,
+         )
+ 
++    def _gptq_build(self, kernel_shape):
++        self._set_quantization_info()
++        self._kernel = self.add_weight(
++            name="kernel",
++            shape=kernel_shape,
++            initializer="zeros",
++            dtype="int8",
++            trainable=False,
++        )
++        # Get the correct, broadcastable shape for scale and zero-point
++        scale_shape = self._get_kernel_scale_shape(kernel_shape)
++
++        self.kernel_scale = self.add_weight(
++            name="kernel_scale",
++            shape=scale_shape,
++            initializer="ones",
++            trainable=False,
++        )
++        self.zero_point = self.add_weight(
++            name="zero_point",
++            shape=scale_shape,
++            initializer="zeros",
++            trainable=False,
++        )
++
+     def _int4_build(self, kernel_shape):
+         """Build variables for int4 quantization.
+ 
+@@ -580,6 +607,21 @@ class EinsumDense(Layer):
+             x = self.activation(x)
+         return x
+ 
++    def _gptq_call(self, inputs, training=None):
++        zero_point = self._adjust_scale_for_dequant(self.zero_point)
++
++        dequantized_kernel = ops.subtract(self._kernel, zero_point)
++
++        x = ops.einsum(self.equation, inputs, dequantized_kernel)
++        x = ops.cast(x, self.compute_dtype)
++        x = ops.multiply(x, self.kernel_scale)
++
++        if self.bias is not None:
++            x = ops.add(x, self.bias)
++        if self.activation is not None:
++            x = self.activation(x)
++        return x
++
+     def _int4_call(self, inputs, training=None):
+         """Forward pass for int4 quantized `EinsumDense`."""
+ 
+@@ -762,7 +804,7 @@ class EinsumDense(Layer):
+             raise self._not_implemented_error(self.quantize)
+ 
+         kernel_shape = self._kernel.shape
+-        if mode in ("int8", "int4"):
++        if mode in ("int8", "int4", "gptq"):
+             self._set_quantization_info()
+ 
+         if mode == "int8":
+@@ -790,6 +832,8 @@ class EinsumDense(Layer):
+             )
+             kernel_value = packed_kernel_value
+             del self._kernel
++        elif mode == "gptq":
++            del self._kernel
+         self.quantized_build(kernel_shape, mode)
+ 
+         # Assign values to the newly created variables.
+@@ -1239,7 +1283,10 @@ def _analyze_quantization_info(equation, input_shape):
+             input_spec = split_string.group(1)
+             weight_spec = split_string.group(2)
+             output_spec = split_string.group(3)
+-            elided = len(input_shape) - len(input_spec)
++            input_shape_tuple = input_shape
++            if type(input_shape) is int:
++                input_shape_tuple = (input_shape,)
++            elided = len(input_shape_tuple) - len(input_spec)
+             possible_labels = sorted(
+                 set(possible_labels)
+                 - set(input_spec)
+diff --git a/keras/src/layers/layer.py b/keras/src/layers/layer.py
+index 3c4ae8ab0..1b1ad6fdb 100644
+--- a/keras/src/layers/layer.py
++++ b/keras/src/layers/layer.py
+@@ -1318,6 +1318,8 @@ class Layer(BackendLayer, Operation):
+             return self._float8_call(*args, **kwargs)
+         elif self.quantization_mode == "int4":
+             return self._int4_call(*args, **kwargs)
++        elif self.quantization_mode == "gptq":
++            return self._gptq_call(*args, **kwargs)
+         else:
+             raise self._quantization_mode_error(self.quantization_mode)
+ 
+@@ -1330,6 +1332,9 @@ class Layer(BackendLayer, Operation):
+     def _float8_call(self, *args, **kwargs):
+         raise self._not_implemented_error(self._float8_call)
+ 
++    def _gptq_call(self, *args, **kwargs):
++        raise self._not_implemented_error(self._gptq_call)
++
+     def _not_implemented_error(self, attr, msg=None):
+         if callable(attr):
+             attr_name = attr.__name__
+diff --git a/keras/src/models/model_test.py b/keras/src/models/model_test.py
+index 0fea1336d..5836de5b9 100644
+--- a/keras/src/models/model_test.py
++++ b/keras/src/models/model_test.py
+@@ -1386,9 +1386,8 @@ quantize_test_cases = [
+ 
+ 
+ @pytest.mark.requires_trainable_backend
+-class TestModelQuantization:
++class TestModelQuantization(testing.TestCase):
+     def _run_gptq_test_on_dataset(self, dataset, **config_kwargs):
+-        """Helper function to run a full GPTQ quantization test."""
+         if isinstance(dataset, Callable):
+             dataset = dataset()
+         model = get_model_with_dense_attention()
+@@ -1416,7 +1415,7 @@ class TestModelQuantization:
+         }
+ 
+         target_layer = model.layers[2].ffn.layers[0]
+-        assert target_layer is not None
++        self.assertIsNotNone(target_layer)
+         original_weights = np.copy(target_layer.kernel)
+ 
+         final_config = {**base_config, **config_kwargs}
+@@ -1426,40 +1425,51 @@ class TestModelQuantization:
+ 
+         quantized_weights = target_layer.kernel
+ 
+-        assert not np.allclose(original_weights, quantized_weights)
++        self.assertNotAllClose(original_weights, quantized_weights)
+ 
+         dummy_sample = rng.integers(
+             low=0, high=VOCAB_SIZE, size=(1, SEQUENCE_LENGTH)
+         )
+         _ = model.predict(dummy_sample)
+ 
+-    @pytest.mark.parametrize("dataset", DATASETS.values(), ids=DATASETS.keys())
+-    @pytest.mark.parametrize("config", CONFIGS.values(), ids=CONFIGS.keys())
++    @parameterized.named_parameters(
++        *[
++            dict(
++                testcase_name=f"{dname}_{cname}",
++                dataset=dataset,
++                config=config,
++            )
++            for dname, dataset in DATASETS.items()
++            for cname, config in CONFIGS.items()
++        ]
++    )
+     def test_quantize_gptq_combinations(self, dataset, config):
+-        """Runs GPTQ tests across different datasets and config variations."""
+         self._run_gptq_test_on_dataset(dataset, **config)
+ 
+-    @pytest.mark.parametrize(
+-        "mode, config, expected_exception, match_message, test_id",
+-        quantize_test_cases,
+-        ids=[case[-1] for case in quantize_test_cases],
++    @parameterized.named_parameters(
++        *[
++            dict(
++                testcase_name=test_id,
++                mode=mode,
++                config=config,
++                expected_exception=expected_exception,
++                match_message=match_message,
++            )
++            for (
++                mode,
++                config,
++                expected_exception,
++                match_message,
++                test_id,
++            ) in quantize_test_cases
++        ]
+     )
+     def test_quantize_scenarios(
+-        self, mode, config, expected_exception, match_message, test_id
++        self, mode, config, expected_exception, match_message
+     ):
+-        """
+-        Tests various scenarios for the model.quantize() method, including
+-        error handling and valid calls.
+-        """
+         model = _get_simple_model()
+-
+         if expected_exception:
+-            # Test for cases where an error is expected
+-            with pytest.raises(expected_exception, match=match_message):
++            with self.assertRaisesRegex(expected_exception, match_message):
+                 model.quantize(mode, config=config)
+         else:
+-            # Test for valid cases where no error should occur
+-            try:
+-                model.quantize(mode, config=config)
+-            except (ValueError, TypeError) as e:
+-                pytest.fail(f"Test case '{test_id}' failed unexpectedly: {e}")
++            model.quantize(mode, config=config)
+diff --git a/keras/src/quantizers/gptq.py b/keras/src/quantizers/gptq.py
+index eac2c3db7..fcc1b2eb5 100644
+--- a/keras/src/quantizers/gptq.py
++++ b/keras/src/quantizers/gptq.py
+@@ -1,7 +1,8 @@
++import types
++
+ from keras.src import ops
+ from keras.src.layers import Dense
+ from keras.src.layers import EinsumDense
+-from keras.src.quantizers.gptq_quant import dequantize
+ 
+ 
+ class GPTQ:
+@@ -47,20 +48,24 @@ class GPTQ:
+ 
+             # Create a temporary object that holds a reshaped
+             # 2D version of the kernel.
+-            self.layer = type(
+-                "temp",
+-                (object,),
+-                {
+-                    "kernel": ops.reshape(
+-                        layer.kernel, (self.rows, self.columns)
+-                    ),
+-                    "bias": layer.bias,
+-                },
+-            )()
++            self.layer = types.SimpleNamespace(
++                kernel=ops.reshape(layer.kernel, (self.rows, self.columns)),
++                bias=layer.bias,
++            )
+ 
+         else:
+             # Raise an error if the layer is not supported.
+             raise TypeError(f"Unsupported layer type for GPTQ: {type(layer)}")
++
++        # Make this cleaner
++        if isinstance(layer, EinsumDense) and layer.kernel.ndim >= 2:
++            if not layer.built:
++                raise ValueError(
++                    "The EinsumDense layer must be built before applying GPTQ. "
++                )
++            # This populates self.original_layer with attributes like
++            # `_kernel_reduced_axes`, `_kernel_transpose_axes`, etc.
++            layer._set_quantization_info()
+         self.hessian = ops.zeros((self.rows, self.rows), dtype="float32")
+ 
+     def update_hessian_with_batch(self, input_batch):
+@@ -181,56 +186,68 @@ class GPTQ:
+                 based
+                 on their activation's second-order information.
+         """
++        self.original_layer.quantize("gptq")
+ 
+         weights_matrix = ops.transpose(ops.cast(self.layer.kernel, "float32"))
+         hessian_matrix = ops.cast(self.hessian, "float32")
+ 
+         if activation_order:
++            # Sort indices by negative Hessian diagonal (descending importance)
+             permutation = ops.argsort(
+                 ops.negative(ops.diagonal(hessian_matrix))
+             )
++
++            # Apply permutation to weights and Hessian
+             weights_matrix = ops.take(weights_matrix, permutation, axis=1)
+-            hessian_matrix = ops.take(
+-                ops.take(hessian_matrix, permutation, axis=0),
+-                permutation,
+-                axis=1,
+-            )
++            hessian_matrix = ops.take(hessian_matrix, permutation, axis=0)
++            hessian_matrix = ops.take(hessian_matrix, permutation, axis=1)
++
++            # Store inverse permutation for later restoration
+             inverse_permutation = ops.argsort(permutation)
+ 
+         # Dampen the Hessian for Stability
+         hessian_diagonal = ops.diagonal(hessian_matrix)
++
++        # Detect zero entries on the diagonal
+         dead_diagonal = ops.equal(hessian_diagonal, 0.0)
++
++        # Replace zeros in the diagonal with ones
+         hessian_diagonal = ops.where(dead_diagonal, 1.0, hessian_diagonal)
+-        hessian_matrix = ops.add(
+-            hessian_matrix,
+-            ops.diag(
+-                ops.where(dead_diagonal, 1.0, ops.zeros_like(hessian_diagonal))
+-            ),
++
++        # Update Hessian diagonal in-place by adding stabilizing values
++        stabilizer = ops.where(
++            dead_diagonal, 1.0, ops.zeros_like(hessian_diagonal)
+         )
++        hessian_matrix = ops.add(hessian_matrix, ops.diag(stabilizer))
+ 
+-        # Add dampening factor to the Hessian diagonal
++        # Scale damping by the average diagonal value
+         damping_factor = ops.multiply(
+             hessian_damping, ops.mean(hessian_diagonal)
+         )
++
++        # Add damping to the diagonal
+         hessian_diagonal = ops.add(hessian_diagonal, damping_factor)
+-        hessian_matrix = ops.add(
+-            ops.subtract(
+-                hessian_matrix, ops.diag(ops.diagonal(hessian_matrix))
+-            ),
+-            ops.diag(hessian_diagonal),
++
++        # Replace the old diagonal in the Hessian with the damped version
++        hessian_off_diag = ops.subtract(
++            hessian_matrix, ops.diag(ops.diagonal(hessian_matrix))
+         )
++        hessian_matrix = ops.add(hessian_off_diag, ops.diag(hessian_diagonal))
+ 
+         # Compute the inverse Hessian, which is used for error correction
+         inverse_hessian = ops.linalg.inv(hessian_matrix)
+-        quantized_weights = ops.zeros_like(weights_matrix)
++
++        # Initialize tensors for integer weights and parameters
++        quantized_weights_int = ops.zeros_like(weights_matrix, dtype="int8")
++        scales = ops.zeros_like(weights_matrix)
++        zeros = ops.zeros_like(weights_matrix)
+ 
+         for block_start in range(0, self.rows, blocksize):
+             block_end = min(ops.add(block_start, blocksize), self.rows)
+             block_size = ops.subtract(block_end, block_start)
+-            # Extract the current block of weights and its corresponding
+-            # Hessian
++
++            # Extract current weight block and its inverse-Hessian submatrix
+             block_weights = weights_matrix[:, block_start:block_end]
+-            block_quantized = ops.zeros_like(block_weights)
+             block_errors = ops.zeros_like(block_weights)
+             block_inverse_hessian = inverse_hessian[
+                 block_start:block_end, block_start:block_end
+@@ -238,44 +255,68 @@ class GPTQ:
+ 
+             # Process one column at a time within the block
+             for col_idx in range(block_size):
++                # Absolute/relative indices
++                abs_col = ops.add(block_start, col_idx)
++
++                # Current column and the corresponding (i,i) of inv(H)
+                 weight_column = block_weights[:, col_idx]
+-                diagonal_element = block_inverse_hessian[col_idx, col_idx]
++                invH_ii = block_inverse_hessian[col_idx, col_idx]
+ 
++                # Find quantization params (scale and zero-point)
+                 if group_size != -1:
+-                    if ops.mod(ops.add(block_start, col_idx), group_size) == 0:
+-                        self.quantizer.find_params(
+-                            weights_matrix[
+-                                :,
+-                                (ops.add(block_start, col_idx)) : (
+-                                    ops.add(
+-                                        ops.add(block_start, col_idx),
+-                                        group_size,
+-                                    )
+-                                ),
+-                            ],
+-                            weight=True,
+-                        )
++                    # Start a new group when we're at a group boundary
++                    if ops.mod(abs_col, group_size) == 0:
++                        group_start = abs_col
++                        group_end = ops.add(group_start, group_size)
++                        group_slice = weights_matrix[:, group_start:group_end]
++                        self.quantizer.find_params(group_slice, weight=True)
+                 else:
++                    # Per-column params
+                     self.quantizer.find_params(
+                         ops.expand_dims(weight_column, 1), weight=True
+                     )
+ 
+-                # Quantize the current weight column
+-                quantized_column = dequantize(
++                # Quantize the current column and store the results
++                quantized_column = self.quantizer.quantize(
+                     ops.expand_dims(weight_column, 1),
+                     self.quantizer.scale,
+                     self.quantizer.zero,
+                     self.quantizer.maxq,
+                 )[:, 0]
+ 
+-                block_quantized = ops.slice_update(
+-                    block_quantized,
+-                    (0, col_idx),
+-                    ops.expand_dims(quantized_column, axis=1),
++                # Write integer weights
++                quantized_weights_int = ops.slice_update(
++                    quantized_weights_int,
++                    (0, abs_col),
++                    ops.expand_dims(
++                        # TODO: use the appropriate dtype.
++                        ops.cast(quantized_column, "int8"),
++                        axis=1,
++                    ),
++                )
++
++                # Store scales and zeros
++                scale_col = ops.expand_dims(
++                    ops.cast(self.quantizer.scale, "float32")[0, :], 1
+                 )
++                zero_col = ops.expand_dims(
++                    ops.cast(self.quantizer.zero, "float32")[0, :], 1
++                )
++
++                scales = ops.slice_update(scales, (0, abs_col), scale_col)
++                zeros = ops.slice_update(zeros, (0, abs_col), zero_col)
++
++                # Dequantize back to float32 for error correction.
++                dequantized_column = self.quantizer.dequantize(
++                    ops.expand_dims(weight_column, 1),
++                    self.quantizer.scale,
++                    self.quantizer.zero,
++                    self.quantizer.maxq,
++                )[:, 0]
++
+                 quantization_error = ops.divide(
+-                    ops.subtract(weight_column, quantized_column),
+-                    diagonal_element,
++                    ops.subtract(weight_column, dequantized_column),
++                    invH_ii,
+                 )
+                 block_errors = ops.slice_update(
+                     block_errors,
+@@ -283,68 +324,94 @@ class GPTQ:
+                     ops.expand_dims(quantization_error, axis=1),
+                 )
+ 
+-                if ops.less(col_idx, ops.subtract(block_size, 1)):
++                # Propagate error within the block to future columns
++                has_future = ops.less(col_idx, ops.subtract(block_size, 1))
++                if has_future:
++                    next_start = ops.add(col_idx, 1)
++
++                    # rank-1 update: q_error * invH[i, i+1:]
++                    invH_row_future = block_inverse_hessian[
++                        col_idx, next_start:
++                    ]
++
+                     error_update = ops.matmul(
+-                        ops.expand_dims(quantization_error, 1),
+-                        ops.expand_dims(
+-                            block_inverse_hessian[
+-                                col_idx, ops.add(col_idx, 1) :
+-                            ],
+-                            0,
+-                        ),
+-                    )
++                        ops.expand_dims(quantization_error, 1),  # (M, 1)
++                        ops.expand_dims(invH_row_future, 0),  # (1, K)
++                    )  # -> (M, K)
+ 
+                     # Efficiently update the remaining part of the
+                     # block_weights tensor.
+-                    slice_to_update = block_weights[:, ops.add(col_idx, 1) :]
++                    # block_weights[:, i+1:] -= error_update
++                    slice_to_update = block_weights[:, next_start:]
+                     updated_slice = ops.subtract(slice_to_update, error_update)
+                     block_weights = ops.slice_update(
+-                        block_weights, (0, ops.add(col_idx, 1)), updated_slice
++                        block_weights, (0, next_start), updated_slice
+                     )
+ 
+-            # Update the full quantized matrix with the processed block
+-            quantized_weights = ops.concatenate(
+-                [
+-                    quantized_weights[:, :block_start],
+-                    block_quantized,
+-                    quantized_weights[:, block_end:],
+-                ],
+-                axis=1,
+-            )
+-
++            # Propagate accumulated block errors to the remaining columns
++            # (to the right of the block)
+             if block_end < self.rows:
+-                total_error_update = ops.matmul(
+-                    block_errors,
+-                    inverse_hessian[block_start:block_end, block_end:],
+-                )
+-                weights_matrix = ops.concatenate(
+-                    [
+-                        weights_matrix[:, :block_end],
+-                        ops.subtract(
+-                            weights_matrix[:, block_end:], total_error_update
+-                        ),
+-                    ],
+-                    axis=1,
++                # (B, R)
++                right_invH = inverse_hessian[block_start:block_end, block_end:]
++                # (M, R)
++                total_error_update = ops.matmul(block_errors, right_invH)
++
++                # weights_matrix[:, block_end:] -= total_error_update
++                left = weights_matrix[:, :block_end]
++                right = ops.subtract(
++                    weights_matrix[:, block_end:], total_error_update
+                 )
++                weights_matrix = ops.concatenate([left, right], axis=1)
+ 
+         if activation_order:
+-            quantized_weights = ops.take(
+-                quantized_weights, inverse_permutation, axis=1
++            quantized_weights_int = ops.take(
++                quantized_weights_int, inverse_permutation, axis=1
+             )
++            scales = ops.take(scales, inverse_permutation, axis=1)
++            zeros = ops.take(zeros, inverse_permutation, axis=1)
+ 
+-        quantized_weights = ops.transpose(quantized_weights)
++        # Transpose back to original layout [in_features, out_features]
++        quantized_kernel = ops.transpose(quantized_weights_int)
++        scale = ops.transpose(scales)
++        zero_point = ops.transpose(zeros)
+ 
+         if isinstance(self.original_layer, EinsumDense):
+-            quantized_weights = ops.reshape(
+-                quantized_weights, self.kernel_shape
++            # 1. Reshape the quantized kernel and dense params back to the
++            #    original N-D shape
++            quantized_kernel = ops.reshape(quantized_kernel, self.kernel_shape)
++            scale = ops.reshape(scale, self.kernel_shape)
++            zero_point = ops.reshape(zero_point, self.kernel_shape)
++
++            # 2. CRUCIAL STEP: Reduce the dense scale/zero_point tensors to
++            #    get the per-channel/per-group values. We use the
++            #    `_kernel_reduced_axes` identified by `_set_quantization_info`.
++            #    Using mean is appropriate since values are repeated for
++            #    group-wise.
++            scale = ops.mean(
++                scale,
++                axis=self.original_layer._kernel_reduced_axes,
++                keepdims=True,
++            )
++            zero_point = ops.mean(
++                zero_point,
++                axis=self.original_layer._kernel_reduced_axes,
++                keepdims=True,
+             )
+ 
+-        # Set the new quantized weights in the original layer
+-        new_weights = [ops.convert_to_numpy(quantized_weights)]
+-        if self.original_layer.bias is not None:
+-            new_weights.append(ops.convert_to_numpy(self.original_layer.bias))
++            # 3. Now the shape of `scale` matches the layer's `kernel_scale`
++            #    variable. We can use the layer's own helper to apply final
++            #    transforms (transpose, etc.). This makes it robust for all
++            #    einsum equations.
++            scale = self.original_layer._adjust_scale_for_quant(scale, "kernel")
++            zero_point = self.original_layer._adjust_scale_for_quant(
++                zero_point, "kernel"
++            )
++
++        self.original_layer.kernel_scale.assign(scale)
++
++        self.original_layer.zero_point.assign(zero_point)
+ 
+-        self.original_layer.set_weights(new_weights)
++        self.original_layer._kernel.assign(quantized_kernel)
+ 
+     def free(self):
+         self.hessian = None
+diff --git a/keras/src/quantizers/gptq_core_test.py b/keras/src/quantizers/gptq_core_test.py
+index 5aa063b18..7b366b9df 100644
+--- a/keras/src/quantizers/gptq_core_test.py
++++ b/keras/src/quantizers/gptq_core_test.py
+@@ -104,10 +104,7 @@ class TestGPTQCore:
+         config = GPTQConfig(
+             dataset=["test data"], tokenizer=MockTokenizer(), group_size=32
+         )
+-        try:
+-            model.quantize("gptq", config=config)
+-        except Exception as e:
+-            pytest.fail(f"Multi-block quantization failed unexpectedly: {e}")
++        model.quantize("gptq", config=config)
+ 
+     def test_apply_gptq_with_empty_block(self, caplog):
+         """Tests that a block with no quantizable layers is skipped
+diff --git a/keras/src/quantizers/gptq_quant.py b/keras/src/quantizers/gptq_quant.py
+index 5823903a2..5f9b60674 100644
+--- a/keras/src/quantizers/gptq_quant.py
++++ b/keras/src/quantizers/gptq_quant.py
+@@ -1,20 +1,6 @@
+ from keras.src import ops
+ 
+ 
+-def dequantize(input_tensor, scale, zero, maxq):
+-    """The core quantization function."""
+-    epsilon = ops.cast(1e-8, dtype=scale.dtype)
+-    scale = ops.where(ops.equal(scale, 0), epsilon, scale)
+-
+-    quantized_tensor = ops.divide(input_tensor, scale)
+-    quantized_tensor = ops.round(quantized_tensor)
+-    q = ops.add(quantized_tensor, zero)
+-    q = ops.clip(q, 0, maxq)
+-
+-    dequantized_tensor = ops.subtract(q, zero)
+-    return ops.multiply(scale, dequantized_tensor)
+-
+-
+ class GPTQQuantization:
+     """A class that handles the quantization of weights using GPTQ method.
+ 
+@@ -131,3 +117,12 @@ class GPTQQuantization:
+     def ready(self):
+         """Checks if the quantization parameters have been computed."""
+         return self.scale is not None and self.zero is not None
++
++    def quantize(self, x, scale, zero, maxq):
++        q = ops.round(ops.add(ops.divide(x, scale), zero))
++        return ops.clip(q, 0, maxq)
++
++    def dequantize(self, input_tensor, scale, zero, maxq):
++        """The core quantization function."""
++        dequantized_tensor = ops.subtract(input_tensor, zero)
++        return ops.multiply(scale, dequantized_tensor)
