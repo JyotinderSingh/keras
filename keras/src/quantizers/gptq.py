@@ -1,7 +1,7 @@
 from keras.src import ops
 from keras.src.layers import Dense
 from keras.src.layers import EinsumDense
-from keras.src.quantizers.gptq_quant import dequantize
+from keras.src.quantizers.gptq_quant import dequantize, quantize
 
 
 class GPTQ:
@@ -159,8 +159,8 @@ class GPTQ:
         4.  **Block-wise Correction**: After a block is quantized, the total
             error from that block is propagated to the *next* block of weights
             to be processed.
-        5.  **Finalization**: The quantized weights are reordered back if
-            `activation_order` was used, and the layer's weights are updated.
+        5.  **Finalization**: The quantized integer weights, scales, and
+            zero-points are stored as attributes of the original layer.
 
         This implementation is based on the official GPTQ paper and repository.
         For more details, see:
@@ -181,6 +181,8 @@ class GPTQ:
                 based
                 on their activation's second-order information.
         """
+
+        self.original_layer.quantize("gptq")
 
         weights_matrix = ops.transpose(ops.cast(self.layer.kernel, "float32"))
         hessian_matrix = ops.cast(self.hessian, "float32")
@@ -222,7 +224,12 @@ class GPTQ:
 
         # Compute the inverse Hessian, which is used for error correction
         inverse_hessian = ops.linalg.inv(hessian_matrix)
-        quantized_weights = ops.zeros_like(weights_matrix)
+
+        # Initialize storage for quantized weights and parameters
+        quantized_weights = ops.zeros_like(
+            weights_matrix, dtype=self.quantizer.dtype
+        )
+        scales, zeros = [], []
 
         for block_start in range(0, self.rows, blocksize):
             block_end = min(ops.add(block_start, blocksize), self.rows)
@@ -230,7 +237,9 @@ class GPTQ:
             # Extract the current block of weights and its corresponding
             # Hessian
             block_weights = weights_matrix[:, block_start:block_end]
-            block_quantized = ops.zeros_like(block_weights)
+            block_quantized = ops.zeros_like(
+                block_weights, dtype=self.quantizer.dtype
+            )
             block_errors = ops.zeros_like(block_weights)
             block_inverse_hessian = inverse_hessian[
                 block_start:block_end, block_start:block_end
@@ -260,21 +269,33 @@ class GPTQ:
                         ops.expand_dims(weight_column, 1), weight=True
                     )
 
-                # Quantize the current weight column
-                quantized_column = dequantize(
+                scales.append(self.quantizer.scale)
+                zeros.append(self.quantizer.zero)
+
+                # Dequantize for error calculation (simulated step)
+                dequantized_column = dequantize(
                     ops.expand_dims(weight_column, 1),
                     self.quantizer.scale,
                     self.quantizer.zero,
                     self.quantizer.maxq,
                 )[:, 0]
 
+                # Quantize to integer for storage (real step)
+                quantized_column_int = quantize(
+                    ops.expand_dims(weight_column, 1),
+                    self.quantizer.scale,
+                    self.quantizer.zero,
+                    self.quantizer.maxq,
+                    dtype=self.quantizer.dtype,
+                )[:, 0]
+
                 block_quantized = ops.slice_update(
                     block_quantized,
                     (0, col_idx),
-                    ops.expand_dims(quantized_column, axis=1),
+                    ops.expand_dims(quantized_column_int, axis=1),
                 )
                 quantization_error = ops.divide(
-                    ops.subtract(weight_column, quantized_column),
+                    ops.subtract(weight_column, dequantized_column),
                     diagonal_element,
                 )
                 block_errors = ops.slice_update(
@@ -293,7 +314,6 @@ class GPTQ:
                             0,
                         ),
                     )
-
                     # Efficiently update the remaining part of the
                     # block_weights tensor.
                     slice_to_update = block_weights[:, ops.add(col_idx, 1) :]
@@ -303,13 +323,8 @@ class GPTQ:
                     )
 
             # Update the full quantized matrix with the processed block
-            quantized_weights = ops.concatenate(
-                [
-                    quantized_weights[:, :block_start],
-                    block_quantized,
-                    quantized_weights[:, block_end:],
-                ],
-                axis=1,
+            quantized_weights = ops.slice_update(
+                quantized_weights, (0, block_start), block_quantized
             )
 
             if block_end < self.rows:
@@ -317,34 +332,51 @@ class GPTQ:
                     block_errors,
                     inverse_hessian[block_start:block_end, block_end:],
                 )
-                weights_matrix = ops.concatenate(
-                    [
-                        weights_matrix[:, :block_end],
-                        ops.subtract(
-                            weights_matrix[:, block_end:], total_error_update
-                        ),
-                    ],
-                    axis=1,
+                weights_matrix = ops.slice_update(
+                    weights_matrix,
+                    (0, block_end),
+                    ops.subtract(
+                        weights_matrix[:, block_end:], total_error_update
+                    ),
                 )
+
+        # Combine all collected scales and zeros into single tensors
+        all_scales = ops.concatenate(scales, axis=0)
+        all_zeros = ops.concatenate(zeros, axis=0)
 
         if activation_order:
             quantized_weights = ops.take(
                 quantized_weights, inverse_permutation, axis=1
             )
+            all_scales = ops.take(all_scales, inverse_permutation, axis=0)
+            all_zeros = ops.take(all_zeros, inverse_permutation, axis=0)
 
-        quantized_weights = ops.transpose(quantized_weights)
+        quantized_kernel = ops.transpose(quantized_weights)
 
         if isinstance(self.original_layer, EinsumDense):
-            quantized_weights = ops.reshape(
-                quantized_weights, self.kernel_shape
-            )
+            quantized_kernel = ops.reshape(quantized_kernel, self.kernel_shape)
 
-        # Set the new quantized weights in the original layer
-        new_weights = [ops.convert_to_numpy(quantized_weights)]
-        if self.original_layer.bias is not None:
-            new_weights.append(ops.convert_to_numpy(self.original_layer.bias))
 
-        self.original_layer.set_weights(new_weights)
+        # Store the quantized weights and parameters on the layer object
+        # Reshape the scales and zeros to match the shape of the kernel's
+        # scale and zero-point variables.
+        all_scales = ops.reshape(all_scales, self.original_layer.kernel_scale.shape)
+        all_zeros = ops.reshape(all_zeros, self.original_layer.zero_point.shape)
+        # Reshape the scales and zeros to match the shape of the kernel's
+        # scale and zero-point variables.
+        all_scales = ops.reshape(all_scales, self.original_layer.kernel_scale.shape)
+        all_zeros = ops.reshape(all_zeros, self.original_layer.zero_point.shape)
+        # Reshape the scales and zeros to match the shape of the kernel's
+        # scale and zero-point variables.
+        all_scales = ops.reshape(
+            all_scales, self.original_layer.kernel_scale.shape
+        )
+        all_zeros = ops.reshape(
+            all_zeros, self.original_layer.zero_point.shape
+        )
+        self.original_layer.kernel_scale.assign(all_scales)
+        self.original_layer.zero_point.assign(all_zeros)
+        self.original_layer._kernel.assign(quantized_kernel)
 
     def free(self):
         self.hessian = None

@@ -1,3 +1,4 @@
+import math
 import re
 import string
 
@@ -12,6 +13,7 @@ from keras.src import ops
 from keras.src import quantizers
 from keras.src import regularizers
 from keras.src.api_export import keras_export
+from keras.src.backend.config import backend
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 
@@ -167,7 +169,7 @@ class EinsumDense(Layer):
         # quantized to int8 or int4, because `quantized_build` has created the
         # appropriate kernel variable. For other modes (e.g., float8 or no
         # quantization), we still need the floating-point kernel.
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8, `self._kernel` will be added
             # in `self._int8_build`. Therefore, we skip it here.
             self._kernel = self.add_weight(
@@ -396,6 +398,8 @@ class EinsumDense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape, group_size=128)
         else:
             raise self._quantization_mode_error(mode)
         self._is_quantized = True
@@ -419,6 +423,53 @@ class EinsumDense(Layer):
             initializer="ones",
             trainable=False,
         )
+
+    def _gptq_build(self, kernel_shape, group_size):
+        """Builds variables for GPTQ group-wise quantization."""
+        # Ensure quantization info (like reduced axes) is available.
+        self._set_quantization_info()
+
+        # Create the variable for the quantized integer kernel.
+        self._kernel = self.add_weight(
+            name="kernel",
+            shape=kernel_shape,
+            # The GPTQ quantizer will determine the actual dtype (e.g., uint8).
+            # We use int8 as a placeholder for packed types like int4.
+            dtype="int8",
+            initializer="zeros",
+            trainable=False,
+        )
+
+        # Determine the number of groups along the input feature axis.
+        # We use the primary "reduced axis" as the input feature dimension.
+        if not self._kernel_reduced_axes:
+            raise ValueError(
+                "GPTQ quantization requires at least one reduced axis (input "
+                "feature dimension) in the EinsumDense equation."
+            )
+        input_feature_axis = self._kernel_reduced_axes[0]
+        num_input_features = kernel_shape[input_feature_axis]
+        num_groups = math.ceil(num_input_features / group_size)
+
+        # The shape for scale and zero-point is (num_groups,).
+        params_shape = (num_groups,)
+
+        self.kernel_scale = self.add_weight(
+            name="scale",
+            shape=params_shape,
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
+        self.zero_point = self.add_weight(
+            name="zero_point",
+            shape=params_shape,
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
+        # Store group_size to use it in the forward pass.
+        self.group_size = group_size
 
     def _int4_build(self, kernel_shape):
         """Build variables for int4 quantization.
@@ -574,6 +625,60 @@ class EinsumDense(Layer):
             lora_x = ops.einsum(self.equation, inputs, self.lora_kernel_a)
             lora_x = ops.matmul(lora_x, self.lora_kernel_b)
             x = ops.add(x, (self.lora_alpha / self.lora_rank) * lora_x)
+        if self.bias is not None:
+            x = ops.add(x, self.bias)
+        if self.activation is not None:
+            x = self.activation(x)
+        return x
+
+    def _gptq_call(self, inputs, training=None):
+        """Performs the forward pass for a GPTQ-quantized EinsumDense layer."""
+        # Cast the integer kernel to float to prepare for dequantization.
+        kernel_float = ops.cast(self._kernel, dtype=self.compute_dtype)
+
+        # === Dequantize the Kernel ===
+        # 1. Get the axis corresponding to the input features, which was grouped.
+        input_feature_axis = self._kernel_reduced_axes[0]
+        num_input_features = self._kernel.shape[input_feature_axis]
+
+        # 2. Reshape and repeat the scale/zero-point to match the kernel shape.
+        #    Start with a shape that can be broadcast, e.g., (num_groups, 1, 1).
+        target_shape = [1] * len(self._kernel.shape)
+        target_shape[input_feature_axis] = -1
+        scale = ops.reshape(self.kernel_scale, target_shape)
+        zero = ops.reshape(self.zero_point, target_shape)
+        
+        # 3. Repeat each parameter `group_size` times along the feature axis.
+        repeated_scales = ops.repeat(
+            scale, repeats=self.group_size, axis=input_feature_axis
+        )
+        repeated_zeros = ops.repeat(
+            zero, repeats=self.group_size, axis=input_feature_axis
+        )
+
+        # 4. Slice the repeated tensors to the exact number of input features.
+        #    This handles cases where `num_input_features` is not a multiple of `group_size`.
+        slicing = [slice(None)] * len(self._kernel.shape)
+        slicing[input_feature_axis] = slice(0, num_input_features)
+        full_scales = repeated_scales[tuple(slicing)]
+        full_zeros = repeated_zeros[tuple(slicing)]
+
+        # 5. Perform the dequantization.
+        dequant_kernel = ops.multiply(ops.subtract(kernel_float, full_zeros), full_scales)
+        
+        # === Standard EinsumDense Forward Pass ===
+        # Now `dequant_kernel` is a full-precision float tensor.
+        x = ops.einsum(self.equation, inputs, dequant_kernel)
+        
+        # Handle LoRA, bias, and activation just like in the other methods.
+        if self.lora_enabled:
+            lora_x = ops.einsum(self.equation, inputs, self.lora_kernel_a)
+            lora_x = ops.einsum(
+                self._lora_output_equation, lora_x, self.lora_kernel_b
+            )
+            x = ops.add(
+                x, (ops.multiply(ops.divide(self.lora_alpha, self.lora_rank), lora_x))
+            )
         if self.bias is not None:
             x = ops.add(x, self.bias)
         if self.activation is not None:
@@ -756,13 +861,13 @@ class EinsumDense(Layer):
             x = self.activation(x)
         return x
 
-    def quantize(self, mode, type_check=True):
+    def quantize(self, mode, type_check=True, config=None):
         # Prevent quantization of the subclasses
         if type_check and (type(self) is not EinsumDense):
             raise self._not_implemented_error(self.quantize)
 
         kernel_shape = self._kernel.shape
-        if mode in ("int8", "int4"):
+        if mode in ("int8", "int4", "gptq"):
             self._set_quantization_info()
 
         if mode == "int8":
@@ -790,6 +895,9 @@ class EinsumDense(Layer):
             )
             kernel_value = packed_kernel_value
             del self._kernel
+        elif mode == "gptq":
+            del self._kernel
+            self.gptq_config = config
         self.quantized_build(kernel_shape, mode)
 
         # Assign values to the newly created variables.
@@ -1239,7 +1347,10 @@ def _analyze_quantization_info(equation, input_shape):
             input_spec = split_string.group(1)
             weight_spec = split_string.group(2)
             output_spec = split_string.group(3)
-            elided = len(input_shape) - len(input_spec)
+            input_shape_tuple = input_shape
+            if type(input_shape) is int:
+                input_shape_tuple = (input_shape,)
+            elided = len(input_shape_tuple) - len(input_spec)
             possible_labels = sorted(
                 set(possible_labels)
                 - set(input_spec)

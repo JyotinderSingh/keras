@@ -1,8 +1,19 @@
 from keras.src import ops
 
+def quantize(input_tensor, scale, zero, maxq, dtype="uint8"):
+    """Performs the core quantization step, returning an integer tensor."""
+    epsilon = ops.cast(1e-8, dtype=scale.dtype)
+    scale = ops.where(ops.equal(scale, 0), epsilon, scale)
+
+    quantized_tensor = ops.divide(input_tensor, scale)
+    quantized_tensor = ops.round(quantized_tensor)
+    q = ops.add(quantized_tensor, zero)
+    q = ops.clip(q, 0, maxq)
+    return ops.cast(q, dtype=dtype)
+
 
 def dequantize(input_tensor, scale, zero, maxq):
-    """The core quantization function."""
+    """The core dequantization function (quant-dequant roundtrip)."""
     epsilon = ops.cast(1e-8, dtype=scale.dtype)
     scale = ops.where(ops.equal(scale, 0), epsilon, scale)
 
@@ -43,10 +54,19 @@ class GPTQQuantization:
         self.per_channel = per_channel
         self.symmetric = symmetric
         self.group_size = group_size
+        self.dtype = self.get_dtype(weight_bits, symmetric)
 
         # These are now determined later by `find_params`
         self.scale = None
         self.zero = None
+
+    def get_dtype(self, weight_bits, symmetric):
+        """Gets the appropriate integer dtype for storing quantized weights."""
+        if weight_bits <= 8:
+            return "int8" if symmetric else "uint8"
+        if weight_bits <= 16:
+            return "int16" if symmetric else "uint16"
+        return "int32" if symmetric else "uint32"
 
     def find_params(self, input_tensor, weight=False):
         """Finds quantization parameters (scale and zero) for a given tensor."""

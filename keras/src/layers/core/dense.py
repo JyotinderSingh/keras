@@ -1,3 +1,4 @@
+import math
 import ml_dtypes
 
 from keras.src import activations
@@ -109,7 +110,7 @@ class Dense(Layer):
         kernel_shape = (input_shape[-1], self.units)
         if self.quantization_mode:
             self.quantized_build(kernel_shape, mode=self.quantization_mode)
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8 or int4, `self._kernel` will be
             # added in `self._int8_build` or `_int4_build`. Therefore, we skip
             # it here.
@@ -323,8 +324,6 @@ class Dense(Layer):
                 f"Expected: {[v.name for v in all_vars]}"
             )
 
-    # Quantization-related (int8 and float8) methods
-
     def quantized_build(self, kernel_shape, mode):
         if mode == "int8":
             self._int8_build(kernel_shape)
@@ -332,9 +331,44 @@ class Dense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape, group_size=128)
         else:
             raise self._quantization_mode_error(mode)
         self._is_quantized = True
+
+    def _gptq_build(self, kernel_shape, group_size):
+        self._kernel = self.add_weight(
+            name="kernel",
+            shape=kernel_shape,
+            dtype="int8", # Or other quantized type
+            initializer="zeros",
+            trainable=False,
+        )
+
+        input_features = kernel_shape[0]
+        # The number of groups along the input-feature axis
+        num_groups = math.ceil(input_features / group_size)
+
+        # Correct shape for group-wise quantization
+        scale_shape = (num_groups,)
+
+        self.kernel_scale = self.add_weight(
+            name="scale",
+            shape=scale_shape,
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
+        self.zero_point = self.add_weight(
+            name="zero_point",
+            shape=scale_shape,
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
+        # Store group_size to use it in the forward pass
+        self.group_size = group_size
 
     def _int8_build(self, kernel_shape):
         self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
@@ -526,6 +560,43 @@ class Dense(Layer):
             x = self.activation(x)
         return x
 
+    def _gptq_call(self, inputs, training=None):
+        # Cast the integer kernel to float for dequantization
+        kernel_float = ops.cast(self._kernel, dtype=self.compute_dtype)
+        input_features = self._kernel.shape[0]
+
+        # Reshape group-wise params to be broadcastable with the kernel
+        # 1. Repeat each scale/zp value `group_size` times
+        repeated_scales = ops.repeat(
+            ops.expand_dims(self.kernel_scale, axis=-1),
+            repeats=self.group_size,
+            axis=0,
+        )
+        repeated_zeros = ops.repeat(
+            ops.expand_dims(self.zero_point, axis=-1),
+            repeats=self.group_size,
+            axis=0,
+        )
+
+        # 2. Slice to the exact number of input features in case of padding
+        full_scales = repeated_scales[:input_features]
+        full_zeros = repeated_zeros[:input_features]
+
+        # Dequantize the kernel using the now-broadcastable scales and zeros
+        dequant_kernel = ops.multiply(
+            ops.subtract(kernel_float, full_zeros), full_scales
+        )
+
+        # Standard Dense matmul
+        x = ops.matmul(inputs, dequant_kernel)
+
+        # Add bias/activation
+        if self.bias is not None:
+            x = ops.add(x, self.bias)
+        if self.activation is not None:
+            x = self.activation(x)
+        return x
+
     def _float8_call(self, inputs, training=None):
         if self.lora_enabled:
             raise NotImplementedError(
@@ -617,7 +688,7 @@ class Dense(Layer):
             x = self.activation(x)
         return x
 
-    def quantize(self, mode, type_check=True):
+    def quantize(self, mode, type_check=True, config=None):
         # Prevent quantization of the subclasses
         if type_check and (type(self) is not Dense):
             raise self._not_implemented_error(self.quantize)
@@ -653,6 +724,10 @@ class Dense(Layer):
             self._kernel.assign(packed_kernel_value)
             self.kernel_scale.assign(kernel_scale)
         elif mode == "float8":
+            self.quantized_build(kernel_shape, mode)
+        elif mode == "gptq":
+            del self._kernel
+            self.gptq_config = config
             self.quantized_build(kernel_shape, mode)
         else:
             raise self._quantization_mode_error(mode)
