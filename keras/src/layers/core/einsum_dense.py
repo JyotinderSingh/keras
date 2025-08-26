@@ -673,12 +673,8 @@ class EinsumDense(Layer):
         # Handle LoRA, bias, and activation just like in the other methods.
         if self.lora_enabled:
             lora_x = ops.einsum(self.equation, inputs, self.lora_kernel_a)
-            lora_x = ops.einsum(
-                self._lora_output_equation, lora_x, self.lora_kernel_b
-            )
-            x = ops.add(
-                x, (ops.multiply(ops.divide(self.lora_alpha, self.lora_rank), lora_x))
-            )
+            lora_x = ops.matmul(lora_x, self.lora_kernel_b)
+            x = ops.add(x, (ops.multiply(ops.divide(self.lora_alpha, self.lora_rank), lora_x)))
         if self.bias is not None:
             x = ops.add(x, self.bias)
         if self.activation is not None:

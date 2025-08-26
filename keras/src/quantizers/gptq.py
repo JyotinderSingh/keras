@@ -360,20 +360,14 @@ class GPTQ:
         # Store the quantized weights and parameters on the layer object
         # Reshape the scales and zeros to match the shape of the kernel's
         # scale and zero-point variables.
-        all_scales = ops.reshape(all_scales, self.original_layer.kernel_scale.shape)
-        all_zeros = ops.reshape(all_zeros, self.original_layer.zero_point.shape)
-        # Reshape the scales and zeros to match the shape of the kernel's
-        # scale and zero-point variables.
-        all_scales = ops.reshape(all_scales, self.original_layer.kernel_scale.shape)
-        all_zeros = ops.reshape(all_zeros, self.original_layer.zero_point.shape)
-        # Reshape the scales and zeros to match the shape of the kernel's
-        # scale and zero-point variables.
-        all_scales = ops.reshape(
-            all_scales, self.original_layer.kernel_scale.shape
-        )
-        all_zeros = ops.reshape(
-            all_zeros, self.original_layer.zero_point.shape
-        )
+        num_groups = self.original_layer.kernel_scale.shape[0]
+        all_scales = ops.reshape(all_scales, (num_groups, -1))
+        all_zeros = ops.reshape(all_zeros, (num_groups, -1))
+        # all_scales = ops.squeeze(all_scales, axis=-1)
+        # all_zeros = ops.squeeze(all_zeros, axis=-1)
+        all_scales = ops.mean(all_scales, axis=-1)
+        all_zeros = ops.mean(all_zeros, axis=-1)
+
         self.original_layer.kernel_scale.assign(all_scales)
         self.original_layer.zero_point.assign(all_zeros)
         self.original_layer._kernel.assign(quantized_kernel)
