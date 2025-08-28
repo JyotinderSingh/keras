@@ -31,21 +31,19 @@ class GPTQ:
             # For EinsumDense, we determine the effective 2D dimensions.
             # kernel_shape: e.g., [in_features, heads, head_dim] or [heads, head_dim, out_features]
             self.kernel_shape = layer.kernel.shape
-            # shape: list representation of kernel_shape
-            shape = list(self.kernel_shape)
             try:
                 # d_model_dim_index: index of the largest dimension, assumed to be the model's hidden size
-                d_model_dim_index = shape.index(max(shape))
+                d_model_dim_index = ops.argmax(self.kernel_shape)
             except ValueError:
                 raise TypeError(
-                    f"Could not determine hidden dimension from shape {shape}"
+                    f"Could not determine hidden dimension from shape {self.kernel_shape}"
                 )
 
             if d_model_dim_index == 0:  # QKV projection case
                 # in_features: e.g., 768
                 # heads: e.g., 12
                 # head_dim: e.g., 64
-                in_features, heads, head_dim = shape
+                in_features, heads, head_dim = self.kernel_shape
                 # rows: number of input features
                 self.rows, self.columns = (
                     in_features,
@@ -55,7 +53,7 @@ class GPTQ:
                 # heads: e.g., 12
                 # head_dim: e.g., 64
                 # out_features: e.g., 768
-                heads, head_dim, out_features = shape
+                heads, head_dim, out_features = self.kernel_shape
                 # rows: effective number of input features (heads * head_dim)
                 # columns: number of output features
                 self.rows, self.columns = (
