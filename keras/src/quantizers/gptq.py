@@ -318,7 +318,7 @@ class GPTQ:
                 # Group-wise params: recompute once per group boundary and fill the group's columns
                 if group_size != -1 and ops.equal(ops.mod(abs_col, group_size), 0):
                     g_start = abs_col
-                    g_end = ops.min(ops.add(g_start, group_size), self.rows)
+                    g_end = ops.minimum(ops.add(g_start, group_size), self.rows)
                     # [columns, group_size]
                     group_slice = weights_matrix[:, g_start:g_end]
                     self.quantizer.find_params(group_slice, weight=True)
