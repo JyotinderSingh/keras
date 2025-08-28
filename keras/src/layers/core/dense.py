@@ -459,6 +459,7 @@ class Dense(Layer):
         )
 
         x = ops.matmul(inputs, dequant_kernel)
+        x = ops.cast(x, self.compute_dtype)
 
         if self.bias is not None:
             x = ops.add(x, self.bias)

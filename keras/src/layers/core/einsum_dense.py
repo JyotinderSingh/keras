@@ -1,3 +1,4 @@
+import math
 import re
 import string
 
@@ -405,6 +406,7 @@ class EinsumDense(Layer):
 
     def _gptq_build(self, kernel_shape):
         self._set_quantization_info()
+
         self._kernel = self.add_weight(
             name="kernel",
             shape=kernel_shape,
@@ -413,20 +415,51 @@ class EinsumDense(Layer):
             trainable=False,
         )
 
-        # Get the correct, broadcastable shape for scale and zero-point
-        scale_shape = self._get_kernel_scale_shape(kernel_shape)
+        columns, rows = None, None
+        try:
+            # d_model_dim_index: index of the largest dimension, assumed to be the model's hidden size
+            d_model_dim_index = ops.argmax(kernel_shape)
+        except ValueError:
+            raise TypeError(
+                f"Could not determine hidden dimension from shape {kernel_shape}"
+            )
 
+        if d_model_dim_index == 0:  # QKV projection case
+            # in_features: e.g., 768
+            # heads: e.g., 12
+            # head_dim: e.g., 64
+            in_features, heads, head_dim = kernel_shape
+            # rows: number of input features
+            rows, columns = (
+                in_features,
+                heads * head_dim,
+            )
+        elif d_model_dim_index in [1, 2]:  # Attention Output case
+            # heads: e.g., 12
+            # head_dim: e.g., 64
+            # out_features: e.g., 768
+            heads, head_dim, out_features = kernel_shape
+            # rows: effective number of input features (heads * head_dim)
+            # columns: number of output features
+            rows, columns = (
+                heads * head_dim,
+                out_features,
+            )
+
+        scale_shape = (rows, columns)
         self.kernel_scale = self.add_weight(
             name="kernel_scale",
             shape=scale_shape,
             initializer="ones",
             trainable=False,
+            dtype="float32",
         )
         self.zero_point = self.add_weight(
             name="zero_point",
             shape=scale_shape,
             initializer="zeros",
             trainable=False,
+            dtype="float32",
         )
 
     def _int8_build(self, kernel_shape):
@@ -610,22 +643,25 @@ class EinsumDense(Layer):
         return x
 
     def _gptq_call(self, inputs, training=None):
-        zero_point = self.zero_point
-        if self.gptq_config.symmetric:
-            # Constant zero-point (symmetric): integer 0
-            zero_point = ops.zeros_like(zero_point, dtype="int8")
+        x = ops.cast(inputs, "float32")
 
-        zero_point = self._adjust_scale_for_dequant(zero_point)
+        # Cast quantized weights to float
+        q = ops.cast(self._kernel, "float32")          # shape: original kernel N-D
 
-        # handle zero point with kernel
-        kernel = ops.subtract(self._kernel, zero_point)
+        # Reshape stored 2-D scales/zeros to the kernel's N-D shape.
+        # This is a pure reshape (no reduction), matching how we flattened during GPTQ.
+        if self.kernel_scale.shape != q.shape:
+            s = ops.reshape(self.kernel_scale, q.shape)
+            z = ops.reshape(self.zero_point,   q.shape)
+        else:
+            s = self.kernel_scale
+            z = self.zero_point
 
-        # if backend is torch, do a cast
-        if backend() == "torch":
-            kernel = ops.cast(kernel, self.compute_dtype)
-        x = ops.einsum(self.equation, inputs, kernel)
-        x = ops.cast(x, self.compute_dtype)
-        x = ops.multiply(x, self.kernel_scale)
+        # Dequantize on-the-fly: W = (q - z) * s
+        W = ops.multiply(ops.subtract(q, z), s)
+
+        # Einsum using the layer's configured equation
+        x = ops.einsum(self.equation, x, W)
 
         if self.bias is not None:
             x = ops.add(x, self.bias)

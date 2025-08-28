@@ -61,8 +61,7 @@ class GPTQ:
                     out_features,
                 )
 
-            # Create a temporary object that holds a reshaped
-            # 2D version of the kernel.
+            # Work on a 2D view (rows=in_features, cols=out_features) via transpose later
             self.layer = types.SimpleNamespace(
                 # kernel: [rows, columns]
                 kernel=ops.reshape(layer.kernel, (self.rows, self.columns)),
@@ -117,11 +116,12 @@ class GPTQ:
 
         if self.hessian.shape[0] != input_batch.shape[-1]:
             raise ValueError(
-                f"Hessian dimensions ({self.hessian.shape[0]}) do not"
-                "match input features ({input_batch.shape[-1]})."
+                f"Hessian dimensions ({self.hessian.shape[0]}) do not "
+                f"match input features ({input_batch.shape[-1]})."
             )
 
-        # current_hessian: [features, features] or [rows, rows]
+        # current_hessian: 2 * X^T X
+        # [features, features] or [rows, rows]
         current_hessian = ops.multiply(
             2, ops.matmul(ops.transpose(input_batch), input_batch)
         )
@@ -167,8 +167,7 @@ class GPTQ:
         The algorithm follows these main steps:
         1.  **Initialization**: It optionally reorders the weight columns based
             on activation magnitudes (`activation_order=True`) to protect more
-            salient
-            weights.
+            salient weights.
         2.  **Hessian Modification**: The Hessian matrix, pre-computed from
             calibration data, is dampened to ensure its invertibility and
             stability.
@@ -206,9 +205,9 @@ class GPTQ:
 
         self.original_layer.quantize("gptq", config=self.config)
 
-        # weights_matrix: [columns, rows] or [output_features, input_features]
+        # weights_matrix: [columns, rows] = [out_features, in_features]
         weights_matrix = ops.transpose(ops.cast(self.layer.kernel, "float32"))
-        # hessian_matrix: [rows, rows] or [input_features, input_features]
+        # hessian_matrix: [rows, rows] = [in_features, in_features]
         hessian_matrix = ops.cast(self.hessian, "float32")
 
         if activation_order:
@@ -270,14 +269,31 @@ class GPTQ:
         # inverse_hessian: [rows, rows]
         inverse_hessian = ops.linalg.inv(hessian_matrix)
 
-        # Initialize tensors for integer weights and parameters
         # quantized_weights_int: [columns, rows]
         quantized_weights_int = ops.zeros_like(weights_matrix, dtype="int8")
+        # We'll store row-wise scales/zeros and broadcast to columns (groups)
+        # shapes below mirror weights_matrix to keep assignment simple
         # scales: [columns, rows]
-        scales = ops.zeros_like(weights_matrix)
+        scales = ops.zeros_like(weights_matrix, dtype="float32")
         # zeros: [columns, rows]
-        zeros = ops.zeros_like(weights_matrix)
+        zeros = ops.zeros_like(weights_matrix, dtype="float32")
 
+        # If per-channel only, compute once and broadcast everywhere (like ref)
+        precomputed_scale = None
+        precomputed_zero = None
+        if group_size == -1:
+            # One set of row-wise params over full weights_matrix
+            self.quantizer.find_params(weights_matrix, weight=True)  # weights_matrix is [columns, rows]
+            
+            # quantizer.scale/zero are row-wise (length = columns = out_features)
+            precomputed_scale = ops.cast(self.quantizer.scale, "float32")[0, :]  # [columns]
+            precomputed_zero = ops.cast(self.quantizer.zero, "float32")[0, :]    # [columns]
+            
+            # Broadcast across all columns (rows = input_features)
+            scales = ops.add(ops.expand_dims(precomputed_scale, 1), ops.zeros_like(weights_matrix))
+            zeros = ops.add(ops.expand_dims(precomputed_zero, 1), ops.zeros_like(weights_matrix))
+
+        # Blockwise OBQ pass on columns of K (rows = in_features)
         for block_start in range(0, self.rows, blocksize):
             block_end = min(ops.add(block_start, blocksize), self.rows)
             # block_size: scalar
@@ -299,29 +315,32 @@ class GPTQ:
                 # abs_col: scalar
                 abs_col = ops.add(block_start, col_idx)
 
+                # Group-wise params: recompute once per group boundary and fill the group's columns
+                if group_size != -1 and ops.equal(ops.mod(abs_col, group_size), 0):
+                    g_start = abs_col
+                    g_end = ops.min(ops.add(g_start, group_size), self.rows)
+                    # [columns, group_size]
+                    group_slice = weights_matrix[:, g_start:g_end]
+                    self.quantizer.find_params(group_slice, weight=True)
+                    # g_scale: [columns]
+                    g_scale = ops.cast(self.quantizer.scale, "float32")[0, :]
+                    # g_zero: [columns]
+                    g_zero = ops.cast(self.quantizer.zero, "float32")[0, :]
+                    # Broadcast row-wise vector across the group's columns
+                    # target: [columns, group_size]
+                    target = weights_matrix[:, g_start:g_end]
+                    # scale_block: [columns, group_size]
+                    scale_block = ops.expand_dims(g_scale, 1) + ops.zeros_like(target)
+                    # zero_block: [columns, group_size]
+                    zero_block = ops.expand_dims(g_zero, 1) + ops.zeros_like(target)
+                    scales = ops.slice_update(scales, (0, g_start), scale_block)
+                    zeros = ops.slice_update(zeros, (0, g_start), zero_block)
+
                 # Current column and the corresponding (i,i) of inv(H)
                 # weight_column: [columns]
                 weight_column = block_weights[:, col_idx]
                 # invH_ii: scalar
                 invH_ii = block_inverse_hessian[col_idx, col_idx]
-
-                # Find quantization params (scale and zero-point)
-                if group_size != -1:
-                    # Start a new group when we're at a group boundary
-                    if ops.mod(abs_col, group_size) == 0:
-                        group_start = abs_col
-                        group_end = ops.add(group_start, group_size)
-                        # group_slice: [columns, group_size]
-                        group_slice = weights_matrix[:, group_start:group_end]
-                        self.quantizer.find_params(group_slice, weight=True)
-                else:
-                    self.quantizer.find_params(
-                        # shape: [columns, 1]
-                        ops.expand_dims(weight_column, 1), weight=True
-                    )
-
-                # Quantize the current column and store the results
-                # quantized_column: [columns]
                 quantized_column = self.quantizer.quantize(
                     ops.expand_dims(weight_column, 1)
                 )[:, 0]
@@ -337,18 +356,7 @@ class GPTQ:
                     ),
                 )
 
-                # Store scales and zeros
-                # scale_col: [columns, 1]
-                scale_col = ops.expand_dims(
-                    ops.cast(self.quantizer.scale, "float32")[0, :], 1
-                )
-                # zero_col: [columns, 1]
-                zero_col = ops.expand_dims(
-                    ops.cast(self.quantizer.zero, "float32")[0, :], 1
-                )
-                scales = ops.slice_update(scales, (0, abs_col), scale_col)
-                zeros = ops.slice_update(zeros, (0, abs_col), zero_col)
-
+                # Error & in-block rank-1 update
                 # Dequantize back to float32 for error correction.
                 # dequantized_column: [columns]
                 dequantized_column = self.quantizer.dequantize(
@@ -414,6 +422,7 @@ class GPTQ:
                 # weights_matrix: [columns, rows]
                 weights_matrix = ops.concatenate([left, right], axis=1)
 
+        # Undo activation order if used
         if activation_order:
             # Reorder back to the original arrangement
             # quantized_weights_int: [columns, rows]
@@ -433,41 +442,15 @@ class GPTQ:
         # zero_point: [rows, columns]
         zero_point = ops.transpose(zeros)
 
-        if isinstance(self.original_layer, EinsumDense):
-            # 1. Reshape the quantized kernel and dense params back to the
-            #    original N-D shape
-            # quantized_kernel: original N-D kernel shape (e.g., [in, heads, head_dim])
+        # NOTE:
+        # We deliberately avoid any EinsumDense "reduction" of scale/zero.
+        # We keep kernel_scale/zero_point broadcastable to the flattened 2-D view.
+        # For EinsumDense, we only reshape the *kernel* back to its original N-D shape.
+        if isinstance(self.original_layer, EinsumDense) and self.kernel_shape != quantized_kernel.shape:
             quantized_kernel = ops.reshape(quantized_kernel, self.kernel_shape)
-            # scale: original N-D kernel shape
-            scale = ops.reshape(scale, self.kernel_shape)
-            # zero_point: original N-D kernel shape
-            zero_point = ops.reshape(zero_point, self.kernel_shape)
+            # Keep scale/zero_point as 2-D (rows x columns) to match matmul layout.
 
-            # 2. CRUCIAL STEP: Reduce the dense scale/zero_point tensors to
-            #    get the per-channel/per-group values.
-            # scale: shape after reduction (e.g., [in, 1, 1] or [1, 1, out])
-            scale = ops.mean(
-                scale,
-                axis=self.original_layer._kernel_reduced_axes,
-                keepdims=True,
-            )
-            # zero_point: shape after reduction
-            zero_point = ops.mean(
-                zero_point,
-                axis=self.original_layer._kernel_reduced_axes,
-                keepdims=True,
-            )
-
-            # 3. Now the shape of `scale` matches the layer's `kernel_scale`
-            #    variable. We can use the layer's own helper to apply final
-            #    transforms (transpose, etc.).
-            # scale: final shape for layer's scale variable
-            scale = self.original_layer._adjust_scale_for_quant(scale, "kernel")
-            # zero_point: final shape for layer's zero_point variable
-            zero_point = self.original_layer._adjust_scale_for_quant(
-                zero_point, "kernel"
-            )
-
+        # Assign final tensors (kernel is int8; scale/zero are float, row-wise broadcast across K)
         self.original_layer.kernel_scale.assign(scale)
         self.original_layer.zero_point.assign(zero_point)
         self.original_layer._kernel.assign(quantized_kernel)
