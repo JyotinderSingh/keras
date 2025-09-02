@@ -14,7 +14,6 @@ from keras.src.quantizers.gptq import GPTQ
 from keras.src.quantizers.gptq import _stable_permutation
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 from keras.src.testing.test_utils import named_product
 
@@ -55,10 +54,11 @@ bit-rates.
 """
 
 
-def _get_mock_layer(layer_type, kernel_shape, rng):
+def _get_mock_layer(layer_type, kernel_shape, rng, should_build=True):
     if layer_type == "Dense":
         layer = layers.Dense(units=kernel_shape[1])
-        layer.build(input_shape=(None, kernel_shape[0]))
+        if should_build:
+            layer.build(input_shape=(None, kernel_shape[0]))
     elif layer_type == "EinsumDense":
         output_shape = (kernel_shape[1], kernel_shape[2])
         layer = layers.EinsumDense(
@@ -112,9 +112,25 @@ class GPTQTest(testing.TestCase):
 
     def test_full_quantization_process(self):
         rng = np.random.default_rng(seed=42)
-        mock_layer = _get_mock_layer("Dense", kernel_shape=(16, 32), rng=rng)
-        original_weights = np.copy(ops.convert_to_numpy(mock_layer.kernel))
-
+        mock_layer = _get_mock_layer(
+            "Dense", kernel_shape=(16, 32), rng=rng, should_build=False
+        )
+        mock_layer.kernel_scale = mock_layer.add_weight(
+            name="kernel_scale",
+            shape=(16, 32),
+            dtype="float32",
+            initializer="ones",
+            trainable=False,
+        )
+        mock_layer.kernel_zero = mock_layer.add_weight(
+            name="kernel_zero",
+            shape=(16, 32),
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
+        mock_layer.build(input_shape=(None, 16))
+        original_weights = ops.copy(mock_layer.kernel)
         gptq_instance = GPTQ(
             mock_layer,
             GPTQConfig(
@@ -305,7 +321,7 @@ class GPTQTest(testing.TestCase):
         # there is no interaction between different features
         inverse_hessian = ops.eye(in_features, dtype="float32")
 
-        dequantized_weights = gptq_quantize_matrix(
+        quantized_weights, _, _ = gptq_quantize_matrix(
             weights_transpose,
             inverse_hessian,
             blocksize=128,
@@ -316,26 +332,39 @@ class GPTQTest(testing.TestCase):
 
         # Compare function output with columnwise direct application
         # of quantization.
-        out = ops.zeros_like(weights_transpose)
-        for j in range(ops.shape(weights_transpose)[1]):
-            column = weights_transpose[:, j : j + 1]
+        out = ops.zeros_like(weights)
+        for j in range(ops.shape(weights)[1]):
+            column = weights[:, j : j + 1]
             scale, zero, maxq = _compute_scale_zero(column)
             quantized_col = quantize_with_zero_point(column, scale, zero, maxq)
-            dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
             out = ops.slice_update(
-                out, (0, j), ops.expand_dims(dequantized[:, 0], 1)
+                out, (0, j), ops.expand_dims(quantized_col[:, 0], 1)
             )
 
-        self.assertAllClose(dequantized_weights, out, atol=1e-6)
+        self.assertAllClose(quantized_weights, out, atol=1e-6)
 
     def test_activation_order_permutation_is_undone(self):
         in_features, out_features = 8, 6
         layer = layers.Dense(out_features, use_bias=False)
+        layer.kernel_scale = layer.add_weight(
+            name="kernel_scale",
+            shape=(8, 6),
+            dtype="float32",
+            initializer="ones",
+            trainable=False,
+        )
+        layer.kernel_zero = layer.add_weight(
+            name="kernel_zero",
+            shape=(8, 6),
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
         layer.build((None, in_features))
         weights = ops.array(
             np.random.randn(in_features, out_features), "float32"
         )
-        layer.set_weights([weights])
+        layer.set_weights([weights, layer.kernel_scale, layer.kernel_zero])
 
         # generate a non-trivial order metric.
         diag = ops.linspace(10.0, 1.0, in_features, dtype="float32")
@@ -361,8 +390,28 @@ class GPTQTest(testing.TestCase):
 
         # Quantize without activation order
         layer2 = layers.Dense(out_features, use_bias=False)
+        layer2.kernel_scale = layer2.add_weight(
+            name="kernel_scale",
+            shape=(8, 6),
+            dtype="float32",
+            initializer="ones",
+            trainable=False,
+        )
+        layer2.kernel_zero = layer2.add_weight(
+            name="kernel_zero",
+            shape=(8, 6),
+            dtype="float32",
+            initializer="zeros",
+            trainable=False,
+        )
         layer2.build((None, in_features))
-        layer2.set_weights([ops.copy(weights)])
+        layer2.set_weights(
+            [
+                ops.copy(weights),
+                ops.copy(layer.kernel_scale),
+                ops.copy(layer.kernel_zero),
+            ]
+        )
 
         g2 = GPTQ(
             layer2,

@@ -1,5 +1,6 @@
 import re
 import string
+from math import prod
 
 import ml_dtypes
 import numpy as np
@@ -167,7 +168,7 @@ class EinsumDense(Layer):
         # quantized to int8 or int4, because `quantized_build` has created the
         # appropriate kernel variable. For other modes (e.g., float8 or no
         # quantization), we still need the floating-point kernel.
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8, `self._kernel` will be added
             # in `self._int8_build`. Therefore, we skip it here.
             self._kernel = self.add_weight(
@@ -396,6 +397,8 @@ class EinsumDense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape)
         else:
             raise self._quantization_mode_error(mode)
         self._is_quantized = True
@@ -419,6 +422,82 @@ class EinsumDense(Layer):
             initializer="ones",
             trainable=False,
         )
+
+    def _gptq_build(self, kernel_shape, *, group_size=-1):
+        """
+        Allocate quantized kernel & params for EinsumDense.
+
+        Args:
+            kernel_shape: tuple/list; the layer's original kernel shape, e.g.
+                [in_features, out_features] or [in_features, heads, head_dim].
+            group_size: int; contiguous input-group size for quantization
+                (=-1 means per-output-channel with no grouping).
+        """
+        self.qptq_initialized = False
+        # Record matmul-view for GPTQ (K x C where C = product of remaining dims)
+        in_features = int(kernel_shape[0])
+        out_features_flat = (
+            int(prod(kernel_shape[1:])) if len(kernel_shape) > 1 else 1
+        )
+        self._matmul_view_shape = (in_features, out_features_flat)  # (K, C)
+        self._group_size = int(group_size)
+
+        # Mark that we've switched to the quantized (int8) path
+        if hasattr(self, "_set_quantization_info"):
+            self._set_quantization_info()
+
+        # INT8 kernel stored in the ORIGINAL N-D kernel shape
+        self.quantized_kernel = self.add_weight(
+            name="kernel",
+            shape=tuple(kernel_shape),
+            initializer="zeros",
+            dtype="int8",
+            trainable=False,
+        )
+
+        # Scales/zeros have the EXACT SAME SHAPE as kernel (no reductions).
+        # Forward does: W = (q - zero_point) * kernel_scale
+        self.kernel_scale = self.add_weight(
+            name="kernel_scale",
+            shape=tuple(kernel_shape),
+            initializer="ones",
+            dtype="float32",
+            trainable=False,
+        )
+        self.kernel_zero = self.add_weight(
+            name="zero_point",
+            shape=tuple(kernel_shape),
+            initializer="zeros",
+            dtype="float32",
+            trainable=False,
+        )
+
+        # Optional: slots for activation-order permutations (filled during GPTQ if used)
+        if not hasattr(self, "_gptq_perm"):
+            self._gptq_perm = None
+        if not hasattr(self, "_gptq_inv_perm"):
+            self._gptq_inv_perm = None
+
+        # (Optional) convenience lambda to reshape 2-D params from GPTQ back to N-D
+        # Use this if your GPTQ returns (K,C) and you want to store back as N-D here.
+        self._reshape_to_kernel_shape = (
+            lambda x2d: ops.reshape(x2d, kernel_shape)
+            if (len(kernel_shape) > 2 or x2d.shape != kernel_shape)
+            else x2d
+        )
+
+    def _gptq_call(self, inputs, training=False):
+        # TODO: This is getting called during calibration, which means the calibration
+        # is happening using the uninitialized quantized_kernel. We need to somehow make
+        # sure that the regular call method is called during that time.
+        if not self.qptq_initialized:
+            self.call(inputs, training=training)
+        q = ops.cast(self.quantized_kernel, "float32")
+        W = ops.multiply(ops.subtract(q, self.kernel_zero), self.kernel_scale)
+        y = ops.einsum(self.equation, inputs, W)
+        if getattr(self, "use_bias", False):
+            y = ops.add(y, self.bias)
+        return y
 
     def _int4_build(self, kernel_shape):
         """Build variables for int4 quantization.
@@ -762,7 +841,7 @@ class EinsumDense(Layer):
             raise self._not_implemented_error(self.quantize)
 
         kernel_shape = self._kernel.shape
-        if mode in ("int8", "int4"):
+        if mode in ("int8", "int4", "gptq"):
             self._set_quantization_info()
 
         if mode == "int8":

@@ -44,31 +44,6 @@ class TransformerBlock(layers.Layer):
         return self.dense(inputs)
 
 
-def _get_model_with_backbone(
-    has_transformer_layers=True, embedding_name="embedding"
-):
-    """Creates a mock KerasNLP-style model with a backbone."""
-
-    class MockBackbone(layers.Layer):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            if has_transformer_layers:
-                self.transformer_layers = [TransformerBlock()]
-            setattr(self, embedding_name, layers.Embedding(VOCAB_SIZE, 128))
-
-    class MockModel(models.Model):
-        def __init__(self, **kwargs):
-            super().__init__(**kwargs)
-            self.backbone = MockBackbone()
-
-        def call(self, inputs):
-            return self.backbone(inputs)
-
-    model = MockModel()
-    model.build(input_shape=(None, 10))
-    return model
-
-
 def build_all_tokens_strings(dataset, tokenizer, eos_id=None):
     pieces = []
     for i, s in enumerate(dataset):
@@ -268,12 +243,16 @@ class TestGPTQCore(testing.TestCase):
         ),
         (
             "backbone_no_layers",
-            _get_model_with_backbone(has_transformer_layers=False),
+            models.Sequential([layers.Embedding(VOCAB_SIZE, 10)]),
             "backbone does not have a 'transformer_layers' attribute",
         ),
         (
             "backbone_no_embedding",
-            _get_model_with_backbone(embedding_name="wrong_name"),
+            models.Sequential(
+                [
+                    TransformerBlock(),
+                ]
+            ),
             "Could not automatically find an embedding layer in the model",
         ),
     )

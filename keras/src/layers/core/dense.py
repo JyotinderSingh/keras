@@ -109,7 +109,7 @@ class Dense(Layer):
         kernel_shape = (input_shape[-1], self.units)
         if self.quantization_mode:
             self.quantized_build(kernel_shape, mode=self.quantization_mode)
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8 or int4, `self._kernel` will be
             # added in `self._int8_build` or `_int4_build`. Therefore, we skip
             # it here.
@@ -332,6 +332,8 @@ class Dense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape)
         else:
             raise self._quantization_mode_error(mode)
         self._is_quantized = True
@@ -351,6 +353,45 @@ class Dense(Layer):
             initializer="ones",
             trainable=False,
         )
+
+    def _gptq_build(self, kernel_shape):
+        self.qptq_initialized = False
+        # self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
+        self.quantized_kernel = self.add_weight(
+            name="kernel",
+            shape=kernel_shape,
+            initializer="zeros",
+            dtype="int8",
+            trainable=False,
+        )
+        self.kernel_scale = self.add_weight(
+            name="kernel_scale",
+            shape=kernel_shape,
+            initializer="ones",
+            trainable=False,
+        )
+        self.kernel_zero = self.add_weight(
+            name="kernel_zero",
+            shape=kernel_shape,
+            initializer="zeros",
+            trainable=False,
+        )
+
+    def _gptq_call(self, inputs, training=False):
+        if not self.qptq_initialized:
+            self.call(inputs, training=training)
+        # Cast inputs to float32 for arithmetic
+        x = ops.cast(inputs, "float32")
+
+        # Dequantize weights on-the-fly:
+        # W = (q - zp) * s   with all tensors broadcast-aligned
+        q = ops.cast(self.quantized_kernel, "float32")
+        W = ops.multiply(ops.subtract(q, self.kernel_zero), self.kernel_scale)
+
+        y = ops.matmul(x, W)  # [batch, out_features]
+        if getattr(self, "use_bias", False):
+            y = ops.add(y, self.bias)
+        return y
 
     def _int4_build(self, kernel_shape):
         """Build variables for int4 quantization.
@@ -652,6 +693,8 @@ class Dense(Layer):
             # Assign packed values.
             self._kernel.assign(packed_kernel_value)
             self.kernel_scale.assign(kernel_scale)
+        elif mode == "gptq":
+            self.quantized_build(kernel_shape, mode)
         elif mode == "float8":
             self.quantized_build(kernel_shape, mode)
         else:
