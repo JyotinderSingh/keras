@@ -716,80 +716,169 @@ def compute_quantization_parameters(
     x, *, bits, symmetric=False, per_channel=False, group_size=-1, weight=False
 ):
     """
-    Computes the scale and zero-point for quantization.
+    Compute affine quantization parameters (scale, zero) and maxq for Keras
+    tensors.
 
     Args:
-        x: KerasTensor. The input tensor to quantize.
-        bits: int. The number of bits to quantize to (e.g., 4).
-        symmetric: bool. Whether to use symmetric quantization.
-        per_channel: bool. Whether to quantize per channel.
-        group_size: int. The group size for quantization.
-        weight: bool. Whether the input tensor is a weight tensor.
+        x: KerasTensor. Tensor to quantize.
+        bits: int >= 1. Bit width (e.g., 4 -> maxq=15).
+        symmetric: bool. If True, enforce symmetric range [-amax, +amax] and
+         mid-code zero.
+        per_channel: bool. If True, compute one (scale, zero) per channel/group.
+            - For weights: per OUTPUT channel (first dim) if group_size == -1;
+              grouped vector-wise if group_size > 0.
+            - For activations: channels-last; per LAST dim.
+        group_size: int. If > 0 and per_channel=True and weight=True, use
+         vector/group-wise quant (rows are contiguous groups of length
+         `group_size`). Must divide total size. Use -1 to disable grouping.
+        weight: bool. If True, apply weight-specific shaping to broadcast
+         against [output_channels, -1].
+
+    Returns:
+        scale: float32 tensor shaped to broadcast in quant/dequant.
+        zero:  float32 tensor shaped to broadcast in quant/dequant.
+        maxq:  float32 scalar = 2**bits - 1.
+
+    Notes:
+        - For symmetric=True: zero is fixed to (maxq + 1)/2 (e.g., 8 for 4-bit).
+        - For asymmetric: zero = round(-min/scale), then clamped to [0, maxq].
+        - Per-tensor activations return shape [1]; per-tensor weights return
+         (output_channels, 1)
+          (or (1,1) if output_channels is unknown at trace time).
     """
+
     if x is None:
-        raise ValueError(f"Input tensor {x} cannot be None.")
-
-    # For weights, we typically expect at least a 2D tensor.
-    if weight and len(x.shape) < 2:
+        raise ValueError("Input tensor 'x' cannot be None.")
+    if not isinstance(bits, int) or bits < 1:
+        raise ValueError(f"'bits' must be an int >= 1, got: {bits}")
+    if weight and (len(x.shape or ()) < 2):
         raise ValueError(
-            f"Input weight tensor {x} must have a rank of at "
-            f"least 2, but got rank {len(x.shape)}."
+            f"Weight tensor must have rank >= 2, got rank {len(x.shape or ())}."
         )
-
     if ops.size(x) == 0:
         raise ValueError("Input tensor 'x' cannot be empty.")
+    if group_size == 0:
+        raise ValueError("If provided, 'group_size' must be > 0 or -1.")
 
-    original_shape = x.shape
+    x = ops.cast(x, "float32")
+    original_shape = x.shape  # may include Nones
+    rank = len(original_shape or ())
+
+    # Define grouping for row-wise min/max
+    # We reshape to [num_rows, row_length] so we can reduce over axis=1.
+    def require_known_dim(dim_val, where_msg):
+        """Require a known static dimension."""
+        if dim_val is None:
+            raise ValueError(
+                f"Static dimension required for {where_msg} is unknown. "
+                f"Provide a statically known shape or compute per-tensor "
+                f"instead."
+            )
+        return dim_val
 
     if per_channel:
         if weight:
-            if group_size != -1:
+            if group_size is not None and group_size > 0:
+                # Grouped vector-wise quant over a flattened view.
+                # input_reshaped: (num_groups, group_size)
                 input_reshaped = ops.reshape(x, [-1, group_size])
             else:
-                input_reshaped = ops.reshape(x, [original_shape[0], -1])
-    else:  # per-tensor
+                # True per-output-channel (first dimension as channels)
+                output_channels = require_known_dim(
+                    original_shape[0],
+                    "first (output channel) dimension of weights",
+                )
+                # input_reshaped: (output_channels, *)
+                input_reshaped = ops.reshape(x, [output_channels, -1])
+        else:
+            # Activations per-channel (channels-last)
+            if rank < 1:
+                raise ValueError(
+                    "per_channel=True for activations requires rank >= 1."
+                )
+            output_channels = require_known_dim(
+                original_shape[-1], "last (channel) dimension of activations"
+            )
+
+            # input_reshaped: (output_channels, *)
+            input_reshaped = ops.reshape(x, [output_channels, -1])
+    else:
+        # Per-tensor: single row over the entire tensor
+        # input_reshaped: (1, *)
         input_reshaped = ops.reshape(x, [1, -1])
 
-    # Find min/max values
+    # Row-wise min/max
+    # min_values: (rows,)
     min_values = ops.min(input_reshaped, axis=1)
+    # max_values: (rows,)
     max_values = ops.max(input_reshaped, axis=1)
 
-    # Apply symmetric quantization logic if enabled
     if symmetric:
-        max_values = ops.maximum(ops.abs(min_values), max_values)
-        min_values = ops.where(
-            ops.less(min_values, 0), ops.negative(max_values), min_values
-        )
+        amax = ops.maximum(ops.abs(min_values), ops.abs(max_values))
+        min_values = ops.negative(amax)
+        max_values = amax
 
-    # Ensure range is not zero to avoid division errors
-    zero_range = ops.equal(min_values, max_values)
-    min_values = ops.where(zero_range, ops.subtract(min_values, 1), min_values)
-    max_values = ops.where(zero_range, ops.add(max_values, 1), max_values)
+    # Guard zero-width ranges
+    same = ops.equal(min_values, max_values)
+    # Expand to [-1, +1] around the value to avoid division by zero
+    min_values = ops.where(same, ops.subtract(min_values, 1.0), min_values)
+    max_values = ops.where(same, ops.add(max_values, 1.0), max_values)
 
-    maxq = ops.cast(ops.subtract(ops.power(2, bits), 1), "float32")
+    maxq = ops.cast(ops.power(2, bits) - 1, "float32")
 
-    # Calculate scale and zero-point
+    # Scale and zero-point
+    # scale = (max - min) / maxq, then ensure strictly positive
+    eps = ops.cast(1e-8, "float32")
     scale = ops.divide(ops.subtract(max_values, min_values), maxq)
+    scale = ops.where(ops.less_equal(scale, 0.0), eps, scale)
+
     if symmetric:
-        zero = ops.full_like(scale, ops.divide(ops.add(maxq, 1), 2))
+        # Mid-code zero-point (e.g., 8 for 4-bit)
+        zero = ops.full_like(scale, ops.divide(maxq + 1.0, 2.0))
     else:
         zero = ops.round(ops.divide(ops.negative(min_values), scale))
+        # Clamp zero to [0, maxq] for safety
+        # Note: ops.clip keeps dtype and works elementwise
+        zero = ops.clip(zero, 0.0, maxq)
 
-    # Ensure scale is non-zero
-    scale = ops.where(ops.less_equal(scale, 0), 1e-8, scale)
+    # Output shaping for broadcastability
+    # Start from vector shape (rows,)
+    def colify(v):
+        """Convert a vector to a column vector.
+
+        Converts to (rows, 1) for easy column broadcast when needed.
+        """
+        return ops.reshape(v, [-1, 1])
 
     if weight:
-        # Per-channel, non-grouped case: simple reshape is correct.
-        if per_channel and group_size == -1:
-            scale = ops.reshape(scale, [-1, 1])
-            zero = ops.reshape(zero, [-1, 1])
-        elif not per_channel:
-            num_rows = original_shape[0]
-            scale = ops.tile(ops.reshape(scale, (1, 1)), (num_rows, 1))
-            zero = ops.tile(ops.reshape(zero, (1, 1)), (num_rows, 1))
-    if per_channel:
-        scale = ops.reshape(scale, [-1, 1])
-        zero = ops.reshape(zero, [-1, 1])
+        if per_channel:
+            # Either (output_channels,) or (num_groups,) -> (rows, 1)
+            scale = colify(scale)
+            zero = colify(zero)
+        else:
+            # Per-tensor for weights: prefer (output_channels, 1) so it
+            # row-broadcasts onto [output_channels, -1].
+            output_channels = original_shape[0]
+            if output_channels is None:
+                # If unknown, return (1,1); this still broadcasts safely.
+                scale = ops.reshape(scale, (1, 1))
+                zero = ops.reshape(zero, (1, 1))
+            else:
+                scale = ops.tile(
+                    ops.reshape(scale, (1, 1)), (output_channels, 1)
+                )  # (output_channels, 1)
+                zero = ops.tile(ops.reshape(zero, (1, 1)), (output_channels, 1))
+    else:
+        # Activations:
+        if per_channel:
+            # (output_channels,) -> (output_channels, 1)
+            scale = colify(scale)
+            zero = colify(zero)
+        else:
+            # Per-tensor activations: keep scalar vector shape [1]
+            # (simple broadcast)
+            scale = ops.reshape(scale, [1])
+            zero = ops.reshape(zero, [1])
 
     return scale, zero, maxq
 

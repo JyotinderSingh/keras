@@ -686,7 +686,9 @@ class ComputeScaleZeroTest(testing.TestCase):
 
     def test_error_when_weight_rank_too_low(self):
         x = ops.array([1.0, 2.0], "float32")  # rank-1
-        with self.assertRaisesRegex(ValueError, "rank of at least 2"):
+        with self.assertRaisesRegex(
+            ValueError, "Weight tensor must have rank >= 2, got rank 1."
+        ):
             compute_quantization_parameters(x, bits=4, weight=True)
 
     @parameterized.named_parameters(
