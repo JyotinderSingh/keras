@@ -101,8 +101,11 @@ def gptq_quantize_matrix(
 
     # weights_buffer: [out_features, in_features]
     weights_buffer = weights_transpose
-    # quantized_weights_buffer: [out_features, in_features]
-    quantized_weights_buffer = ops.zeros_like(weights_buffer)
+    # dequantized_weights_buffer: [out_features, in_features]
+    dequantized_weights_buffer = ops.zeros_like(weights_buffer)
+    quantized_weights_buffer = ops.zeros_like(weights_buffer, dtype="int32")
+    scales = ops.zeros_like(weights_buffer)
+    zeros = ops.zeros_like(weights_buffer)
 
     # Process features in blocks
     for block_start in range(0, in_features, blocksize):
@@ -113,7 +116,8 @@ def gptq_quantize_matrix(
         # block_weights: [out_features, bsize]
         block_weights = weights_buffer[:, block_start:block_end]
         # block_weights_quantized: [out_features, bsize]
-        block_weights_quantized = ops.zeros_like(block_weights)
+        block_weights_dequantized = ops.zeros_like(block_weights)
+        block_weights_quantized = ops.zeros_like(block_weights, dtype="int32")
         # block_error: [out_features, bsize]
         block_error = ops.zeros_like(block_weights)
         # block_inv_hessian: [bsize, bsize]
@@ -156,13 +160,32 @@ def gptq_quantize_matrix(
             quantized_column = quantize_with_zero_point(
                 ops.expand_dims(weight_column, 1), scale, zero, maxq
             )
-            quantized_column = dequantize_with_zero_point(
+
+            quantized_weights_buffer = ops.slice_update(
+                quantized_weights_buffer,
+                (0, global_idx),
+                ops.cast(ops.expand_dims(quantized_column[:, 0], 1), "int32"),
+            )
+
+            # TODO: First scales and zeros need to be expanded out
+            scales = ops.slice_update(
+                scales,
+                (0, global_idx),
+                ops.expand_dims(scale[:, 0], 1),
+            )
+            zeros = ops.slice_update(
+                zeros,
+                (0, global_idx),
+                ops.expand_dims(zero[:, 0], 1),
+            )
+
+            dequantized_column = dequantize_with_zero_point(
                 quantized_column, scale, zero
             )[:, 0]
-            block_weights_quantized = ops.slice_update(
-                block_weights_quantized,
+            block_weights_dequantized = ops.slice_update(
+                block_weights_dequantized,
                 (0, block_idx),
-                ops.expand_dims(quantized_column, 1),
+                ops.expand_dims(dequantized_column, 1),
             )
 
             # Error feedback for remaining columns within the block
@@ -171,7 +194,7 @@ def gptq_quantize_matrix(
             # error = (col - quantized_col) / block_inv_hessian[idx, idx]
             # error: [out_features,]
             error = ops.divide(
-                ops.subtract(weight_column, quantized_column), diag
+                ops.subtract(weight_column, dequantized_column), diag
             )
             # block_error: [out_features, bsize]
             block_error = ops.slice_update(
@@ -193,10 +216,10 @@ def gptq_quantize_matrix(
                 )
 
         # Write block’s quantized columns into result
-        left = quantized_weights_buffer[:, :block_start]
-        right = quantized_weights_buffer[:, block_end:]
-        quantized_weights_buffer = ops.concatenate(
-            [left, block_weights_quantized, right], axis=1
+        left = dequantized_weights_buffer[:, :block_start]
+        right = dequantized_weights_buffer[:, block_end:]
+        dequantized_weights_buffer = ops.concatenate(
+            [left, block_weights_dequantized, right], axis=1
         )
 
         # Propagate block errors to *future* features (beyond the block)
@@ -220,8 +243,10 @@ def gptq_quantize_matrix(
         quantized_weights_buffer = ops.take(
             quantized_weights_buffer, inv_perm, axis=1
         )
+        scales = ops.take(scales, inv_perm, axis=1)
+        zeros = ops.take(zeros, inv_perm, axis=1)
 
-    return quantized_weights_buffer
+    return quantized_weights_buffer, scales, zeros
 
 
 class GPTQ:
@@ -418,7 +443,7 @@ class GPTQ:
         # Compute the inverse Hessian, which is used for error correction
         inverse_hessian = linalg.inv(hessian_matrix)
 
-        quantized_weights = gptq_quantize_matrix(
+        quantized_weights, scales, zeros = gptq_quantize_matrix(
             weights_matrix,
             inv_hessian=inverse_hessian,
             blocksize=blocksize,
@@ -429,11 +454,15 @@ class GPTQ:
         )
 
         quantized_weights = ops.transpose(quantized_weights)
+        scales = ops.transpose(scales)
+        zeros = ops.transpose(zeros)
 
         if isinstance(self.original_layer, EinsumDense):
             quantized_weights = ops.reshape(
                 quantized_weights, self.kernel_shape
             )
+            scales = ops.reshape(scales, self.kernel_shape)
+            zeros = ops.reshape(zeros, self.kernel_shape)
 
         # Set the new quantized weights in the original layer
         self.original_layer._kernel.assign(quantized_weights)

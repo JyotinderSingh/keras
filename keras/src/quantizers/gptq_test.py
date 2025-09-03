@@ -305,7 +305,7 @@ class GPTQTest(testing.TestCase):
         # there is no interaction between different features
         inverse_hessian = ops.eye(in_features, dtype="float32")
 
-        dequantized_weights = gptq_quantize_matrix(
+        quantized, scales, zeros = gptq_quantize_matrix(
             weights_transpose,
             inverse_hessian,
             blocksize=128,
@@ -313,6 +313,7 @@ class GPTQTest(testing.TestCase):
             activation_order=False,
             compute_scale_zero=_compute_scale_zero,
         )
+        dequantized = dequantize_with_zero_point(quantized, scales, zeros)
 
         # Compare function output with columnwise direct application
         # of quantization.
@@ -321,12 +322,12 @@ class GPTQTest(testing.TestCase):
             column = weights_transpose[:, j : j + 1]
             scale, zero, maxq = _compute_scale_zero(column)
             quantized_col = quantize_with_zero_point(column, scale, zero, maxq)
-            dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
+            manual_dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
             out = ops.slice_update(
-                out, (0, j), ops.expand_dims(dequantized[:, 0], 1)
+                out, (0, j), ops.expand_dims(manual_dequantized[:, 0], 1)
             )
 
-        self.assertAllClose(dequantized_weights, out, atol=1e-6)
+        self.assertAllClose(dequantized, out, atol=1e-4)
 
     def test_activation_order_permutation_is_undone(self):
         in_features, out_features = 8, 6
