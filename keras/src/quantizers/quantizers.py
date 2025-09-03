@@ -667,18 +667,6 @@ class GPTQQuantizer(Quantizer):
         self.zero = None
         self.maxq = None
 
-    def find_params(self, input_tensor, weight=False):
-        """Finds quantization parameters (scale and zero) for a given tensor."""
-        self.scale, self.zero, self.maxq = compute_quantization_parameters(
-            input_tensor,
-            bits=self.weight_bits,
-            symmetric=self.symmetric,
-            per_channel=self.per_channel,
-            group_size=self.group_size,
-            weight=weight,
-        )
-        return self.scale, self.zero, self.maxq
-
     def ready(self):
         """Checks if the quantization parameters have been computed."""
         return (

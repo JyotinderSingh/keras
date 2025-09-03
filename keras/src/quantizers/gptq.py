@@ -1,3 +1,4 @@
+from functools import partial
 import types
 
 from keras.src import ops
@@ -30,198 +31,162 @@ def gptq_quantize_matrix(
     inv_hessian,
     *,
     blocksize=128,
+    per_channel=False,
     group_size=-1,
     activation_order=False,
     order_metric=None,
     compute_scale_zero=compute_quantization_parameters,
 ):
     """
-    Implements the GPTQ error correction updates.
-
-    For a single column update (column j):
-        e = invH[j, j] * (w_j - q_j)
-        W[:, j+1:] -= e * invH[j, j+1:]
-    where:
-    - w_j is the original column,
-    - q_j is the quantized column,
-    - invH is the inverse Hessian,
-    - e is the propagated error term.
-
-    Across entire blocks:
-        W[:, future] -= E_block * invH[block, future]
-    where:
-    - E_block is the quantization error accumulated for the current block,
-    - invH[block, future] denotes the cross-block slice of the inverse Hessian,
-    - W[:, future] are the columns yet to be quantized.
-
-    Args:
-        weights_transpose: Transposed weight matrix [out_features, in_features]
-         to quantize.
-        inv_hessian: Inverse Hessian matrix [in_features, in_features] for
-         error propagation.
-        blocksize: Size of the blocks to process (default: 128).
-        group_size: Size of the groups for parameter reuse
-         (default: -1, no grouping).
-        activation_order: Whether to apply activation-order permutation
-         (default: False).
-        order_metric: Metric for ordering features
-         (default: None, uses 1 / diag(invH)).
-        compute_scale_zero: Function to compute scale and zero for
-         quantization.
+    Returns:
+      q_int:     int32, [out_features, in_features]
+      scale_map: float32, broadcast-compatible with q_int
+      zero_map:  float32, broadcast-compatible with q_int
     """
-    in_features = ops.shape(weights_transpose)[1]
+    out_features = ops.shape(weights_transpose)[0]
+    in_features  = ops.shape(weights_transpose)[1]
 
-    # Optional activation-order permutation on feature axis (axis=1)
+    # ---- optional activation-order permutation ----
     if activation_order:
         if order_metric is None:
-            # Use 1 / diag(inverse_hessian) as importance proxy if H not
-            # available.
-            order_metric = ops.reciprocal(
-                ops.add(ops.diagonal(inv_hessian), 1e-12)
-            )
+            order_metric = ops.reciprocal(ops.add(ops.diagonal(inv_hessian), 1e-12))
         else:
-            # sanitize provided metric
             order_metric = ops.cast(order_metric, "float32")
             order_metric = ops.where(
-                ops.isfinite(order_metric),
-                order_metric,
-                ops.zeros_like(order_metric),
+                ops.isfinite(order_metric), order_metric, ops.zeros_like(order_metric)
             )
-
-        # Sort in descending order by importance
-        perm = _stable_permutation(order_metric)
+        perm = _stable_permutation(order_metric)   # descending
         inv_perm = ops.argsort(perm)
 
         weights_transpose = ops.take(weights_transpose, perm, axis=1)
-        inv_hessian = ops.take(
-            ops.take(inv_hessian, perm, axis=0), perm, axis=1
-        )
+        inv_hessian = ops.take(ops.take(inv_hessian, perm, axis=0), perm, axis=1)
     else:
         perm = inv_perm = None
 
-    # weights_buffer: [out_features, in_features]
-    weights_buffer = weights_transpose
-    # quantized_weights_buffer: [out_features, in_features]
-    quantized_weights_buffer = ops.zeros_like(weights_buffer)
+    # ---- outputs ----
+    q_int_buffer = ops.zeros(ops.shape(weights_transpose), dtype="int32")
 
-    # Process features in blocks
+    if not per_channel:
+        # Minimal broadcast maps for per-tensor: [1, in]
+        scale_map = ops.zeros((1, in_features), dtype="float32")
+        zero_map  = ops.zeros((1, in_features), dtype="float32")
+    else:
+        # For per-channel(,grouped), params vary by (row, possibly column),
+        # so we materialize full maps for correctness.
+        scale_map = ops.zeros(ops.shape(weights_transpose), dtype="float32")
+        zero_map  = ops.zeros(ops.shape(weights_transpose), dtype="float32")
+
+    # ---- path helpers ----
+    # A) per-tensor (per_channel == False): 1 scalar per column, broadcast over rows.
+    def _params_per_tensor(col2d):  # col2d: [out,1]
+        # Use weight=False so compute_quantization_parameters returns a single scalar
+        # for this "tensor" (the column). That scalar will broadcast over [out,1].
+        s, z, maxq = compute_scale_zero(col2d)
+        # Ensure shapes [1,1] explicitly
+        s = ops.reshape(s, (1, 1))
+        z = ops.reshape(z, (1, 1))
+        return s, z, maxq
+
+    # B) per-channel, no grouping: compute per-column per-row params (full map).
+    def _params_per_channel(col2d):  # [out,1]
+        s, z, maxq = compute_scale_zero(col2d, weight=True)  # returns [out,1]
+        return s, z, maxq
+
+    # C) per-channel, grouped: reuse per-group params across columns in the group.
+    cached = {"group_start": -1, "scale": None, "zero": None, "maxq": None}
+    def _params_grouped(global_idx, weights_buf):
+        group_start = (global_idx // group_size) * group_size
+        if group_start != cached["group_start"]:
+            group_end = ops.minimum(group_start + group_size, in_features)
+            group_slice = weights_buf[:, group_start:group_end]  # [out, group_len]
+            s, z, m = compute_scale_zero(group_slice, weight=True)  # expect [out,1]
+            cached.update(group_start=group_start, scale=s, zero=z, maxq=m)
+        return cached["scale"], cached["zero"], cached["maxq"], group_start
+
+    # ---- GPTQ sweep ----
+    weights_buffer = weights_transpose
     for block_start in range(0, in_features, blocksize):
         block_end = min(block_start + blocksize, in_features)
         block_size = block_end - block_start
 
-        # Block views
-        # block_weights: [out_features, bsize]
-        block_weights = weights_buffer[:, block_start:block_end]
-        # block_weights_quantized: [out_features, bsize]
-        block_weights_quantized = ops.zeros_like(block_weights)
-        # block_error: [out_features, bsize]
-        block_error = ops.zeros_like(block_weights)
-        # block_inv_hessian: [bsize, bsize]
-        block_inv_hessian = inv_hessian[
-            block_start:block_end, block_start:block_end
-        ]
+        block_weights = weights_buffer[:, block_start:block_end]                   # [out, b]
+        block_q_int   = ops.zeros_like(block_weights, dtype="int32")               # [out, b]
+        block_error   = ops.zeros_like(block_weights, dtype="float32")             # [out, b]
+        block_inv_h   = inv_hessian[block_start:block_end, block_start:block_end]  # [b, b]
 
-        # group cache for per-group s/z/maxq reuse
-        cached_scale = None
-        cached_zero = None
-        cached_maxq = None
-        cached_group_start = -1
+        # For per-tensor, we also keep a row-vector of params for this block
+        if not per_channel:
+            block_scale_row = ops.zeros((1, block_size), dtype="float32")          # [1, b]
+            block_zero_row  = ops.zeros((1, block_size), dtype="float32")          # [1, b]
 
         for block_idx in range(block_size):
-            global_idx = block_start + block_idx
-            # weight_column: [out_features,]
-            weight_column = block_weights[:, block_idx]
+            j = block_start + block_idx
+            col  = block_weights[:, block_idx]        # [out]
+            col2d = ops.expand_dims(col, 1)           # [out,1]
 
-            # Group-wise parameter reuse (compute once per group)
-            if group_size != -1:
-                # Determine group boundaries
-                group_start = (global_idx // group_size) * group_size
-                if group_start != cached_group_start:
-                    group_end = min(group_start + group_size, in_features)
-                    # group_slice: [out_features, group_len]
-                    group_slice = weights_buffer[:, group_start:group_end]
-                    cached_scale, cached_zero, cached_maxq = compute_scale_zero(
-                        group_slice, weight=True
-                    )
-                    cached_group_start = group_start
-                scale, zero, maxq = cached_scale, cached_zero, cached_maxq
+            # ---- pick params by path ----
+            if not per_channel:
+                s, z, maxq = _params_per_tensor(col2d)        # [1,1]
+                # store into row-vectors at (0, block_idx)
+                block_scale_row = ops.slice_update(block_scale_row, (0, block_idx), s)  # s is [1,1]
+                block_zero_row  = ops.slice_update(block_zero_row,  (0, block_idx), z)
+            elif group_size == -1:
+                s, z, maxq = _params_per_channel(col2d)        # [out,1]
+                # write the whole column into maps
+                scale_map = ops.slice_update(scale_map, (0, j), s)
+                zero_map  = ops.slice_update(zero_map,  (0, j), z)
             else:
-                # Per-column params
-                scale, zero, maxq = compute_scale_zero(
-                    ops.expand_dims(weight_column, 1), weight=True
-                )
+                s, z, maxq, grp_start = _params_grouped(j, weights_buffer)  # [out,1]
+                scale_map = ops.slice_update(scale_map, (0, j), s)
+                zero_map  = ops.slice_update(zero_map,  (0, j), z)
 
-            # Quantize one column
-            # quantized_column: [out_features,]
-            quantized_column = quantize_with_zero_point(
-                ops.expand_dims(weight_column, 1), scale, zero, maxq
-            )
-            quantized_column = dequantize_with_zero_point(
-                quantized_column, scale, zero
-            )[:, 0]
-            block_weights_quantized = ops.slice_update(
-                block_weights_quantized,
-                (0, block_idx),
-                ops.expand_dims(quantized_column, 1),
-            )
+            # ---- quantize to int ----
+            q_int_col = ops.cast(quantize_with_zero_point(col2d, s, z, maxq), dtype="int32")   # [out,1] -> int32
+            block_q_int = ops.slice_update(block_q_int, (0, block_idx), q_int_col)
 
-            # Error feedback for remaining columns within the block
-            # diag: [out_features,]
-            diag = block_inv_hessian[block_idx, block_idx]
-            # error = (col - quantized_col) / block_inv_hessian[idx, idx]
-            # error: [out_features,]
-            error = ops.divide(
-                ops.subtract(weight_column, quantized_column), diag
-            )
-            # block_error: [out_features, bsize]
-            block_error = ops.slice_update(
-                block_error, (0, block_idx), ops.expand_dims(error, 1)
-            )
+            # ---- GPTQ error feedback uses dequantized col ----
+            dq_col = dequantize_with_zero_point(q_int_col, s, z)[:, 0]  # [out]
+            diag = block_inv_h[block_idx, block_idx]
+            err = ops.divide(ops.subtract(col, dq_col), diag)           # [out]
+            block_error = ops.slice_update(block_error, (0, block_idx), ops.expand_dims(err, 1))
 
             if block_idx < block_size - 1:
                 update = ops.matmul(
-                    ops.expand_dims(error, 1),
-                    ops.expand_dims(
-                        block_inv_hessian[block_idx, block_idx + 1 :], 0
-                    ),
-                )
+                    ops.expand_dims(err, 1),
+                    ops.expand_dims(block_inv_h[block_idx, block_idx + 1 :], 0),
+                )  # [out, remaining]
                 tail = block_weights[:, block_idx + 1 :]
-                block_weights = ops.slice_update(
-                    block_weights,
-                    (0, block_idx + 1),
-                    ops.subtract(tail, update),
-                )
+                block_weights = ops.slice_update(block_weights, (0, block_idx + 1), ops.subtract(tail, update))
 
-        # Write block’s quantized columns into result
-        left = quantized_weights_buffer[:, :block_start]
-        right = quantized_weights_buffer[:, block_end:]
-        quantized_weights_buffer = ops.concatenate(
-            [left, block_weights_quantized, right], axis=1
-        )
+        # stitch q_int
+        left_q  = q_int_buffer[:, :block_start]
+        right_q = q_int_buffer[:, block_end:]
+        q_int_buffer = ops.concatenate([left_q, block_q_int, right_q], axis=1)
 
-        # Propagate block errors to *future* features (beyond the block)
+        # stitch per-tensor row maps
+        if not per_channel:
+            left_s  = scale_map[:, :block_start]
+            right_s = scale_map[:, block_end:]
+            scale_map = ops.concatenate([left_s, block_scale_row, right_s], axis=1)  # [1, in]
+
+            left_z  = zero_map[:, :block_start]
+            right_z = zero_map[:, block_end:]
+            zero_map = ops.concatenate([left_z, block_zero_row, right_z], axis=1)    # [1, in]
+
+        # propagate block errors to future columns
         if block_end < in_features:
-            # weights_buffer[:, block_end:] -=
-            # block_error @ invH[block_start:block_end, block_end:]
-            # total_update: [out_features, bsize]
-            total_update = ops.matmul(
-                block_error, inv_hessian[block_start:block_end, block_end:]
-            )
+            total_update = ops.matmul(block_error, inv_hessian[block_start:block_end, block_end:])  # [out, future]
             weights_buffer = ops.concatenate(
-                [
-                    weights_buffer[:, :block_end],
-                    ops.subtract(weights_buffer[:, block_end:], total_update),
-                ],
-                axis=1,
+                [weights_buffer[:, :block_end], ops.subtract(weights_buffer[:, block_end:], total_update)], axis=1
             )
 
-    # Undo permutation if used
+    # undo permutation
     if activation_order:
-        quantized_weights_buffer = ops.take(
-            quantized_weights_buffer, inv_perm, axis=1
-        )
+        q_int_buffer = ops.take(q_int_buffer, inv_perm, axis=1)
+        scale_map    = ops.take(scale_map,    inv_perm, axis=1)
+        zero_map     = ops.take(zero_map,     inv_perm, axis=1)
 
-    return quantized_weights_buffer
+    return q_int_buffer, scale_map, zero_map
 
 
 class GPTQ:
@@ -418,22 +383,33 @@ class GPTQ:
         # Compute the inverse Hessian, which is used for error correction
         inverse_hessian = linalg.inv(hessian_matrix)
 
-        quantized_weights = gptq_quantize_matrix(
+        quantized_weights, scale_map, zero_map = gptq_quantize_matrix(
             weights_matrix,
             inv_hessian=inverse_hessian,
             blocksize=blocksize,
             group_size=self.config.group_size,
             activation_order=self.config.activation_order,
             order_metric=ops.diagonal(hessian_matrix),
-            compute_scale_zero=self.quantizer.find_params,
+            compute_scale_zero=partial(
+                compute_quantization_parameters,
+                bits=self.config.weight_bits,
+                symmetric=self.config.symmetric,
+                per_channel=self.config.per_channel,
+                group_size=self.config.group_size,
+            )
         )
 
+        # TODO: This part is untested but probably okay???
         quantized_weights = ops.transpose(quantized_weights)
+        scale_map = ops.transpose(scale_map)
+        zero_map = ops.transpose(zero_map)
 
         if isinstance(self.original_layer, EinsumDense):
             quantized_weights = ops.reshape(
                 quantized_weights, self.kernel_shape
             )
+            scale_map = ops.reshape(scale_map, self.kernel_shape)
+            zero_map = ops.reshape(zero_map, self.kernel_shape)
 
         # Set the new quantized weights in the original layer
         self.original_layer._kernel.assign(quantized_weights)
