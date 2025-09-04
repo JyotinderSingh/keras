@@ -15,7 +15,8 @@ from keras.src.quantizers.gptq import GPTQ
 from keras.src.quantizers.gptq import _stable_permutation
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.quantizers import compute_quantization_parameters, dequantize_with_zero_point
+from keras.src.quantizers.quantizers import compute_quantization_parameters
+from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 from keras.src.testing.test_utils import named_product
 
@@ -308,13 +309,13 @@ class GPTQTest(testing.TestCase):
 
         # TODO: DURING TESTING MAKE SURE PARAMS MATCH IN PARTIAL AND gptq_quantize_matrix CALL
         get_quant_params = partial(
-                compute_quantization_parameters,
-                bits=4,
-                symmetric=False,
-                per_channel=True,
-                group_size=8,
-                weight=True,
-            )
+            compute_quantization_parameters,
+            bits=4,
+            symmetric=False,
+            per_channel=True,
+            group_size=8,
+            weight=True,
+        )
         quantized, scale_map, zero_map = gptq_quantize_matrix(
             weights_transpose,
             inverse_hessian,
@@ -327,7 +328,9 @@ class GPTQTest(testing.TestCase):
 
         # Dequantize the weights
         # NOTE: THESE NUMBERS ARE REAL CLOSE TO weights_transpose RN!
-        dequantized_weights = dequantize_with_zero_point(quantized, scale_map, zero_map)
+        dequantized_weights = dequantize_with_zero_point(
+            quantized, scale_map, zero_map
+        )
 
         # Compare function output with columnwise direct application
         # of quantization. FIX THIS PART
@@ -337,9 +340,7 @@ class GPTQTest(testing.TestCase):
             scale, zero, maxq = get_quant_params(column)
             quantized_col = quantize_with_zero_point(column, scale, zero, maxq)
             dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
-            out = ops.slice_update(
-                out, (0, j), dequantized[:, 0]
-            )
+            out = ops.slice_update(out, (0, j), dequantized[:, 0])
 
         # TODO: The numbers are close but likely can be exact same
         self.assertAllClose(dequantized_weights, out, atol=1e-1)
@@ -573,6 +574,9 @@ class TestModelQuantization(testing.TestCase):
 
         # Build classifier and tokenizer
         model = _get_sequence_classifier()
+
+        model.compile(run_eagerly=True)
+
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Build an eval batch drawn from the SAME distribution as calibration

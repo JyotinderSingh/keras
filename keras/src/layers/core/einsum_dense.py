@@ -14,6 +14,7 @@ from keras.src import regularizers
 from keras.src.api_export import keras_export
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
+from keras.src.quantizers.quantizers import dequantize_with_zero_point
 
 
 @keras_export("keras.layers.EinsumDense")
@@ -167,7 +168,7 @@ class EinsumDense(Layer):
         # quantized to int8 or int4, because `quantized_build` has created the
         # appropriate kernel variable. For other modes (e.g., float8 or no
         # quantization), we still need the floating-point kernel.
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8, `self._kernel` will be added
             # in `self._int8_build`. Therefore, we skip it here.
             self._kernel = self.add_weight(
@@ -396,9 +397,12 @@ class EinsumDense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape)
         else:
             raise self._quantization_mode_error(mode)
-        self._is_quantized = True
+        if mode != "gptq":
+            self._is_quantized = True
 
     def _int8_build(self, kernel_shape):
         self._set_quantization_info()
@@ -419,6 +423,109 @@ class EinsumDense(Layer):
             initializer="ones",
             trainable=False,
         )
+
+    def _gptq_build(self, kernel_shape, *, group_size=-1):
+        """
+        Allocate quantized kernel & params for EinsumDense.
+
+        Args:
+            kernel_shape: tuple/list; the layer's original kernel shape, e.g.
+                [in_features, out_features] or [in_features, heads, head_dim].
+            group_size: int; contiguous input-group size for quantization
+                (=-1 means per-output-channel with no grouping).
+        """
+        self.qptq_initialized = False
+        # Record matmul-view for GPTQ (K x C where C = product of remaining dims)
+        self.original_kernel_shape = kernel_shape
+        shape = list(self.original_kernel_shape)
+        try:
+            d_model_dim_index = shape.index(max(shape))
+        except ValueError:
+            raise TypeError(
+                f"Could not determine hidden dimension from shape {shape}"
+            )
+
+        if d_model_dim_index == 0:  # QKV projection case
+            in_features, heads, head_dim = shape
+            rows, columns = (
+                in_features,
+                heads * head_dim,
+            )
+        elif d_model_dim_index in [1, 2]:  # Attention Output case
+            heads, head_dim, out_features = shape
+            rows, columns = (
+                heads * head_dim,
+                out_features,
+            )
+        else:
+            raise ValueError("Could not determine row/column split.")
+        self._matmul_view_shape = (rows, columns)  # (K, C)
+
+        self._group_size = int(group_size)
+        self.original_kernel_shape = kernel_shape
+
+        # Mark that we've switched to the quantized (int8) path
+        if hasattr(self, "_set_quantization_info"):
+            self._set_quantization_info()
+
+        # INT8 kernel stored in the ORIGINAL N-D kernel shape
+        self.quantized_kernel = self.add_weight(
+            name="kernel",
+            shape=self._matmul_view_shape,
+            initializer="zeros",
+            dtype="int32",
+            trainable=False,
+        )
+
+        # Scales/zeros have the EXACT SAME SHAPE as kernel (no reductions).
+        # Forward does: W = (q - zero_point) * kernel_scale
+        self.kernel_scale = self.add_weight(
+            name="kernel_scale",
+            shape=self._matmul_view_shape,
+            initializer="ones",
+            dtype="float32",
+            trainable=False,
+        )
+        self.kernel_zero = self.add_weight(
+            name="zero_point",
+            shape=self._matmul_view_shape,
+            initializer="zeros",
+            dtype="int32",
+            trainable=False,
+        )
+
+        # Optional: slots for activation-order permutations (filled during GPTQ if used)
+        if not hasattr(self, "_gptq_perm"):
+            self._gptq_perm = None
+        if not hasattr(self, "_gptq_inv_perm"):
+            self._gptq_inv_perm = None
+
+        # (Optional) convenience lambda to reshape 2-D params from GPTQ back to N-D
+        # Use this if your GPTQ returns (K,C) and you want to store back as N-D here.
+        self._reshape_to_kernel_shape = (
+            lambda x2d: ops.reshape(x2d, kernel_shape)
+            if (len(kernel_shape) > 2 or x2d.shape != kernel_shape)
+            else x2d
+        )
+
+    def _gptq_call(self, inputs, training=False):
+        # TODO: This is getting called during calibration, which means the calibration
+        # is happening using the uninitialized quantized_kernel. We need to somehow make
+        # sure that the regular call method is called during that time.
+        if not self._is_quantized:
+            return self.call(inputs, training=training)
+        # q = ops.cast(self.quantized_kernel, "float32")
+        W = dequantize_with_zero_point(
+            self.quantized_kernel, self.kernel_scale, self.kernel_zero
+        )
+        W = ops.transpose(W)
+
+        W = ops.reshape(W, self.original_kernel_shape)
+
+        y = ops.einsum(self.equation, inputs, W)
+        if getattr(self, "use_bias", False):
+            y = ops.add(y, self.bias)
+        return y
 
     def _int4_build(self, kernel_shape):
         """Build variables for int4 quantization.
@@ -762,7 +869,7 @@ class EinsumDense(Layer):
             raise self._not_implemented_error(self.quantize)
 
         kernel_shape = self._kernel.shape
-        if mode in ("int8", "int4"):
+        if mode in ("int8", "int4", "gptq"):
             self._set_quantization_info()
 
         if mode == "int8":
@@ -800,7 +907,11 @@ class EinsumDense(Layer):
         # Set new dtype policy
         if self.dtype_policy.quantization_mode is None:
             policy = dtype_policies.get(f"{mode}_from_{self.dtype_policy.name}")
+            if mode == "gptq":
+                self._is_quantized = True
             self.dtype_policy = policy
+            if mode == "gptq":
+                self._is_quantized = False
 
     def _get_kernel_scale_shape(self, kernel_shape):
         """Get the shape of the kernel scale tensor.

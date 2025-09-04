@@ -759,9 +759,9 @@ def compute_quantization_parameters(
     # Calculate scale and zero-point
     scale = ops.divide(ops.subtract(max_values, min_values), maxq)
     if symmetric:
-        zero = ops.full_like(scale, ops.divide(ops.add(maxq, 1), 2))
+        zero = ops.full_like(scale, ops.divide(ops.add(maxq, 1), 2), dtype="int32")
     else:
-        zero = ops.round(ops.divide(ops.negative(min_values), scale))
+        zero = ops.cast(ops.round(ops.divide(ops.negative(min_values), scale)), dtype="int32")
 
     # Ensure scale is non-zero
     scale = ops.where(ops.less_equal(scale, 0), 1e-8, scale)

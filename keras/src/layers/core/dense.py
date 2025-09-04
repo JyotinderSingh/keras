@@ -9,6 +9,7 @@ from keras.src import regularizers
 from keras.src.api_export import keras_export
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
+from keras.src.quantizers.quantizers import dequantize_with_zero_point
 
 
 @keras_export("keras.layers.Dense")
@@ -109,7 +110,7 @@ class Dense(Layer):
         kernel_shape = (input_shape[-1], self.units)
         if self.quantization_mode:
             self.quantized_build(kernel_shape, mode=self.quantization_mode)
-        if self.quantization_mode not in ("int8", "int4"):
+        if self.quantization_mode not in ("int8", "int4", "gptq"):
             # If the layer is quantized to int8 or int4, `self._kernel` will be
             # added in `self._int8_build` or `_int4_build`. Therefore, we skip
             # it here.
@@ -332,9 +333,12 @@ class Dense(Layer):
             self._int4_build(kernel_shape)
         elif mode == "float8":
             self._float8_build()
+        elif mode == "gptq":
+            self._gptq_build(kernel_shape)
         else:
             raise self._quantization_mode_error(mode)
-        self._is_quantized = True
+        if mode != "gptq":
+            self._is_quantized = True
 
     def _int8_build(self, kernel_shape):
         self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
@@ -351,6 +355,55 @@ class Dense(Layer):
             initializer="ones",
             trainable=False,
         )
+
+    def _gptq_build(self, kernel_shape):
+        self.qptq_initialized = False
+        # self.inputs_quantizer = quantizers.AbsMaxQuantizer(axis=-1)
+        self.kernel_shape = kernel_shape
+        self.quantized_kernel = self.add_weight(
+            name="kernel",
+            shape=kernel_shape,
+            initializer="zeros",
+            dtype="int32",
+            trainable=False,
+        )
+        self.kernel_scale = self.add_weight(
+            name="kernel_scale",
+            shape=kernel_shape,
+            initializer="ones",
+            dtype="float32",
+            trainable=False,
+        )
+        self.kernel_zero = self.add_weight(
+            name="kernel_zero",
+            shape=kernel_shape,
+            initializer="zeros",
+            dtype="int32",
+            trainable=False,
+        )
+
+    def _gptq_call(self, inputs, training=False):
+        if not self._is_quantized:
+            return self.call(inputs, training=training)
+        # Cast inputs to float32 for arithmetic
+        # x = ops.cast(inputs, "float32")
+
+        # Dequantize weights on-the-fly:
+        # W = (q - zp) * s   with all tensors broadcast-aligned
+        # q = ops.cast(self.quantized_kernel, "float32")
+        W = ops.reshape(
+            ops.transpose(
+                dequantize_with_zero_point(
+                    self.quantized_kernel, self.kernel_scale, self.kernel_zero
+                )
+            ),
+            (self.kernel_shape),
+        )
+
+        y = ops.matmul(inputs, W)  # [batch, out_features]
+        if getattr(self, "use_bias", False):
+            y = ops.add(y, self.bias)
+        return y
 
     def _int4_build(self, kernel_shape):
         """Build variables for int4 quantization.
@@ -652,6 +705,8 @@ class Dense(Layer):
             # Assign packed values.
             self._kernel.assign(packed_kernel_value)
             self.kernel_scale.assign(kernel_scale)
+        elif mode == "gptq":
+            self.quantized_build(kernel_shape, mode)
         elif mode == "float8":
             self.quantized_build(kernel_shape, mode)
         else:
@@ -662,7 +717,11 @@ class Dense(Layer):
             from keras.src import dtype_policies  # local import to avoid cycle
 
             policy = dtype_policies.get(f"{mode}_from_{self.dtype_policy.name}")
+            if mode == "gptq":
+                self._is_quantized = True
             self.dtype_policy = policy
+            if mode == "gptq":
+                self._is_quantized = False
 
     def _get_kernel_with_merged_lora(self):
         """Returns the kernel with LoRA matrices merged, for serialization.
