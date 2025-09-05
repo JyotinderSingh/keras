@@ -43,7 +43,6 @@ def gptq_quantize_matrix(
       scale_map: float32, broadcast-compatible with q_int
       zero_map:  float32, broadcast-compatible with q_int
     """
-    out_features = ops.shape(weights_transpose)[0]
     in_features = ops.shape(weights_transpose)[1]
 
     # ---- optional activation-order permutation ----
@@ -88,6 +87,13 @@ def gptq_quantize_matrix(
         # Use weight=False so compute_quantization_parameters returns a single scalar
         # for this "tensor" (the column). That scalar will broadcast over [out,1].
         s, z, maxq = compute_scale_zero(col2d)
+        
+        # Collapse to a single scalar per column to match per-tensor semantics.
+        # If s/z are [out,1], take the first row; if already [1,1], this is a no-op.
+        # (Indexing keeps shapes as [1,1].)
+        s = s[:1, :]
+        z = z[:1, :]
+        
         # Ensure shapes [1,1] explicitly
         s = ops.reshape(s, (1, 1))
         z = ops.reshape(z, (1, 1))
@@ -129,7 +135,7 @@ def gptq_quantize_matrix(
                 (1, block_size), dtype="float32"
             )  # [1, b]
             block_zero_row = ops.zeros(
-                (1, block_size), dtype="float32"
+                (1, block_size), dtype="int32"
             )  # [1, b]
 
         for block_idx in range(block_size):

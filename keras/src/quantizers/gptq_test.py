@@ -290,60 +290,170 @@ class GPTQTest(testing.TestCase):
 
         self.assertAllClose(g1.hessian, g2.hessian, rtol=1e-6, atol=1e-6)
 
-    def test_identity_inv_hessian_matches_direct_quantization(self):
-        """Tests that the matrix quantization without error correction
-        matches the direct implementation."""
+def _direct_reference_dequantized(
+    weights_T,
+    inv_hessian,
+    *,
+    compute_scale_zero,
+    per_channel,
+    group_size,
+    activation_order,
+):
+    """Direct, permutation-aware & grouping-aware baseline (no error feedback
+    because inv_hessian is identity). Returns dequantized weights with shape
+    [out_features, in_features].
+    """
+    in_features = ops.shape(weights_T)[1]
+
+    # Optional activation-order permutation (mirrors impl)
+    if activation_order:
+        order_metric = ops.reciprocal(ops.add(ops.diagonal(inv_hessian), 1e-12))
+        perm = _stable_permutation(order_metric)  # descending
+        inv_perm = ops.argsort(perm)
+        work_T = ops.take(weights_T, perm, axis=1)
+    else:
+        work_T = weights_T
+        inv_perm = None
+
+    out = ops.zeros_like(work_T)
+
+    if not per_channel:
+        # Per-tensor: one scalar (s,z) per column (broadcast across rows)
+        for j in range(in_features):
+            col2d = ops.expand_dims(work_T[:, j], 1)  # [out,1]
+            s, z, m = compute_scale_zero(col2d)
+            q = quantize_with_zero_point(col2d, s, z, m)
+            dq = dequantize_with_zero_point(q, s, z)[:, 0]  # [out]
+            out = ops.slice_update(out, (0, j), ops.expand_dims(dq, axis=1))
+    elif group_size == -1:
+        # Per-channel, no grouping: distinct (s,z) per row & column
+        for j in range(in_features):
+            col2d = ops.expand_dims(work_T[:, j], 1)  # [out,1]
+            s, z, m = compute_scale_zero(col2d)       # [out,1]
+            q = quantize_with_zero_point(col2d, s, z, m)
+            dq = dequantize_with_zero_point(q, s, z)[:, 0]
+            out = ops.slice_update(out, (0, j), ops.expand_dims(dq, axis=1))
+    else:
+        # Grouped per-channel: reuse (s,z) (shape [out,1]) across all cols in the group
+        for g in range(0, in_features, group_size):
+            g_end = min(g + group_size, in_features)
+            group_slice = work_T[:, g:g_end]          # [out, group_len]
+            s, z, m = compute_scale_zero(group_slice) # expect [out,1]
+            for j in range(g, g_end):
+                col2d = ops.expand_dims(work_T[:, j], 1)
+                q = quantize_with_zero_point(col2d, s, z, m)
+                dq = dequantize_with_zero_point(q, s, z)[:, 0]
+                out = ops.slice_update(out, (0, j), ops.expand_dims(dq, axis=1))
+
+    # Undo permutation to match original column order
+    if activation_order:
+        out = ops.take(out, inv_perm, axis=1)
+    return out
+
+
+class GPTQIdentityTest(testing.TestCase, parameterized.TestCase):
+    BITS = 4
+    QMIN = 0
+    QMAX = (1 << BITS) - 1  # 15 for 4-bit
+
+    @parameterized.named_parameters(
+        dict(
+            testcase_name="per_tensor_bs4",
+            per_channel=False, group_size=-1, blocksize=4, activation_order=False
+        ),
+        dict(
+            testcase_name="per_tensor_bs64",
+            per_channel=False, group_size=-1, blocksize=64, activation_order=False
+        ),
+        dict(
+            testcase_name="per_channel_nogroup_bs4",
+            per_channel=True, group_size=-1, blocksize=4, activation_order=False
+        ),
+        dict(
+            testcase_name="grouped8_bs4",
+            per_channel=True, group_size=8, blocksize=4, activation_order=False
+        ),
+        dict(
+            testcase_name="grouped8_bs64",
+            per_channel=True, group_size=8, blocksize=64, activation_order=False
+        ),
+        dict(
+            testcase_name="grouped8_activation_order",
+            per_channel=True, group_size=8, blocksize=4, activation_order=True
+        ),
+    )
+    def test_identity_inv_hessian_matches_direct_quantization(
+        self, per_channel, group_size, blocksize, activation_order
+    ):
+        # ---- Test data ----
         in_features, out_features = 32, 128
         weights = ops.reshape(
-            ops.linspace(
-                -0.9, 1.1, in_features * out_features, dtype="float32"
-            ),
+            ops.linspace(-0.9, 1.1, in_features * out_features, dtype="float32"),
             (in_features, out_features),
         )
-        weights_transpose = ops.transpose(weights)
+        weights_T = ops.transpose(weights)  # [out, in]
+        inv_hessian = ops.eye(in_features, dtype="float32")  # identity
 
-        # inverse_hessian = identity; no cross-feature correction
-        # (since all off-diagonal elements are zero), which means
-        # there is no interaction between different features
-        inverse_hessian = ops.eye(in_features, dtype="float32")
-
-        # TODO: DURING TESTING MAKE SURE PARAMS MATCH IN PARTIAL AND gptq_quantize_matrix CALL
+        # ---- Parameter function matching the path under test ----
         get_quant_params = partial(
             compute_quantization_parameters,
             bits=4,
             symmetric=False,
-            per_channel=True,
-            group_size=8,
+            per_channel=per_channel,
+            group_size=group_size,
             weight=True,
         )
-        quantized, scale_map, zero_map = gptq_quantize_matrix(
-            weights_transpose,
-            inverse_hessian,
-            blocksize=4,
-            group_size=8,
-            activation_order=False,
+
+        # ---- System under test ----
+        q_int, scale_map, zero_map = gptq_quantize_matrix(
+            weights_T,
+            inv_hessian,
+            blocksize=blocksize,
+            per_channel=per_channel,
+            group_size=group_size,
+            activation_order=activation_order,
             compute_scale_zero=get_quant_params,
-            per_channel=True,
+        )
+        got = dequantize_with_zero_point(q_int, scale_map, zero_map)
+
+        # ---- Direct, grouping-aware baseline ----
+        want = _direct_reference_dequantized(
+            weights_T,
+            inv_hessian,
+            compute_scale_zero=get_quant_params,
+            per_channel=per_channel,
+            group_size=group_size,
+            activation_order=activation_order,
         )
 
-        # Dequantize the weights
-        # NOTE: THESE NUMBERS ARE REAL CLOSE TO weights_transpose RN!
-        dequantized_weights = dequantize_with_zero_point(
-            quantized, scale_map, zero_map
+        # ---- Equality ----
+        self.assertAllClose(got, want, rtol=1e-6, atol=1e-6)
+
+        # 2) Dequantized matrix is close to original matrix.
+        #    For uniform (nearest) quantization, |x - dq(x)| <= 0.5*scale elementwise
+        #    (relaxed to 1.0*scale for edge bins where clamping may occur).
+        # Build a full scale map for elementwise bounds.
+        if not per_channel:
+            # per-tensor: scale_map is [1, in]; broadcast to [out, in]
+            scale_full = ops.broadcast_to(scale_map, ops.shape(weights_T))
+        else:
+            # per-channel (incl. grouped): test impl materializes full [out, in]
+            scale_full = scale_map
+
+        # Edge elements: q == QMIN or q == QMAX (possible clamp) ⇒ allow up to 1.0*scale.
+        is_edge = ops.logical_or(
+            ops.equal(q_int, self.QMIN), ops.equal(q_int, self.QMAX)
         )
+        half_step = ops.multiply(scale_full, 0.5)
+        bound = ops.where(is_edge, scale_full, half_step)  # [out, in]
 
-        # Compare function output with columnwise direct application
-        # of quantization. FIX THIS PART
-        out = ops.zeros_like(weights_transpose)
-        for j in range(ops.shape(weights_transpose)[1]):
-            column = ops.expand_dims(weights_transpose[:, j : j + 1], 1)
-            scale, zero, maxq = get_quant_params(column)
-            quantized_col = quantize_with_zero_point(column, scale, zero, maxq)
-            dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
-            out = ops.slice_update(out, (0, j), dequantized[:, 0])
-
-        # TODO: The numbers are close but likely can be exact same
-        self.assertAllClose(dequantized_weights, out, atol=1e-1)
+        abs_err = ops.subtract(got, weights_T)     # [out, in]
+        # Verify abs_err <= bound + tiny_numerical_slack
+        slack = 1e-6
+        violation = ops.subtract(abs_err, ops.add(bound, slack))
+        # Expect max(violation) <= 0
+        max_violation = ops.max(violation)
+        self.assertLessEqual(float(max_violation.numpy().item()), 0.0 + 1e-12)
 
     def test_activation_order_permutation_is_undone(self):
         in_features, out_features = 8, 6
@@ -395,17 +505,6 @@ class GPTQTest(testing.TestCase):
 
         # The weights should be identical since permutation is undone
         self.assertAllClose(layer.get_weights()[0], layer2.get_weights()[0])
-
-
-def _compute_scale_zero(x, **_):
-    # Per-column asymmetric int4 example
-    # scale = (max-min)/maxq, zero = round(-min/scale)
-    maxq = 15.0
-    xmin = ops.min(x, axis=0, keepdims=True)
-    xmax = ops.max(x, axis=0, keepdims=True)
-    scale = ops.divide(ops.subtract(xmax, xmin), ops.add(maxq, 1e-8))
-    zero = ops.round(ops.divide(ops.negative(xmin), ops.add(scale, 1e-8)))
-    return scale, zero, maxq
 
 
 def _get_sequence_classifier():
