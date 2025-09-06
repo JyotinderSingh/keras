@@ -577,6 +577,7 @@ class TestModelQuantization(testing.TestCase):
 
         # Build classifier and tokenizer
         model = _get_sequence_classifier()
+        model.compile(jit_compile=False, run_eagerly=True)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Build an eval batch drawn from the SAME distribution as calibration

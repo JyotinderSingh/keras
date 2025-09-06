@@ -7,7 +7,6 @@ from keras.src.ops import linalg
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import GPTQQuantizer
 from keras.src.quantizers.quantizers import compute_quantization_parameters
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
@@ -406,27 +405,18 @@ class GPTQ:
             compute_scale_zero=self.quantizer.find_params,
         )
 
-        # ------- Determine maxq (integer range) -------
-        # Prefer a single global maxq derived from the quantizer configuration.
-        #
-        # If your GPTQConfig exposes `bits`, use that; otherwise, probe via
-        # find_params.
         maxq = ops.cast(
             ops.subtract(ops.power(2, self.config.weight_bits), 1), "float32"
         )
 
-        # ------- Build quantized (dequantized-proxy) weight matrix -------
         Q = quantize_with_sz_map(weights_matrix, scale, zero, g_idx, maxq)
-        Q = dequantize_with_sz_map(Q, scale, zero, g_idx)
 
-        # ------- Restore original layer shape & assign -------
-        Q = ops.transpose(Q)  # back to [in_features, out_features]
-
-        if isinstance(self.original_layer, EinsumDense):
-            Q = ops.reshape(Q, self.kernel_shape)
-
-        # Set the new quantized weights in the original layer
-        self.original_layer._kernel.assign(Q)
+        del self.original_layer._kernel
+        self.original_layer.quantized_kernel.assign(ops.copy(Q))
+        self.original_layer.kernel_scale.assign(ops.copy(scale))
+        self.original_layer.kernel_zero.assign(ops.copy(zero))
+        self.original_layer.g_idx.assign(ops.copy(g_idx))
+        self.original_layer.gptq = True
 
     def free(self):
         self.hessian = None
