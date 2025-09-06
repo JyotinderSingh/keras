@@ -36,59 +36,32 @@ def gptq_quantize_matrix(
     compute_scale_zero=compute_quantization_parameters,
 ):
     """
-    Implements the GPTQ error correction updates.
-
-    For a single column update (column j):
-        e = invH[j, j] * (w_j - q_j)
-        W[:, j+1:] -= e * invH[j, j+1:]
-    where:
-    - w_j is the original column,
-    - q_j is the quantized column,
-    - invH is the inverse Hessian,
-    - e is the propagated error term.
-
-    Across entire blocks:
-        W[:, future] -= E_block * invH[block, future]
-    where:
-    - E_block is the quantization error accumulated for the current block,
-    - invH[block, future] denotes the cross-block slice of the inverse Hessian,
-    - W[:, future] are the columns yet to be quantized.
-
-    Args:
-        weights_transpose: Transposed weight matrix [out_features, in_features]
-         to quantize.
-        inv_hessian: Inverse Hessian matrix [in_features, in_features] for
-         error propagation.
-        blocksize: Size of the blocks to process (default: 128).
-        group_size: Size of the groups for parameter reuse
-         (default: -1, no grouping).
-        activation_order: Whether to apply activation-order permutation
-         (default: False).
-        order_metric: Metric for ordering features
-         (default: None, uses 1 / diag(invH)).
-        compute_scale_zero: Function to compute scale and zero for
-         quantization.
+    Same GPTQ error-correction procedure as before, but returns:
+      - scale: concatenated per-group scales  [out_features, n_groups]
+      - zero:  concatenated per-group zeros   [out_features, n_groups]
+      - g_idx: per-column group index         [in_features,]
+    Notes:
+      * We still *internally* quantize/dequantize columns to compute error
+        feedback (that’s how GPTQ updates future columns), but we no longer
+        build/return a simulated quantized weight matrix.
+      * When group_size == -1, a single group spans all columns.
+      * If activation_order=True, g_idx is mapped back to original column order.
     """
     in_features = ops.shape(weights_transpose)[1]
 
     # Optional activation-order permutation on feature axis (axis=1)
     if activation_order:
         if order_metric is None:
-            # Use 1 / diag(inverse_hessian) as importance proxy if H not
-            # available.
             order_metric = ops.reciprocal(
                 ops.add(ops.diagonal(inv_hessian), 1e-12)
             )
         else:
-            # sanitize provided metric
             order_metric = ops.cast(order_metric, "float32")
             order_metric = ops.where(
                 ops.isfinite(order_metric),
                 order_metric,
                 ops.zeros_like(order_metric),
             )
-
-        # Sort in descending order by importance
         perm = _stable_permutation(order_metric)
         inv_perm = ops.argsort(perm)
 
@@ -99,10 +72,21 @@ def gptq_quantize_matrix(
     else:
         perm = inv_perm = None
 
-    # weights_buffer: [out_features, in_features]
+    # Working buffers
     weights_buffer = weights_transpose
-    # quantized_weights_buffer: [out_features, in_features]
-    quantized_weights_buffer = ops.zeros_like(weights_buffer)
+
+    # For returning parameters
+    scale_chunks = []
+    zero_chunks = []
+
+    # We’ll build group indices after the loop
+    # (shape [in_features,], dtype int32)
+    # Compute "effective" group size
+    effective_group = ops.cond(
+        ops.equal(group_size, -1),
+        lambda: in_features,
+        lambda: group_size,
+    )
 
     # Process features in blocks
     for block_start in range(0, in_features, blocksize):
@@ -110,18 +94,13 @@ def gptq_quantize_matrix(
         block_size = block_end - block_start
 
         # Block views
-        # block_weights: [out_features, bsize]
         block_weights = weights_buffer[:, block_start:block_end]
-        # block_weights_quantized: [out_features, bsize]
-        block_weights_quantized = ops.zeros_like(block_weights)
-        # block_error: [out_features, bsize]
         block_error = ops.zeros_like(block_weights)
-        # block_inv_hessian: [bsize, bsize]
         block_inv_hessian = inv_hessian[
             block_start:block_end, block_start:block_end
         ]
 
-        # group cache for per-group s/z/maxq reuse
+        # Per-group cached params
         cached_scale = None
         cached_zero = None
         cached_maxq = None
@@ -129,58 +108,49 @@ def gptq_quantize_matrix(
 
         for block_idx in range(block_size):
             global_idx = block_start + block_idx
-            # weight_column: [out_features,]
             weight_column = block_weights[:, block_idx]
 
             # Group-wise parameter reuse (compute once per group)
-            if group_size != -1:
-                # Determine group boundaries
-                group_start = (global_idx // group_size) * group_size
+            if not ops.equal(effective_group, in_features):  # group_size != -1
+                group_start = (global_idx // effective_group) * effective_group
                 if group_start != cached_group_start:
-                    group_end = min(group_start + group_size, in_features)
-                    # group_slice: [out_features, group_len]
+                    group_end = min(group_start + effective_group, in_features)
                     group_slice = weights_buffer[:, group_start:group_end]
                     cached_scale, cached_zero, cached_maxq = compute_scale_zero(
                         group_slice, weight=True
                     )
+                    # Store params once per group (in the order encountered)
+                    scale_chunks.append(cached_scale)
+                    zero_chunks.append(cached_zero)
                     cached_group_start = group_start
                 scale, zero, maxq = cached_scale, cached_zero, cached_maxq
             else:
-                # Per-column params
-                scale, zero, maxq = compute_scale_zero(
-                    ops.expand_dims(weight_column, 1), weight=True
-                )
+                # Single global group covering all columns
+                if cached_scale is None:
+                    cached_scale, cached_zero, cached_maxq = compute_scale_zero(
+                        weights_buffer, weight=True
+                    )
+                    scale_chunks.append(cached_scale)
+                    zero_chunks.append(cached_zero)
+                    cached_group_start = 0
+                scale, zero, maxq = cached_scale, cached_zero, cached_maxq
 
-            # Quantize one column
-            # quantized_column: [out_features,]
-            quantized_column = quantize_with_zero_point(
+            # --- Internal quantize/dequantize for GPTQ error correction ---
+            q_col = quantize_with_zero_point(
                 ops.expand_dims(weight_column, 1), scale, zero, maxq
             )
-            quantized_column = dequantize_with_zero_point(
-                quantized_column, scale, zero
-            )[:, 0]
-            block_weights_quantized = ops.slice_update(
-                block_weights_quantized,
-                (0, block_idx),
-                ops.expand_dims(quantized_column, 1),
-            )
+            q_col = dequantize_with_zero_point(q_col, scale, zero)[:, 0]
 
             # Error feedback for remaining columns within the block
-            # diag: [out_features,]
-            diag = block_inv_hessian[block_idx, block_idx]
-            # error = (col - quantized_col) / block_inv_hessian[idx, idx]
-            # error: [out_features,]
-            error = ops.divide(
-                ops.subtract(weight_column, quantized_column), diag
-            )
-            # block_error: [out_features, bsize]
+            d = block_inv_hessian[block_idx, block_idx]
+            err = ops.divide(ops.subtract(weight_column, q_col), d)
             block_error = ops.slice_update(
-                block_error, (0, block_idx), ops.expand_dims(error, 1)
+                block_error, (0, block_idx), ops.expand_dims(err, 1)
             )
 
             if block_idx < block_size - 1:
                 update = ops.matmul(
-                    ops.expand_dims(error, 1),
+                    ops.expand_dims(err, 1),
                     ops.expand_dims(
                         block_inv_hessian[block_idx, block_idx + 1 :], 0
                     ),
@@ -192,18 +162,8 @@ def gptq_quantize_matrix(
                     ops.subtract(tail, update),
                 )
 
-        # Write block’s quantized columns into result
-        left = quantized_weights_buffer[:, :block_start]
-        right = quantized_weights_buffer[:, block_end:]
-        quantized_weights_buffer = ops.concatenate(
-            [left, block_weights_quantized, right], axis=1
-        )
-
         # Propagate block errors to *future* features (beyond the block)
         if block_end < in_features:
-            # weights_buffer[:, block_end:] -=
-            # block_error @ invH[block_start:block_end, block_end:]
-            # total_update: [out_features, bsize]
             total_update = ops.matmul(
                 block_error, inv_hessian[block_start:block_end, block_end:]
             )
@@ -215,13 +175,29 @@ def gptq_quantize_matrix(
                 axis=1,
             )
 
-    # Undo permutation if used
-    if activation_order:
-        quantized_weights_buffer = ops.take(
-            quantized_weights_buffer, inv_perm, axis=1
-        )
+    # Build group indices for each (possibly permuted) column
+    # base_group = effective_group (int)
+    base_group = effective_group
+    # g_idx in permuted domain
+    g_idx = ops.arange(0, in_features, dtype="int32")
+    g_idx = ops.divide(g_idx, base_group)  # integer division (floor)
+    g_idx = ops.cast(g_idx, "int32")
 
-    return quantized_weights_buffer
+    # Map group indices back to original column order if act-order was used
+    if activation_order:
+        g_idx = ops.take(g_idx, inv_perm, axis=0)
+
+    # Concatenate recorded group params
+    if len(scale_chunks) == 0:
+        # Edge case: no groups recorded (empty input); fall back to whole matrix
+        s, z, _ = compute_scale_zero(weights_transpose, weight=True)
+        scale = s
+        zero = z
+    else:
+        scale = ops.concatenate(scale_chunks, axis=1)
+        zero = ops.concatenate(zero_chunks, axis=1)
+
+    return scale, zero, g_idx
 
 
 class GPTQ:
@@ -418,7 +394,7 @@ class GPTQ:
         # Compute the inverse Hessian, which is used for error correction
         inverse_hessian = linalg.inv(hessian_matrix)
 
-        quantized_weights = gptq_quantize_matrix(
+        scale, zero, g_idx = gptq_quantize_matrix(
             weights_matrix,
             inv_hessian=inverse_hessian,
             blocksize=blocksize,
@@ -428,15 +404,42 @@ class GPTQ:
             compute_scale_zero=self.quantizer.find_params,
         )
 
-        quantized_weights = ops.transpose(quantized_weights)
+        # ------- Determine maxq (integer range) -------
+        # Prefer a single global maxq derived from the quantizer configuration.
+        #
+        # If your GPTQConfig exposes `bits`, use that; otherwise, probe via
+        # find_params.
+        maxq = ops.cast(
+            ops.subtract(ops.power(2, self.config.weight_bits), 1), "float32"
+        )
+
+        # ------- Build quantized (dequantized-proxy) weight matrix -------
+        in_features = ops.shape(weights_matrix)[1]
+        Q = ops.zeros_like(weights_matrix)  # [out_features, in_features]
+
+        # Vectorized column loop written in ops-friendly form
+        # (simple python loop is fine; backends lower slice_update efficiently)
+        for j in range(in_features):
+            gid = g_idx[j]  # scalar int32
+            # Select this column and its group's params
+            wj = weights_matrix[:, j : j + 1]  # [out_features, 1]
+            sj = scale[:, gid : gid + 1]  # [out_features, 1]
+            zj = zero[:, gid : gid + 1]  # [out_features, 1]
+
+            q_int = quantize_with_zero_point(wj, sj, zj, maxq)  # integer levels
+            q_deq = dequantize_with_zero_point(q_int, sj, zj)  # float proxy
+
+            # write back the dequantized (float) proxy
+            Q = ops.slice_update(Q, (0, j), q_deq)
+
+        # ------- Restore original layer shape & assign -------
+        Q = ops.transpose(Q)  # back to [in_features, out_features]
 
         if isinstance(self.original_layer, EinsumDense):
-            quantized_weights = ops.reshape(
-                quantized_weights, self.kernel_shape
-            )
+            Q = ops.reshape(Q, self.kernel_shape)
 
         # Set the new quantized weights in the original layer
-        self.original_layer._kernel.assign(quantized_weights)
+        self.original_layer._kernel.assign(Q)
 
     def free(self):
         self.hessian = None
