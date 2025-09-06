@@ -14,7 +14,9 @@ from keras.src.quantizers.gptq import GPTQ
 from keras.src.quantizers.gptq import _stable_permutation
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
+from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 from keras.src.testing.test_utils import named_product
 
@@ -305,13 +307,21 @@ class GPTQTest(testing.TestCase):
         # there is no interaction between different features
         inverse_hessian = ops.eye(in_features, dtype="float32")
 
-        dequantized_weights = gptq_quantize_matrix(
+        scale_map, zero_map, g_idx = gptq_quantize_matrix(
             weights_transpose,
             inverse_hessian,
             blocksize=128,
             group_size=-1,
             activation_order=False,
             compute_scale_zero=_compute_scale_zero,
+        )
+
+        qmax = 15.0
+        quantized_weights = quantize_with_sz_map(
+            weights_transpose, scale_map, zero_map, g_idx, qmax
+        )
+        dequantized_weights = dequantize_with_sz_map(
+            quantized_weights, scale_map, zero_map, g_idx
         )
 
         # Compare function output with columnwise direct application
