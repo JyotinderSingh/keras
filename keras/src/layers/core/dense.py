@@ -403,6 +403,8 @@ class Dense(Layer):
         y = ops.matmul(inputs, W)  # [batch, out_features]
         if getattr(self, "use_bias", False):
             y = ops.add(y, self.bias)
+        if self.activation is not None:
+            y = self.activation(y)
         return y
 
     def _int4_build(self, kernel_shape):

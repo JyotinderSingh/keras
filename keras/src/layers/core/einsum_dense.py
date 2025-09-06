@@ -525,6 +525,8 @@ class EinsumDense(Layer):
         y = ops.einsum(self.equation, inputs, W)
         if getattr(self, "use_bias", False):
             y = ops.add(y, self.bias)
+        if self.activation is not None:
+            y = self.activation(y)
         return y
 
     def _int4_build(self, kernel_shape):
