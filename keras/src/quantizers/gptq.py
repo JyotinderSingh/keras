@@ -7,7 +7,9 @@ from keras.src.ops import linalg
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import GPTQQuantizer
 from keras.src.quantizers.quantizers import compute_quantization_parameters
+from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
+from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 
 
@@ -117,7 +119,7 @@ def gptq_quantize_matrix(
                     group_end = min(group_start + effective_group, in_features)
                     group_slice = weights_buffer[:, group_start:group_end]
                     cached_scale, cached_zero, cached_maxq = compute_scale_zero(
-                        group_slice, weight=True
+                        group_slice
                     )
                     # Store params once per group (in the order encountered)
                     scale_chunks.append(cached_scale)
@@ -128,7 +130,7 @@ def gptq_quantize_matrix(
                 # Single global group covering all columns
                 if cached_scale is None:
                     cached_scale, cached_zero, cached_maxq = compute_scale_zero(
-                        weights_buffer, weight=True
+                        weights_buffer
                     )
                     scale_chunks.append(cached_scale)
                     zero_chunks.append(cached_zero)
@@ -190,7 +192,7 @@ def gptq_quantize_matrix(
     # Concatenate recorded group params
     if len(scale_chunks) == 0:
         # Edge case: no groups recorded (empty input); fall back to whole matrix
-        s, z, _ = compute_scale_zero(weights_transpose, weight=True)
+        s, z, _ = compute_scale_zero(weights_transpose)
         scale = s
         zero = z
     else:
@@ -414,23 +416,8 @@ class GPTQ:
         )
 
         # ------- Build quantized (dequantized-proxy) weight matrix -------
-        in_features = ops.shape(weights_matrix)[1]
-        Q = ops.zeros_like(weights_matrix)  # [out_features, in_features]
-
-        # Vectorized column loop written in ops-friendly form
-        # (simple python loop is fine; backends lower slice_update efficiently)
-        for j in range(in_features):
-            gid = g_idx[j]  # scalar int32
-            # Select this column and its group's params
-            wj = weights_matrix[:, j : j + 1]  # [out_features, 1]
-            sj = scale[:, gid : gid + 1]  # [out_features, 1]
-            zj = zero[:, gid : gid + 1]  # [out_features, 1]
-
-            q_int = quantize_with_zero_point(wj, sj, zj, maxq)  # integer levels
-            q_deq = dequantize_with_zero_point(q_int, sj, zj)  # float proxy
-
-            # write back the dequantized (float) proxy
-            Q = ops.slice_update(Q, (0, j), q_deq)
+        Q = quantize_with_sz_map(weights_matrix, scale, zero, g_idx, maxq)
+        Q = dequantize_with_sz_map(Q, scale, zero, g_idx)
 
         # ------- Restore original layer shape & assign -------
         Q = ops.transpose(Q)  # back to [in_features, out_features]
