@@ -853,23 +853,13 @@ def quantize_with_sz_map(weights_matrix, scale, zero, g_idx, maxq):
         dequantized (float) proxy weights produced by quantize->dequantize
         with the provided group parameters.
     """
-    in_features = ops.shape(weights_matrix)[1]
-    Q = ops.zeros_like(weights_matrix, dtype="int32")
+    g_idx = ops.cast(g_idx, "int32")
+    scale_cols = ops.take(scale, g_idx, axis=1)  # [out_features, in_features]
+    zero_cols  = ops.take(zero,  g_idx, axis=1)  # [out_features, in_features]
 
-    # Column-wise reconstruction using per-group parameters
-    for j in range(in_features):
-        gid = g_idx[j]
-        # Select this column and its group's params
-        wj = weights_matrix[:, j : j + 1]  # [out_features, 1]
-        sj = scale[:, gid : gid + 1]  # [out_features, 1]
-        zj = zero[:, gid : gid + 1]  # [out_features, 1]
-
-        q_int = quantize_with_zero_point(wj, sj, zj, maxq)  # integer levels
-
-        # write back the dequantized (float) proxy
-        Q = ops.slice_update(Q, (0, j), ops.cast(q_int, "int32"))
-
-    return Q
+    # Quantize elementwise, then cast to int
+    q = quantize_with_zero_point(weights_matrix, scale_cols, zero_cols, maxq)
+    return ops.cast(q, "int32")
 
 
 def dequantize_with_sz_map(weights_matrix, scale, zero, g_idx):
@@ -889,20 +879,15 @@ def dequantize_with_sz_map(weights_matrix, scale, zero, g_idx):
         dequantized (float) proxy weights produced by quantize->dequantize
         with the provided group parameters.
     """
-    in_features = ops.shape(weights_matrix)[1]
-    Q = ops.zeros_like(weights_matrix, dtype="float32")
+    # Use g_idx to "gather" the correct scale and zero columns for each
+    # column in the weights_matrix. This creates tensors with the same shape
+    # as the weights_matrix.
+    # ops.gather(params, indices, axis)
+    scales_mapped = ops.take(scale, g_idx, axis=1)
+    zeros_mapped = ops.take(zero, g_idx, axis=1)
 
-    # Column-wise reconstruction using per-group parameters
-    for j in range(in_features):
-        gid = g_idx[j]
-        # Select this column and its group's params
-        wj = weights_matrix[:, j : j + 1]  # [out_features, 1]
-        sj = scale[:, gid : gid + 1]  # [out_features, 1]
-        zj = zero[:, gid : gid + 1]  # [out_features, 1]
-
-        q_deq = dequantize_with_zero_point(wj, sj, zj)  # float proxy
-
-        # write back the dequantized (float) proxy
-        Q = ops.slice_update(Q, (0, j), q_deq)
+    # Now, dequantization is a simple element-wise operation on the full matrices.
+    # This assumes a standard dequantization formula: (quantized_value - zero_point) * scale
+    Q = ops.multiply(ops.subtract(weights_matrix, zeros_mapped), scales_mapped)
 
     return Q

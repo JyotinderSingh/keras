@@ -615,9 +615,9 @@ class TestModelQuantization(testing.TestCase):
         kl = _mean_kl(p_ref, p_q)
 
         self.assertGreaterEqual(
-            top1_match, 0.6, f"Top-1 agreement too low: {top1_match:.3f}"
+            top1_match, 0.7, f"Top-1 agreement too low: {top1_match:.3f}"
         )
-        self.assertLessEqual(kl, 0.50, f"KL divergence too high: {kl:.3f}")
+        self.assertLessEqual(kl, 0.40, f"KL divergence too high: {kl:.3f}")
 
     @parameterized.named_parameters(
         {
