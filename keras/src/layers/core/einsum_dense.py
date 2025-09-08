@@ -507,20 +507,20 @@ class EinsumDense(Layer):
 
     def _gptq_call(self, inputs, training=False):
         if not self.gptq:
-            return self.call(inputs, training=training)
-        # q = ops.cast(self.quantized_kernel, "float32")
-        W = dequantize_with_sz_map(
-            self.quantized_kernel,
-            self.kernel_scale,
-            self.kernel_zero,
-            self.g_idx,
-        )
-        W = ops.transpose(W)
+            W = self._kernel
+        else:
+            W = dequantize_with_sz_map(
+                self.quantized_kernel,
+                self.kernel_scale,
+                self.kernel_zero,
+                self.g_idx,
+            )
+            W = ops.transpose(W)
 
-        W = ops.reshape(W, self.original_kernel_shape)
+            W = ops.reshape(W, self.original_kernel_shape)
 
         y = ops.einsum(self.equation, inputs, W)
-        if getattr(self, "use_bias", False):
+        if self.bias is not None:
             y = ops.add(y, self.bias)
         if self.activation is not None:
             y = self.activation(y)
