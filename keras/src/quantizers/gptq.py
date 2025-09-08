@@ -4,7 +4,7 @@ from keras.src.layers import Dense
 from keras.src.layers import EinsumDense
 from keras.src.ops import linalg
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.quantizers import GPTQQuantizer
+from keras.src.quantizers.quantizers import GPTQQuantizer, dequantize_with_sz_map
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_sz_map
@@ -364,14 +364,20 @@ class GPTQ:
             order_metric=ops.diagonal(hessian_matrix),
             compute_scale_zero=self.quantizer.find_params,
         )
-        # The quantized matrix Q is now returned directly.
-        # The redundant quantization step has been removed.
-        del self.original_layer._kernel
+        Q1 = ops.transpose(dequantize_with_sz_map(Q, scale, zero, g_idx))
+        if isinstance(self.original_layer, EinsumDense):
+            # Reshape back to original 3D shape
+            Q1 = ops.reshape(
+                Q1, self.kernel_shape
+            )
+
+        self.original_layer._kernel.assign(Q1)
+        # del self.original_layer._kernel
         self.original_layer.quantized_kernel.assign(Q)
         self.original_layer.kernel_scale.assign(scale)
         self.original_layer.kernel_zero.assign(zero)
         self.original_layer.g_idx.assign(g_idx)
-        self.original_layer.gptq = True
+        # self.original_layer.gptq = True
 
     def free(self):
         self.hessian = None
