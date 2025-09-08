@@ -364,14 +364,7 @@ class GPTQ:
             order_metric=ops.diagonal(hessian_matrix),
             compute_scale_zero=self.quantizer.find_params,
         )
-        # Q1 = ops.transpose(dequantize_with_sz_map(Q, scale, zero, g_idx))
-        # if isinstance(self.original_layer, EinsumDense):
-        #     # Reshape back to original 3D shape
-        #     Q1 = ops.reshape(
-        #         Q1, self.kernel_shape
-        #     )
 
-        # self.original_layer._kernel.assign(Q1)
         self.original_layer.quantized_kernel.assign(Q)
         self.original_layer.kernel_scale.assign(scale)
         self.original_layer.kernel_zero.assign(zero)
