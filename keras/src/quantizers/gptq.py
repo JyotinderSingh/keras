@@ -76,11 +76,7 @@ def gptq_quantize_matrix(
     # We’ll build group indices after the loop
     # (shape [in_features,], dtype int32)
     # Compute "effective" group size
-    effective_group = ops.cond(
-        ops.equal(group_size, -1),
-        lambda: in_features,
-        lambda: group_size,
-    )
+    effective_group = in_features if group_size == -1 else group_size
     # Process features in blocks
     for block_start in range(0, in_features, blocksize):
         block_end = min(block_start + blocksize, in_features)
@@ -100,7 +96,7 @@ def gptq_quantize_matrix(
             global_idx = block_start + block_idx
             weight_column = block_weights[:, block_idx]
             # Group-wise parameter reuse (compute once per group)
-            if not ops.equal(effective_group, in_features):  # group_size != -1
+            if not effective_group == in_features:  # group_size != -1
                 group_start = (global_idx // effective_group) * effective_group
                 if group_start != cached_group_start:
                     group_end = min(group_start + effective_group, in_features)
@@ -231,7 +227,6 @@ class GPTQ:
             # 2D version of the kernel.
             self.layer = types.SimpleNamespace(
                 kernel=ops.reshape(layer.kernel, (self.rows, self.columns)),
-                bias=layer.bias,
             )
         else:
             # Raise an error if the layer is not supported.
@@ -373,4 +368,5 @@ class GPTQ:
         self.original_layer.gptq = True
 
     def free(self):
-        self.hessian = None
+        del self.hessian
+        del self.layer
