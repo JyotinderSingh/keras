@@ -506,30 +506,59 @@ class Dense(Layer):
 
         if not self.is_gptq_calibrated:
             W = self._kernel
+            y = ops.matmul(inputs, W)
         else:
-            should_unpack = (
-                gptq_core.get_weight_bits_for_layer(self, config=None) == 4
-            )
-            W = (
-                quantizers.unpack_int4(
-                    self.quantized_kernel,
-                    orig_len=self.units,
-                    axis=0,
-                    dtype="uint8",
-                )
-                if should_unpack
-                else self.quantized_kernel
-            )
-            W = ops.transpose(
-                dequantize_with_sz_map(
-                    W,
-                    self.kernel_scale,
-                    self.kernel_zero,
-                    self.g_idx,
-                )
+            # Check if we can use the optimized CUDA kernel
+            from keras.src.quantizers.cuda_kernels import dispatch
+
+            use_cuda = (
+                dispatch.should_use_cuda_kernels()
+                and gptq_core.get_weight_bits_for_layer(self, config=None) == 4
             )
 
-        y = ops.matmul(inputs, W)
+            if use_cuda:
+                # Use fused Marlin CUDA kernel for dequantize + matmul
+                try:
+                    from keras.src.quantizers.cuda_kernels import marlin_ops
+
+                    y = marlin_ops.gptq_matmul(
+                        inputs,
+                        self.quantized_kernel,
+                        self.kernel_scale,
+                        self.kernel_zero,
+                        self.g_idx,
+                        out_features=self.units,
+                    )
+                except (ValueError, RuntimeError):
+                    # Fall back to standard implementation if kernel fails
+                    # (e.g., incompatible dimensions)
+                    use_cuda = False
+
+            if not use_cuda:
+                # Standard implementation: unpack, dequantize, matmul
+                should_unpack = (
+                    gptq_core.get_weight_bits_for_layer(self, config=None) == 4
+                )
+                W = (
+                    quantizers.unpack_int4(
+                        self.quantized_kernel,
+                        orig_len=self.units,
+                        axis=0,
+                        dtype="uint8",
+                    )
+                    if should_unpack
+                    else self.quantized_kernel
+                )
+                W = ops.transpose(
+                    dequantize_with_sz_map(
+                        W,
+                        self.kernel_scale,
+                        self.kernel_zero,
+                        self.g_idx,
+                    )
+                )
+                y = ops.matmul(inputs, W)
+
         if self.bias is not None:
             y = ops.add(y, self.bias)
         if self.activation is not None:
