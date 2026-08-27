@@ -822,31 +822,35 @@ class Layer(BackendLayer, Operation):
         return self.variable_dtype
 
     @property
+    def _resolved_dtype_policy(self):
+        """This layer's own policy, resolved through a `DTypePolicyMap`.
+
+        `self._dtype_policy` is the `DTypePolicyMap` itself when the layer was
+        constructed with one (e.g. when reloading a quantized model whose
+        config carries a policy map). Code that needs the policy of this
+        specific layer (its quantization mode, its name to derive a quantized
+        policy from, ...) must resolve the map by `self.path` instead of
+        reading attributes off the map, which reflect the map's default
+        policy.
+        """
+        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
+            return self._dtype_policy[self.path]
+        return self._dtype_policy
+
+    @property
     def compute_dtype(self):
         """The dtype of the computations performed by the layer."""
-        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
-            policy = self._dtype_policy[self.path]
-        else:
-            policy = self._dtype_policy
-        return policy.compute_dtype
+        return self._resolved_dtype_policy.compute_dtype
 
     @property
     def variable_dtype(self):
         """The dtype of the state (weights) of the layer."""
-        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
-            policy = self._dtype_policy[self.path]
-        else:
-            policy = self._dtype_policy
-        return policy.variable_dtype
+        return self._resolved_dtype_policy.variable_dtype
 
     @property
     def quantization_mode(self):
         """The quantization mode of this layer, `None` if not quantized."""
-        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
-            policy = self._dtype_policy[self.path]
-        else:
-            policy = self._dtype_policy
-        return policy.quantization_mode
+        return self._resolved_dtype_policy.quantization_mode
 
     @property
     def input_dtype(self):

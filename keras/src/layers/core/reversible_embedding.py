@@ -532,8 +532,10 @@ class ReversibleEmbedding(layers.Embedding):
         else:
             raise self._quantization_mode_error(mode)
 
-        # Set new dtype policy.
-        if self.dtype_policy.quantization_mode is None:
+        # Set new dtype policy. Resolve through a `DTypePolicyMap` if the
+        # layer holds one, so the source name is this layer's policy name
+        # rather than the map's.
+        if self.quantization_mode is None:
             policy_name = mode
             if mode == "int4":
                 # Include block_size in policy name for sub-channel quantization
@@ -541,6 +543,6 @@ class ReversibleEmbedding(layers.Embedding):
                 block_size_value = -1 if block_size is None else block_size
                 policy_name = f"int4/{block_size_value}"
             policy = dtype_policies.get(
-                f"{policy_name}_from_{self.dtype_policy.name}"
+                f"{policy_name}_from_{self._resolved_dtype_policy.name}"
             )
             self.dtype_policy = policy

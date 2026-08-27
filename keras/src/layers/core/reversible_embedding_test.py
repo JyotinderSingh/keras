@@ -6,6 +6,7 @@ import pytest
 from absl.testing import parameterized
 
 from keras.src import backend
+from keras.src import dtype_policies
 from keras.src import layers
 from keras.src import models
 from keras.src import ops
@@ -19,6 +20,50 @@ from keras.src.quantizers.report import QuantizationReport
 from keras.src.testing import test_case
 from keras.src.testing import test_utils
 from keras.src.testing.test_utils import named_product
+
+
+class QuantizedWrapperModel(models.Model):
+    """Subclassed model carrying sublayer quantization via `DTypePolicyMap`.
+
+    This is the documented pattern (see the `DTypePolicyMap` docstring and
+    keras-hub's `Backbone`) for making quantized sublayers survive the config
+    round-trip of a subclassed model: the config's `dtype` entry records each
+    quantized sublayer's policy keyed by its `path`.
+    """
+
+    def __init__(self, tie_weights=True, dtype=None, **kwargs):
+        super().__init__(dtype=dtype, **kwargs)
+        self.embedding = layers.ReversibleEmbedding(
+            32,
+            12,
+            tie_weights=tie_weights,
+            dtype=dtype,
+            name="embedding",
+        )
+
+    def call(self, inputs):
+        hidden = self.embedding(inputs)
+        return self.embedding(hidden, reverse=True)
+
+    def get_config(self):
+        config = super().get_config()
+        config["tie_weights"] = self.embedding.tie_weights
+        dtype = self.dtype_policy
+        if not isinstance(dtype, dtype_policies.DTypePolicyMap):
+            policy_map = dtype_policies.DTypePolicyMap()
+            for sublayer in self._flatten_layers():
+                if sublayer.quantization_mode is not None:
+                    policy_map[sublayer.path] = sublayer.dtype_policy
+            if len(policy_map) > 0:
+                dtype = policy_map
+        config["dtype"] = dtype_policies.serialize(dtype)
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        config = config.copy()
+        config["dtype"] = dtype_policies.deserialize(config.get("dtype"))
+        return cls(**config)
 
 
 class ReversibleEmbeddingTest(test_case.TestCase):
@@ -207,6 +252,84 @@ class ReversibleEmbeddingTest(test_case.TestCase):
         new_model.quantize(mode)
         new_model.load_weights(temp_filepath)
         self.assertAllClose(model.predict(x), new_model.predict(x))
+
+    @parameterized.named_parameters(
+        named_product(mode=("int8", "int4"), tie_weights=(False, True))
+    )
+    def test_quantized_subclassed_model_saving(self, mode, tie_weights):
+        # Regression test: a subclassed model wrapping a quantized
+        # `ReversibleEmbedding` (quantization recorded in the config via
+        # `DTypePolicyMap`) must survive `model.save()` /
+        # `keras.saving.load_model()`. The reload build path used to rebuild
+        # the sublayer as float because the model was built outside its name
+        # scope, so the policy-map lookup missed and loading failed with
+        # "expected N variables, but received 0".
+        model = QuantizedWrapperModel(tie_weights=tie_weights)
+        x = np.random.randint(0, 32, size=(2, 5))
+        model(x)
+        model.quantize(mode, verbose=False)
+        y_quantized = ops.convert_to_numpy(model(x))
+        custom_objects = {"QuantizedWrapperModel": QuantizedWrapperModel}
+
+        temp_filepath = os.path.join(self.get_temp_dir(), "wrapped.keras")
+        model.save(temp_filepath)
+        loaded = saving.load_model(temp_filepath, custom_objects)
+        self.assertEqual(loaded.embedding.quantization_mode, mode)
+        self.assertLen(loaded.embedding.weights, len(model.embedding.weights))
+        for ref, restored in zip(
+            model.embedding.weights, loaded.embedding.weights
+        ):
+            self.assertEqual(ref.name, restored.name)
+            self.assertDType(restored, ref.dtype)
+            self.assertAllClose(restored, ref)
+        # The `DTypePolicyMap` carries the policy but not the original
+        # `quantization_config`, so the reloaded int4 layer falls back to the
+        # default reverse-pass activation quantizer; allow a small tolerance.
+        atol = 1e-4 if mode == "int4" else 1e-6
+        self.assertAllClose(loaded(x), y_quantized, atol=atol)
+
+        # Save the *loaded* model and load it again. The re-save used to
+        # break because the reloaded layer holds the `DTypePolicyMap` itself,
+        # and the save path consulted `dtype_policy.quantization_mode` (the
+        # map's default, `None`) instead of the layer's resolved mode,
+        # storing a `None` scale.
+        temp_filepath = os.path.join(self.get_temp_dir(), "rewrapped.keras")
+        loaded.save(temp_filepath)
+        reloaded = saving.load_model(temp_filepath, custom_objects)
+        for ref, restored in zip(
+            loaded.embedding.weights, reloaded.embedding.weights
+        ):
+            self.assertAllClose(restored, ref)
+        self.assertAllClose(
+            reloaded(x), ops.convert_to_numpy(loaded(x)), atol=atol
+        )
+
+    @parameterized.named_parameters(
+        named_product(mode=("int8", "int4"), tie_weights=(False, True))
+    )
+    def test_quantize_with_dtype_policy_map(self, mode, tie_weights):
+        # A layer holding a `DTypePolicyMap` (like every sublayer of a
+        # reloaded quantized model) must still be quantizable and
+        # serializable: the new policy name is derived from the layer's
+        # resolved policy, not from the map, and the save loop keeps its
+        # positional contract.
+        layer = layers.ReversibleEmbedding(
+            32,
+            12,
+            tie_weights=tie_weights,
+            dtype=dtype_policies.DTypePolicyMap("float32"),
+            name="embedding",
+        )
+        layer.build()
+        layer.quantize(mode)
+        self.assertEqual(layer.quantization_mode, mode)
+
+        store = {}
+        layer.save_own_variables(store)
+        n_expected = len(test_utils.serialized_variable_names(layer))
+        self.assertEqual(set(store.keys()), {str(i) for i in range(n_expected)})
+        for key, value in store.items():
+            self.assertIsNotNone(value, msg=f"store[{key!r}] is None")
 
     @parameterized.named_parameters(
         named_product(mode=("float8", "gptq"), tie_weights=(True, False))

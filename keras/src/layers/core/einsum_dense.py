@@ -1430,8 +1430,10 @@ class EinsumDense(Layer):
             if mode == "int4" and use_grouped:
                 self.kernel_zero.assign(kernel_zero)
 
-        # Set new dtype policy
-        if self.dtype_policy.quantization_mode is None:
+        # Set new dtype policy. Resolve through a `DTypePolicyMap` if the
+        # layer holds one, so the source name is this layer's policy name
+        # rather than the map's.
+        if self.quantization_mode is None:
             policy_name = mode
             if mode in ("gptq", "awq"):
                 policy_name = self.quantization_config.dtype_policy_string()
@@ -1442,7 +1444,7 @@ class EinsumDense(Layer):
                 block_size_value = -1 if block_size is None else block_size
                 policy_name = f"int4/{block_size_value}"
             policy = dtype_policies.get(
-                f"{policy_name}_from_{self.dtype_policy.name}"
+                f"{policy_name}_from_{self._resolved_dtype_policy.name}"
             )
             self.dtype_policy = policy
 
@@ -1526,7 +1528,12 @@ class EinsumDense(Layer):
                     This is `None` for per-channel or non-int4 modes.
         """
         # If not a quantized layer, return the full-precision kernel directly.
-        if self.dtype_policy.quantization_mode in (None, "gptq", "awq"):
+        # Use the resolved `quantization_mode` rather than
+        # `self.dtype_policy.quantization_mode`: when the layer holds a
+        # `DTypePolicyMap` (e.g. after reloading a quantized model), the
+        # latter is the map's default mode (`None`) and would wrongly take
+        # this branch, saving a `None` scale for a quantized layer.
+        if self.quantization_mode in (None, "gptq", "awq"):
             return self.kernel, None, None
 
         kernel_zero = getattr(self, "kernel_zero", None)

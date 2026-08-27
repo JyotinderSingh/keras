@@ -667,8 +667,10 @@ class Embedding(Layer):
         else:
             raise self._quantization_mode_error(mode)
 
-        # Set new dtype policy.
-        if self.dtype_policy.quantization_mode is None:
+        # Set new dtype policy. Resolve through a `DTypePolicyMap` if the
+        # layer holds one, so the source name is this layer's policy name
+        # rather than the map's.
+        if self.quantization_mode is None:
             policy_name = mode
             if mode == "int4":
                 # Include block_size in policy name for sub-channel quantization
@@ -676,7 +678,7 @@ class Embedding(Layer):
                 block_size_value = -1 if block_size is None else block_size
                 policy_name = f"int4/{block_size_value}"
             policy = dtype_policies.get(
-                f"{policy_name}_from_{self.dtype_policy.name}"
+                f"{policy_name}_from_{self._resolved_dtype_policy.name}"
             )
             self.dtype_policy = policy
 
@@ -711,7 +713,12 @@ class Embedding(Layer):
                 `embeddings_zero`: The zero point for sub-channel quantization.
                     This is `None` for per-channel quantization modes.
         """
-        if self.dtype_policy.quantization_mode in (None, "gptq", "awq"):
+        # Use the resolved `quantization_mode` rather than
+        # `self.dtype_policy.quantization_mode`: when the layer holds a
+        # `DTypePolicyMap` (e.g. after reloading a quantized model), the
+        # latter is the map's default mode (`None`) and would wrongly take
+        # this branch, saving a `None` scale for a quantized layer.
+        if self.quantization_mode in (None, "gptq", "awq"):
             return self.embeddings, None, None
 
         embeddings_value = self._embeddings

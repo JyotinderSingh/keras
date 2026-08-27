@@ -730,9 +730,17 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         if "input_shape" in config:
             # Case: all inputs are in the first arg (possibly nested).
             if utils.is_default(self.build):
-                status = self._build_by_run_for_single_pos_arg(
-                    config["input_shape"]
-                )
+                # Build under this model's name scope so that sublayers built
+                # by running `call` get the same `path` they would get when
+                # the model is called normally (`__call__` opens the scope).
+                # Otherwise reloading assigns paths that are missing the model
+                # prefix, which breaks path-keyed lookups such as
+                # `DTypePolicyMap` and silently rebuilds quantized sublayers
+                # as float.
+                with self._open_name_scope():
+                    status = self._build_by_run_for_single_pos_arg(
+                        config["input_shape"]
+                    )
             else:
                 try:
                     self.build(config["input_shape"])
@@ -744,7 +752,11 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         elif "shapes_dict" in config:
             # Case: inputs were recorded as multiple keyword arguments.
             if utils.is_default(self.build):
-                status = self._build_by_run_for_kwargs(config["shapes_dict"])
+                # See the name-scope comment above.
+                with self._open_name_scope():
+                    status = self._build_by_run_for_kwargs(
+                        config["shapes_dict"]
+                    )
             else:
                 try:
                     self.build(**config["shapes_dict"])

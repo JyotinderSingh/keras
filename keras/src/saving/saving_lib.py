@@ -870,7 +870,12 @@ def _load_state(
             except Exception as e:
                 if failed_saveables is not None:
                     failed_saveables.add(id(saveable))
-                error_msgs[id(saveable)] = saveable, e
+                # Keep the first error: a saveable reachable through several
+                # attribute paths is saved only under the first one visited,
+                # so a retry through a later path reads an empty store and
+                # would mask the real error with a misleading
+                # "received 0 variables" message.
+                error_msgs.setdefault(id(saveable), (saveable, e))
                 failure = True
         else:
             saveable.load_own_variables(store)
@@ -882,7 +887,8 @@ def _load_state(
             except Exception as e:
                 if failed_saveables is not None:
                     failed_saveables.add(id(saveable))
-                error_msgs[id(saveable)] = saveable, e
+                # See above: keep the first error for this saveable.
+                error_msgs.setdefault(id(saveable), (saveable, e))
                 failure = True
         else:
             saveable.load_assets(assets_store.get(inner_path))

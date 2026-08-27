@@ -1281,7 +1281,9 @@ class Dense(Layer):
             raise self._quantization_mode_error(mode)
 
         # Set new dtype policy only for modes that already have a policy.
-        if self.dtype_policy.quantization_mode is None:
+        # Resolve through a `DTypePolicyMap` if the layer holds one, so the
+        # source name is this layer's policy name rather than the map's.
+        if self.quantization_mode is None:
             from keras.src import dtype_policies  # local import to avoid cycle
 
             policy_name = mode
@@ -1294,7 +1296,7 @@ class Dense(Layer):
                 block_size_value = -1 if block_size is None else block_size
                 policy_name = f"int4/{block_size_value}"
             policy = dtype_policies.get(
-                f"{policy_name}_from_{self.dtype_policy.name}"
+                f"{policy_name}_from_{self._resolved_dtype_policy.name}"
             )
             self.dtype_policy = policy
 
@@ -1329,9 +1331,14 @@ class Dense(Layer):
                 `kernel_zero`: The zero point for sub-channel int4 quantization.
                     This is `None` for per-channel or non-int4 modes.
         """
-        if self.dtype_policy.quantization_mode in (None, "gptq", "awq"):
+        # Use the resolved `quantization_mode` rather than
+        # `self.dtype_policy.quantization_mode`: when the layer holds a
+        # `DTypePolicyMap` (e.g. after reloading a quantized model), the
+        # latter is the map's default mode (`None`) and would wrongly take
+        # this branch, saving a `None` scale for a quantized layer.
+        if self.quantization_mode in (None, "gptq", "awq"):
             return self.kernel, None, None
-        if self.dtype_policy.quantization_mode == "ternary":
+        if self.quantization_mode == "ternary":
             return self._packed_kernel, None, None
 
         kernel_value = self._kernel
