@@ -8,11 +8,16 @@ no generic quantization support). The mode descriptors in
 quantized values, and run quantized forward passes, so layer classes hold no
 per-mode methods.
 
-Projections are the family so far: a float kernel contracted against the
-inputs, either by a plain matmul (`Dense`, `ProjectionGeometry`) or by an
-einsum whose axis analysis lives on the layer itself (`EinsumDense`,
-`EinsumProjectionGeometry`). Further families are added as their layers move
-onto the protocol.
+Two geometry families exist today:
+
+- Projection: a float kernel contracted against the inputs. `Dense` and
+  `TernaryDense` are the plain matmul case (`ProjectionGeometry`);
+  `EinsumDense` is the equation-driven case (`EinsumProjectionGeometry`),
+  whose axis analysis lives on the layer itself and is reached through the
+  geometry's hooks.
+- Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
+  plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
+  projection (`ReversibleLookupGeometry`).
 
 Making a layer quantizable
 --------------------------
@@ -214,3 +219,20 @@ class EinsumProjectionGeometry(ProjectionGeometry):
 
     def record_calibration_kernel_shape(self, kernel_shape):
         self.layer.original_kernel_shape = kernel_shape
+
+
+class LookupGeometry(QuantizationGeometry):
+    """Geometry of an embeddings table indexed by integer inputs."""
+
+    family = "lookup"
+
+    @property
+    def weight_shape(self):
+        return (self.layer.input_dim, self.layer.output_dim)
+
+
+class ReversibleLookupGeometry(LookupGeometry):
+    """Lookup geometry with a reverse projection (`ReversibleEmbedding`)."""
+
+    call_family = "reversible_lookup"
+    reversible = True
