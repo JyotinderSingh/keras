@@ -1,15 +1,18 @@
 import math
 
+from keras.src import backend
 from keras.src import ops
 from keras.src.dtype_policies.dtype_policy import Int4DTypePolicy
 from keras.src.dtype_policies.dtype_policy import QuantizedDTypePolicy
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.quantizers.modes.common import GeometryDispatchMode
+from keras.src.quantizers.modes.common import add_einsum_lora_delta
 from keras.src.quantizers.modes.common import add_matmul_lora_delta
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
+from keras.src.quantizers.quantizers import abs_max_quantize
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
@@ -333,4 +336,273 @@ class Int4Mode(GeometryDispatchMode):
         layer._kernel.assign(packed_kernel_value)
         layer.kernel_scale.assign(kernel_scale)
         if _is_grouped(block_size):
+            layer.kernel_zero.assign(kernel_zero)
+
+    # --- Einsum projection (EinsumDense) ----------------------------------
+
+    def _build_einsum(self, layer, geometry, kernel_shape, config):
+        """Build variables for int4 quantization of an einsum kernel.
+
+        The kernel is flattened to 2D [rows, columns]
+        and packed along last axis to [rows, ceil(columns/2)].
+
+        Args:
+            layer: The layer being built.
+            kernel_shape: Original kernel shape (may be N-dimensional).
+            config: Optional quantization config specifying block_size.
+        """
+        layer._set_quantization_info()
+
+        layer.inputs_quantizer = (
+            QuantizationConfig.activation_quantizer_or_default(config, None)
+        )
+        layer.quantization_axis = tuple(layer._input_reduced_axes)
+        layer.original_kernel_shape = kernel_shape
+
+        # Flatten kernel to 2D: rows = reduced dims, columns = non-reduced dims
+        rows, columns = _flatten_rows_columns(
+            kernel_shape, layer._kernel_reduced_axes
+        )
+
+        block_size = self.resolve_block_size(layer, config)
+        use_grouped = _is_grouped(block_size)
+        layer._int4_block_size = block_size if use_grouped else None
+        layer._int4_unpacked_column_size = columns
+        layer._int4_rows = rows
+
+        # Kernel packed along last axis (columns)
+        # Stored shape: [rows, ceil(columns/2)]
+        packed_cols = (columns + 1) // 2
+        layer._kernel = layer.add_weight(
+            name="kernel",
+            shape=(rows, packed_cols),
+            initializer="zeros",
+            dtype="int8",
+            trainable=False,
+        )
+
+        if use_grouped:
+            # Sub-channel: [n_groups, columns]
+            n_groups = math.ceil(rows / block_size)
+            scale_shape = (n_groups, columns)
+        else:
+            scale_shape = (columns,)
+
+        layer.kernel_scale = layer.add_weight(
+            name="kernel_scale",
+            shape=scale_shape,
+            initializer="ones",
+            trainable=False,
+        )
+
+        # Sub-channel quantization uses asymmetric quantization with zero point
+        if use_grouped:
+            layer.kernel_zero = layer.add_weight(
+                name="zero_point",
+                shape=scale_shape,
+                initializer="zeros",
+                dtype="int8",
+                trainable=False,
+            )
+            # `g_idx` is stored as `float32` because TF has no GPU kernel for
+            # int32 resource variables (would pin the variable to CPU and
+            # break jit_compile on GPU); consumers cast to int32 on-device.
+            layer.g_idx = layer.add_weight(
+                name="g_idx",
+                shape=(rows,),
+                initializer="zeros",
+                dtype="float32",
+                trainable=False,
+            )
+            layer.g_idx.assign(
+                ops.floor_divide(ops.arange(rows, dtype="float32"), block_size)
+            )
+
+    def _call_einsum(self, layer, inputs, training=None):
+        """Forward pass for int4 quantized EinsumDense.
+
+        Uses custom gradients to handle quantized weights since autodiff
+        cannot differentiate through int4 operations.
+        """
+        block_size = getattr(layer, "_int4_block_size", None)
+
+        if _is_per_channel(block_size):
+
+            @ops.custom_gradient
+            def einsum_per_channel_with_inputs_gradient(
+                inputs, packed_kernel, kernel_scale
+            ):
+                """Per-channel int4 forward pass with custom gradient."""
+                # Unpack: stored as [rows, ceil(columns/2)],
+                # unpack along last axis
+                unpacked_kernel = unpack_int4(
+                    packed_kernel,
+                    layer._int4_unpacked_column_size,
+                    axis=-1,
+                    dtype="int8",
+                )
+
+                def _dequantize_kernel(unpacked, scale):
+                    # kernel is [rows, columns], scale is [columns]
+                    float_kernel = ops.divide(
+                        ops.cast(unpacked, dtype=layer.compute_dtype),
+                        scale,
+                    )
+                    return ops.reshape(
+                        float_kernel, layer.original_kernel_shape
+                    )
+
+                def grad_fn(*args, upstream=None):
+                    if upstream is None:
+                        (upstream,) = args
+                    float_kernel = _dequantize_kernel(
+                        unpacked_kernel, kernel_scale
+                    )
+                    inputs_grad = ops.einsum(
+                        layer._custom_gradient_equation, upstream, float_kernel
+                    )
+                    return (inputs_grad, None, None)
+
+                if layer.inputs_quantizer:
+                    # Per-channel with input quantization
+                    float_kernel = _dequantize_kernel(
+                        unpacked_kernel, kernel_scale
+                    )
+                    inputs_q, inputs_scale = layer.inputs_quantizer(
+                        inputs, axis=layer.quantization_axis
+                    )
+                    inputs_scale = layer._adjust_scale_for_quant(
+                        inputs_scale, "input"
+                    )
+                    # Cast inputs to float for einsum. This is a workaround
+                    # for PyTorch's einsum which doesn't support
+                    # mixed-precision inputs (int8 input, float kernel).
+                    if backend.backend() == "torch":
+                        x = ops.einsum(
+                            layer.equation,
+                            ops.cast(inputs_q, layer.compute_dtype),
+                            float_kernel,
+                        )
+                        x = ops.divide(x, inputs_scale)
+                    else:
+                        x = ops.einsum(layer.equation, inputs_q, float_kernel)
+                        x = ops.cast(x, layer.compute_dtype)
+                        x = ops.divide(x, inputs_scale)
+                else:
+                    # Weight-only per-channel quantization
+                    float_kernel = _dequantize_kernel(
+                        unpacked_kernel, kernel_scale
+                    )
+                    x = ops.einsum(layer.equation, inputs, float_kernel)
+                return x, grad_fn
+
+            x = einsum_per_channel_with_inputs_gradient(
+                inputs,
+                ops.convert_to_tensor(layer._kernel),
+                ops.convert_to_tensor(layer.kernel_scale),
+            )
+        else:
+
+            @ops.custom_gradient
+            def einsum_sub_channel_with_inputs_gradient(
+                inputs, packed_kernel, kernel_scale, kernel_zero, g_idx
+            ):
+                """Sub-channel int4 forward pass with custom gradient."""
+                # Unpack: stored as [rows, ceil(columns/2)],
+                # unpack along last axis
+                unpacked_kernel = unpack_int4(
+                    packed_kernel,
+                    layer._int4_unpacked_column_size,
+                    axis=-1,
+                    dtype="int8",
+                )
+
+                def _dequantize_kernel(unpacked, scale, zero, g_idx_t):
+                    # Dequantize with group_axis=0 since
+                    # scale is [n_groups, columns]
+                    float_kernel = dequantize_with_sz_map(
+                        unpacked, scale, zero, g_idx_t, group_axis=0
+                    )
+                    float_kernel = ops.cast(float_kernel, layer.compute_dtype)
+                    return ops.reshape(
+                        float_kernel, layer.original_kernel_shape
+                    )
+
+                def grad_fn(*args, upstream=None):
+                    if upstream is None:
+                        (upstream,) = args
+                    float_kernel = _dequantize_kernel(
+                        unpacked_kernel, kernel_scale, kernel_zero, g_idx
+                    )
+                    inputs_grad = ops.einsum(
+                        layer._custom_gradient_equation, upstream, float_kernel
+                    )
+                    return (inputs_grad, None, None, None, None)
+
+                float_kernel = _dequantize_kernel(
+                    unpacked_kernel, kernel_scale, kernel_zero, g_idx
+                )
+                x = ops.einsum(layer.equation, inputs, float_kernel)
+                return x, grad_fn
+
+            x = einsum_sub_channel_with_inputs_gradient(
+                inputs,
+                ops.convert_to_tensor(layer._kernel),
+                ops.convert_to_tensor(layer.kernel_scale),
+                ops.convert_to_tensor(layer.kernel_zero),
+                ops.convert_to_tensor(layer.g_idx),
+            )
+
+        x = add_einsum_lora_delta(layer, inputs, x)
+        return apply_bias_activation(layer, x)
+
+    def _quantize_einsum(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        layer._set_quantization_info()
+        # `Int4Mode.resolve_block_size` is the single source of truth for the
+        # group size, shared with the build path and the dtype-policy naming.
+        # A bare `quantize("int4")` resolves to the canonical
+        # `Int4QuantizationConfig()` (grouped, block_size=128); `None`/`-1`
+        # selects per-channel.
+        block_size = self.resolve_block_size(layer, config)
+        use_grouped = _is_grouped(block_size)
+
+        # Flatten kernel to 2D: rows = reduced dims, columns = non-reduced
+        rows, columns = _flatten_rows_columns(
+            kernel_shape, layer._kernel_reduced_axes
+        )
+
+        flat_kernel = ops.reshape(layer._kernel, (rows, columns))
+
+        if not use_grouped:
+            # Per-channel quantization
+            kernel_value_int4, kernel_scale = abs_max_quantize(
+                flat_kernel,
+                axis=0,
+                value_range=(-8, 7),
+                dtype="int8",
+                to_numpy=True,
+            )
+            kernel_scale = ops.squeeze(kernel_scale, axis=0)
+        else:
+            # Sub-channel quantization with asymmetric zero point
+            # Returns kernel [rows, columns], scale [n_groups, columns]
+            kernel_value_int4, kernel_scale, kernel_zero = (
+                abs_max_quantize_grouped_with_zero_point(
+                    flat_kernel, block_size=block_size, to_numpy=True
+                )
+            )
+
+        # Pack two int4 values per int8 byte along last axis
+        # Stored as [rows, ceil(columns/2)]
+        packed_kernel_value, _, _ = pack_int4(kernel_value_int4, axis=-1)
+        kernel_value = packed_kernel_value
+        del layer._kernel
+        layer.quantized_build(kernel_shape, "int4", config)
+
+        # Assign values to the newly created variables.
+        layer._kernel.assign(kernel_value)
+        layer.kernel_scale.assign(kernel_scale)
+        # Assign zero point for sub-channel int4 quantization
+        if use_grouped:
             layer.kernel_zero.assign(kernel_zero)

@@ -8,9 +8,11 @@ no generic quantization support). The mode descriptors in
 quantized values, and run quantized forward passes, so layer classes hold no
 per-mode methods.
 
-One geometry family exists so far: a projection, whose float kernel is
-contracted against the inputs by a matmul (`Dense`). Further families are
-added as their layers move onto the protocol.
+Projections are the family so far: a float kernel contracted against the
+inputs, either by a plain matmul (`Dense`, `ProjectionGeometry`) or by an
+einsum whose axis analysis lives on the layer itself (`EinsumDense`,
+`EinsumProjectionGeometry`). Further families are added as their layers move
+onto the protocol.
 
 Making a layer quantizable
 --------------------------
@@ -167,3 +169,48 @@ class ProjectionGeometry(QuantizationGeometry):
         )
         beta = float(np.mean(abs_k))
         return kernel_ternary, beta
+
+
+class EinsumProjectionGeometry(ProjectionGeometry):
+    """Geometry of an N-D einsum kernel (`EinsumDense`).
+
+    The equation-derived axis analysis (reduced/transpose/expand/squeeze
+    axes, the custom-gradient equation) is the layer's own geometry
+    implementation; this class routes the mode descriptors to it.
+    """
+
+    family = "einsum"
+
+    def prepare(self):
+        self.layer._set_quantization_info()
+
+    def calibration_rows_columns(self, kernel_shape):
+        if len(kernel_shape) == 2:
+            return kernel_shape[0], kernel_shape[1]
+        # 3D kernels are split by locating the model dimension (the largest
+        # one): [d_model, heads, head_dim] is a QKV projection, while
+        # [heads, head_dim, d_model] is an attention output projection.
+        shape = list(kernel_shape)
+        d_model_dim_index = shape.index(max(shape))
+        if d_model_dim_index == 0:  # QKV projection case
+            in_features, heads, head_dim = shape
+            return in_features, heads * head_dim
+        elif d_model_dim_index in [1, 2]:  # Attention Output case
+            heads, head_dim, out_features = shape
+            return heads * head_dim, out_features
+        raise ValueError("Could not determine row/column split.")
+
+    def store_unpacked_columns(self, mode_name, columns):
+        setattr(self.layer, f"{mode_name}_unpacked_column_size", columns)
+
+    def unpacked_columns(self, mode_name):
+        return getattr(self.layer, f"{mode_name}_unpacked_column_size")
+
+    def contract(self, inputs, kernel):
+        return ops.einsum(self.layer.equation, inputs, kernel)
+
+    def reshape_kernel(self, kernel):
+        return ops.reshape(kernel, self.layer.original_kernel_shape)
+
+    def record_calibration_kernel_shape(self, kernel_shape):
+        self.layer.original_kernel_shape = kernel_shape
