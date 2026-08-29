@@ -1,9 +1,15 @@
+import numpy as np
 from absl.testing import parameterized
 
+from keras.src import backend
 from keras.src import dtype_policies
+from keras.src import layers
+from keras.src import models
+from keras.src import ops
 from keras.src import testing
 from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
 from keras.src.quantizers import mode_registry
+from keras.src.quantizers.quantization_config import QuantizationConfig
 
 
 class ModeRegistryTest(testing.TestCase):
@@ -271,3 +277,137 @@ class PolicyCodecCorpusTest(testing.TestCase):
         self.assertEqual(
             dtype_policies.serialize(policy)["class_name"], class_name
         )
+
+
+class ToyModeConfig(QuantizationConfig):
+    """Config for the toy float16-storage mode used in the test below."""
+
+    def __init__(self):
+        super().__init__(None, None)
+
+    @property
+    def mode(self):
+        return "demo_half"
+
+    def get_config(self):
+        return {}
+
+    @classmethod
+    def from_config(cls, config):
+        return cls()
+
+
+class ToyHalfMode(mode_registry.QuantizationMode):
+    """A toy quantization mode: store the kernel in float16.
+
+    This is the "add a mode is a registration, not a treasure hunt"
+    demonstration: the descriptor implements build/call/quantize directly
+    against the layer's geometry (`_quantization_geometry()`), so no
+    layer class needs editing and no dispatch chain exists to extend.
+    """
+
+    name = "demo_half"
+    config_cls = ToyModeConfig
+
+    def supports_layer(self, layer):
+        return isinstance(layer, layers.Dense)
+
+    def build(self, layer, input_shape, config):
+        del config
+        layer._kernel = layer.add_weight(
+            name="kernel",
+            shape=input_shape,
+            initializer="zeros",
+            dtype="float16",
+            trainable=False,
+        )
+
+    def quantize(self, layer, config):
+        kernel_shape = layer._quantization_geometry().weight_shape
+        kernel_value = ops.cast(layer._kernel, "float16")
+        del layer._kernel
+        layer.quantized_build(kernel_shape, self.name, config)
+        layer._kernel.assign(kernel_value)
+
+    def call(self, layer, inputs, training=None):
+        x = ops.matmul(inputs, ops.cast(layer._kernel, layer.compute_dtype))
+        if layer.bias is not None:
+            x = ops.add(x, layer.bias)
+        if layer.activation is not None:
+            x = layer.activation(x)
+        return x
+
+
+class ToyModeRegistrationTest(testing.TestCase):
+    """End-to-end test that a new mode is just a registry entry."""
+
+    def setUp(self):
+        super().setUp()
+        mode_registry.register_quantization_mode(ToyHalfMode)
+
+    def tearDown(self):
+        mode_registry.unregister_quantization_mode("demo_half")
+        super().tearDown()
+
+    def test_toy_mode_end_to_end(self):
+        layer = layers.Dense(units=3)
+        layer.build((None, 4))
+        reference_kernel = ops.convert_to_numpy(layer._kernel)
+
+        layer.quantize("demo_half")
+
+        # The kernel is now stored in float16 and the policy is named after
+        # the mode, all through the generic machinery.
+        self.assertEqual(
+            backend.standardize_dtype(layer._kernel.dtype), "float16"
+        )
+        self.assertEqual(layer.dtype_policy.name, "demo_half_from_float32")
+        self.assertEqual(layer.quantization_mode, "demo_half")
+        self.assertTrue(layer._is_quantized)
+
+        # The quantized forward pass dispatches through the descriptor.
+        x = np.random.uniform(-1, 1, size=(2, 4)).astype("float32")
+        y = ops.convert_to_numpy(layer(x))
+        expected = x @ reference_kernel.astype("float16").astype(
+            "float32"
+        ) + ops.convert_to_numpy(layer.bias)
+        self.assertAllClose(y, expected, atol=1e-3)
+
+    def test_toy_mode_through_model_quantize(self):
+        model = models.Sequential(
+            [layers.Input((4,)), layers.Dense(3, name="target")]
+        )
+        report = model.quantize("demo_half", verbose=False)
+        self.assertEqual(
+            model.get_layer("target").dtype_policy.name,
+            "demo_half_from_float32",
+        )
+        self.assertIn(
+            "target", "".join(path for path, _, _ in report.quantized)
+        )
+
+    def test_toy_mode_rejects_unsupported_layer(self):
+        # `supports_layer` only claims Dense; an Embedding must be skipped
+        # with NotImplementedError, like any unsupported (layer, mode) pair.
+        layer = layers.Embedding(5, 3)
+        layer.build()
+        with self.assertRaises(NotImplementedError):
+            layer.quantize("demo_half")
+
+
+class QuantizeTransactionTest(testing.TestCase):
+    def test_unsupported_mode_leaves_layer_untouched(self):
+        # An unsupported (layer, mode) pair must be rejected before any
+        # state is mutated, so `Model.quantize` records the layer as
+        # skipped and the layer stays fully usable and quantizable.
+        layer = layers.Embedding(8, 4)
+        layer.build()
+        original_config = layer.quantization_config
+        with self.assertRaises(NotImplementedError):
+            layer.quantize("ternary")
+        self.assertIs(layer.quantization_config, original_config)
+        self.assertFalse(getattr(layer, "_is_quantized", False))
+        self.assertIsNone(layer.quantization_mode)
+        # The layer is still float and still quantizable.
+        layer.quantize("int8")
+        self.assertEqual(layer.quantization_mode, "int8")

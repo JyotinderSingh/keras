@@ -45,6 +45,7 @@ from keras.src.layers import input_spec
 from keras.src.metrics.metric import Metric
 from keras.src.ops.node import Node
 from keras.src.ops.operation import Operation
+from keras.src.quantizers import mode_registry
 from keras.src.quantizers.quantization_config import validate_and_resolve_config
 from keras.src.utils import python_utils
 from keras.src.utils import summary_utils
@@ -1355,13 +1356,82 @@ class Layer(BackendLayer, Operation):
         for layer in self._layers:
             layer._clear_losses()
 
-    # Quantization-related (int8 and float8) methods
+    # Quantization-related methods.
+    #
+    # Mode-specific behavior (variables, forward pass, quantized values,
+    # policy naming) is owned by the mode descriptors in
+    # `keras.src.quantizers.mode_registry`; the methods below look the
+    # descriptor up and delegate. A layer participates by exposing its
+    # quantizable structure through `_quantization_geometry()` and by
+    # listing the modes it supports in its `variable_serialization_spec`.
 
-    def quantized_build(self, input_shape, mode):
-        raise self._not_implemented_error(self.quantized_build)
+    def _supports_quantization_mode(self, mode, descriptor):
+        """Whether this layer declares support for quantization mode `mode`.
+
+        A layer declares support by listing the mode in its
+        `variable_serialization_spec`; an externally registered mode can
+        also claim a layer via its descriptor's `supports_layer` hook.
+        """
+        spec = getattr(self, "variable_serialization_spec", None)
+        if spec is not None and mode in spec:
+            return True
+        return descriptor is not None and descriptor.supports_layer(self)
+
+    def quantized_build(self, input_shape, mode, config=None):
+        descriptor = mode_registry.get_mode(mode)
+        if not self._supports_quantization_mode(mode, descriptor):
+            if getattr(self, "variable_serialization_spec", None) is None:
+                # The layer has no quantization support at all.
+                raise self._not_implemented_error(self.quantized_build)
+            raise self._quantization_mode_error(mode)
+        if descriptor is None:
+            raise self._quantization_mode_error(mode)
+        descriptor.build(self, input_shape, config)
+        self._is_quantized = True
 
     def quantize(self, mode=None, type_check=True, config=None):
         raise self._not_implemented_error(self.quantize)
+
+    def _registry_quantize(self, mode, config):
+        """Quantizes this layer through the mode registry.
+
+        The shared `quantize()` body for layers that have moved onto the
+        quantization geometry protocol: validate that the mode is supported
+        by this layer *before* mutating any state, let the mode descriptor
+        compute and swap the variables, then update the dtype policy.
+        """
+        descriptor = mode_registry.get_mode(mode)
+        if descriptor is None or not self._supports_quantization_mode(
+            mode, descriptor
+        ):
+            raise self._quantization_mode_error(mode)
+        # Record the config only after the mode is validated, so a rejected
+        # mode leaves the layer untouched.
+        self.quantization_config = config
+        descriptor.quantize(self, config)
+        self._finalize_quantization_policy(descriptor, config)
+
+    def _quantization_geometry(self):
+        """Returns this layer's quantization geometry, or `None`.
+
+        The geometry (`keras.src.quantizers.geometry`) describes the layer's
+        quantizable structure; the mode descriptors consume it to build
+        variables, compute quantized values, and run quantized forward
+        passes. The base implementation returns `None`, meaning the layer
+        has no generic quantization support. Defining this method on a
+        subclass also marks that subclass as the owner of its quantization
+        support for `quantize()`'s type check.
+        """
+        return None
+
+    def _finalize_quantization_policy(self, descriptor, config):
+        # Set new dtype policy only for modes that don't already have one.
+        if self.dtype_policy.quantization_mode is None:
+            policy_name = descriptor.policy_suffix(self, config)
+            policy = dtype_policies.get(
+                f"{policy_name}_from_{self.dtype_policy.name}"
+            )
+            self.dtype_policy = policy
 
     def _check_quantize_args(self, mode, compute_dtype):
         if not self.built:
@@ -1376,10 +1446,10 @@ class Layer(BackendLayer, Operation):
                 f"dtype_policy='{self.dtype_policy.name}'. "
                 f"Received: mode={mode}"
             )
-        if mode not in dtype_policies.QUANTIZATION_MODES:
+        if not mode_registry.is_registered(mode):
             raise ValueError(
                 "Invalid quantization mode. "
-                f"Expected one of {dtype_policies.QUANTIZATION_MODES}. "
+                f"Expected one of {mode_registry.registered_mode_names()}. "
                 f"Received: mode={mode}"
             )
         if mode == "int8" and compute_dtype == "float16":
@@ -1404,6 +1474,14 @@ class Layer(BackendLayer, Operation):
                 f"Restoring the correct rematerialization mode "
                 f"{self._remat_mode} for this layer."
             )
+        if self._quantization_geometry() is not None:
+            # Layers on the geometry protocol dispatch through the
+            # mode descriptor; the chain below serves the rest.
+            mode = self.quantization_mode
+            descriptor = mode_registry.get_mode(mode)
+            if descriptor is None:
+                raise self._quantization_mode_error(mode)
+            return descriptor.call(self, *args, **kwargs)
         if self.quantization_mode == "int8":
             return self._int8_call(*args, **kwargs)
         elif self.quantization_mode == "float8":
@@ -1453,7 +1531,7 @@ class Layer(BackendLayer, Operation):
     def _quantization_mode_error(self, mode):
         return NotImplementedError(
             "Invalid quantization mode. Expected one of "
-            f"{dtype_policies.QUANTIZATION_MODES}. "
+            f"{mode_registry.registered_mode_names()}. "
             f"Received: quantization_mode={mode}"
         )
 
