@@ -9,11 +9,16 @@ owns:
 - the policy-string codec: routing a `"int4/128"`-style string to its
   dtype-policy class, and naming policies after quantization (each policy
   class parses its own grammar),
+- the mode's math: the `build`/`call`/`quantize` adapters create the mode's
+  variables, run its forward pass, and compute its quantized values against
+  the layer's quantization geometry (`keras.src.quantizers.geometry`),
 - per-layer hyperparameter resolution (block size, weight bits, group size),
 - model-level orchestration hooks (calibration for structure-aware modes).
 
-The registry is internal API (`keras.src.quantizers`). Adding a mode is a
-registration rather than an edit of every resolution helper:
+The registry is internal API (`keras.src.quantizers`). Layers do not branch
+on mode strings and hold no per-mode methods; they expose their structure
+through `Layer._quantization_geometry()` and the descriptors do the rest.
+Adding a mode is a registration, not an edit of every dispatch chain:
 
 ```python
 from keras.src.quantizers.mode_registry import QuantizationMode
@@ -37,8 +42,10 @@ _MODES = {}  # name -> QuantizationMode, in registration order.
 class QuantizationMode:
     """Descriptor for one quantization mode.
 
-    Subclasses set `name` and `config_cls` and override the hooks whose
-    behavior differs from the defaults derived from those attributes.
+    Subclasses set `name` and `config_cls` and implement the
+    `build`/`call`/`quantize` adapters against the layer's quantization
+    geometry (`Layer._quantization_geometry()`), which describes the layer's
+    quantizable structure without the layer knowing about any mode.
     """
 
     # The mode identifier, e.g. `"int8"`. Also the root of the policy-string
@@ -52,6 +59,12 @@ class QuantizationMode:
     # Whether `quantize(mode)` without a config is an error (calibration
     # modes need datasets that only an explicit config can carry).
     requires_config = False
+
+    # Whether `build` creates the layer's weight storage itself, replacing
+    # the float weight. Modes that keep the float weight and only add
+    # auxiliary variables (float8) set this to False, so the layer's `build`
+    # still creates the float weight.
+    owns_weight_storage = True
 
     # Whether `Model.quantize` must resolve a quantization layer structure
     # (pre-block layers + sequential blocks) before mutating any layer.
@@ -144,6 +157,30 @@ class QuantizationMode:
         del layer
         return False
 
+    # --- Mode math --------------------------------------------------------
+
+    def build(self, layer, input_shape, config):
+        """Creates the mode's variables on `layer`."""
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `build`."
+        )
+
+    def call(self, layer, *args, **kwargs):
+        """Runs the mode's forward pass on `layer`."""
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `call`."
+        )
+
+    def quantize(self, layer, config):
+        """Computes quantized values and swaps `layer`'s variables.
+
+        A mode whose values arrive later (from calibration, or from
+        training) instead just builds its variables here.
+        """
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `quantize`."
+        )
+
     # --- Model-level orchestration ----------------------------------------
 
     def finalize_model_quantization(self, model, config, structure, filters):
@@ -152,6 +189,18 @@ class QuantizationMode:
         Structure-aware modes run their calibration pass here.
         """
         del model, config, structure, filters
+
+
+def require_geometry(layer, mode_name):
+    """Returns `layer`'s quantization geometry, raising if it has none."""
+    geometry = layer._quantization_geometry()
+    if geometry is None:
+        raise NotImplementedError(
+            f"Layer {layer.__class__.__name__} does not define a "
+            f"quantization geometry, so mode '{mode_name}' cannot be "
+            "applied to it."
+        )
+    return geometry
 
 
 def register_quantization_mode(mode):
