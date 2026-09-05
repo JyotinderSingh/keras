@@ -786,16 +786,20 @@ class Layer(BackendLayer, Operation):
             self._dtype_policy = policy
         if policy.quantization_mode is not None:
             if self.built and not getattr(self, "_is_quantized", False):
-                if policy.quantization_mode == "gptq":
-                    raise ValueError(
-                        "Implicitly enabling GPTQ quantization by setting "
-                        f"`dtype_policy` to '{value}' is not supported. "
-                        "GPTQ requires a calibration dataset and a "
-                        "`GPTQConfig` object.\n\n"
-                        "Please use the `.quantize('gptq', config=...)` method "
-                        "on the layer or model instead."
-                    )
-                self.quantize(policy.quantization_mode)
+                # Forward the policy's full parameters into `quantize` so the
+                # built variables agree with the policy name: assigning
+                # "int4/32_from_float32" quantizes with block_size=32 instead
+                # of silently falling back to the default block size while
+                # keeping a name that says 32. A mode may refuse
+                # policy-triggered quantization by raising here (GPTQ needs
+                # a calibration dataset that a bare policy cannot carry).
+                descriptor = mode_registry.get_mode(policy.quantization_mode)
+                config = (
+                    descriptor.config_from_policy(policy)
+                    if descriptor is not None
+                    else None
+                )
+                self.quantize(policy.quantization_mode, config=config)
 
     @property
     def dtype(self):
@@ -1171,7 +1175,7 @@ class Layer(BackendLayer, Operation):
             with backend.StatelessScope(
                 state_mapping=mapping, collect_losses=return_losses
             ) as scope:
-                if self.dtype_policy.quantization_mode is not None:
+                if self.quantization_mode is not None:
                     if self._remat_mode is not None:
                         outputs = self.rematerialized_call(
                             self.quantized_call, *args, **kwargs
