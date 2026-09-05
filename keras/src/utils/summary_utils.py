@@ -478,24 +478,26 @@ def print_quantization_summary(model, verbose=True):
         if not weights:
             continue
 
-        # The primary quantized weight is the largest one (the kernel).
-        primary = max(weights, key=lambda w: math.prod(w.shape))
-        storage_dtype = backend.standardize_dtype(primary.dtype)
-        storage_bytes = _weight_bytes(primary)
-
-        # Packed sub-byte modes store two values per byte, so the logical
-        # (unpacked) element count is a multiple of the stored count. The
-        # multiplier is owned by the mode's descriptor.
         # Imported here, not at module scope: this module is pulled in
         # while `keras.src.ops` is still initializing, and the quantizers
         # package imports back into `keras.src.ops`.
         from keras.src.quantizers import mode_registry
 
         descriptor = mode_registry.get_mode(mode)
-        multiplier = (
-            descriptor.summary_byte_multiplier if descriptor is not None else 1
-        )
-        logical_params = math.prod(primary.shape) * multiplier
+        qtensor = descriptor.qtensor(layer) if descriptor is not None else None
+        if qtensor is not None:
+            # The mode stores integer codes: count the weights they stand
+            # for, which a packed layout stores several to a byte.
+            primary = qtensor.codes
+            logical_params = qtensor.num_values
+        else:
+            # No code view (float8 keeps its float kernel; a calibration
+            # mode has none until calibrated): the primary weight is the
+            # largest one, stored one value per element.
+            primary = max(weights, key=lambda w: math.prod(w.shape))
+            logical_params = math.prod(primary.shape)
+        storage_dtype = backend.standardize_dtype(primary.dtype)
+        storage_bytes = _weight_bytes(primary)
         float_bytes = logical_params * 4  # float32 baseline.
 
         rows.append(

@@ -257,6 +257,13 @@ class Layer(BackendLayer, Operation):
         self._lock = False
         Operation.__init__(self, name=name)
         self._dtype_policy = dtype_policies.get(dtype)
+        # Quantization bookkeeping, always initialized so the quantization
+        # paths read it directly: whether `quantized_build` has created the
+        # mode's variables, and the `QuantizationConfig` recorded by
+        # `quantize()` (subclasses with a `quantization_config` constructor
+        # argument overwrite the latter).
+        self._is_quantized = False
+        self.quantization_config = None
         self.activity_regularizer = regularizers.get(activity_regularizer)
         input_dim_arg = kwargs.pop("input_dim", None)
         if input_dim_arg is not None:
@@ -785,7 +792,7 @@ class Layer(BackendLayer, Operation):
         else:
             self._dtype_policy = policy
         if policy.quantization_mode is not None:
-            if self.built and not getattr(self, "_is_quantized", False):
+            if self.built and not self._is_quantized:
                 # Forward the policy's full parameters into `quantize` so the
                 # built variables agree with the policy name: assigning
                 # "int4/32_from_float32" quantizes with block_size=32 instead
@@ -1370,6 +1377,10 @@ class Layer(BackendLayer, Operation):
             raise self._quantization_mode_error(mode)
         if descriptor is None:
             raise self._quantization_mode_error(mode)
+        if config is not None:
+            # The config the variables are built from is the one the layer
+            # reports afterwards, whichever path called this.
+            self.quantization_config = config
         descriptor.build(self, input_shape, config)
         self._is_quantized = True
 
@@ -1427,6 +1438,17 @@ class Layer(BackendLayer, Operation):
         """
         return None
 
+    def _qtensor(self):
+        """Returns the `QTensor` view of this layer's quantized weight.
+
+        `None` when the layer is not quantized, or when its mode holds no
+        integer codes for it (see `QuantizationMode.qtensor`).
+        """
+        descriptor = mode_registry.get_mode(self.quantization_mode)
+        if descriptor is None:
+            return None
+        return descriptor.qtensor(self)
+
     def _quantization_type_owner(self):
         """The class whose `_quantization_geometry` definition applies."""
         for cls in type(self).__mro__:
@@ -1449,7 +1471,7 @@ class Layer(BackendLayer, Operation):
                 f"Layer '{self.name}' (of type '{self.__class__.__name__}') "
                 "is not built yet."
             )
-        if getattr(self, "_is_quantized", False):
+        if self._is_quantized:
             raise ValueError(
                 f"Layer '{self.name}' is already quantized with "
                 f"dtype_policy='{self.dtype_policy.name}'. "

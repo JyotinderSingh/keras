@@ -136,26 +136,17 @@ class ProjectionGeometry(QuantizationGeometry):
         """2D `(rows, columns)` view used by the calibration modes."""
         return kernel_shape[0], kernel_shape[1]
 
-    def store_unpacked_columns(self, mode_name, columns):
-        """Records the unpacked column count for the calibration call path."""
-        del mode_name, columns  # The matmul case reads `layer.units` instead.
-
-    def unpacked_columns(self, mode_name):
-        """The unpacked column count recorded at calibration build time."""
-        del mode_name
-        return self.layer.units
-
     def contract(self, inputs, kernel):
         """Contracts `inputs` against a kernel in the contraction shape."""
         return ops.matmul(inputs, kernel)
 
-    def reshape_kernel(self, kernel):
-        """Restores a 2D dequantized kernel to the contraction shape."""
-        return kernel
-
     def record_calibration_kernel_shape(self, kernel_shape):
         """Records the float kernel shape for the calibration write-back."""
         self.layer.kernel_shape = kernel_shape
+
+    def calibration_kernel_shape(self):
+        """The float kernel shape recorded at calibration build time."""
+        return self.layer.kernel_shape
 
     def ternary_values(self):
         """Returns `(ternary_kernel, scale)` for ternary quantization.
@@ -205,20 +196,14 @@ class EinsumProjectionGeometry(ProjectionGeometry):
             return heads * head_dim, out_features
         raise ValueError("Could not determine row/column split.")
 
-    def store_unpacked_columns(self, mode_name, columns):
-        setattr(self.layer, f"{mode_name}_unpacked_column_size", columns)
-
-    def unpacked_columns(self, mode_name):
-        return getattr(self.layer, f"{mode_name}_unpacked_column_size")
-
     def contract(self, inputs, kernel):
         return ops.einsum(self.layer.equation, inputs, kernel)
 
-    def reshape_kernel(self, kernel):
-        return ops.reshape(kernel, self.layer.original_kernel_shape)
-
     def record_calibration_kernel_shape(self, kernel_shape):
         self.layer.original_kernel_shape = kernel_shape
+
+    def calibration_kernel_shape(self):
+        return self.layer.original_kernel_shape
 
 
 class LookupGeometry(QuantizationGeometry):

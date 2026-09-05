@@ -5,9 +5,11 @@ from keras.src import initializers
 from keras.src import ops
 from keras.src.quantizers.mode_registry import QuantizationMode
 from keras.src.quantizers.mode_registry import require_geometry
+from keras.src.quantizers.qtensor import QTensor
+from keras.src.quantizers.qtensor import TernaryTrits
+from keras.src.quantizers.qtensor import WeightScheme
 from keras.src.quantizers.quantization_config import TernaryQuantizationConfig
 from keras.src.quantizers.quantizers import pack_ternary
-from keras.src.quantizers.quantizers import unpack_ternary
 
 
 def _ternary_divisor(beta, dtype):
@@ -60,6 +62,19 @@ class TernaryMode(QuantizationMode):
         )
         layer._orig_input_dim = input_dim
 
+    def qtensor(self, layer):
+        # Codes are exactly {-1, 0, +1}; the scalar scale is `1 / beta`, so
+        # dividing by it applies the BitNet beta (the forward pass divides
+        # the matmul output, which is the same product).
+        return QTensor(
+            codes=layer._packed_kernel,
+            scale=layer.kernel_scale,
+            layout=TernaryTrits(axis=0, orig_len=layer._orig_input_dim),
+            scheme=WeightScheme(bits=2, code_range=(-1, 1)),
+            logical_shape=(layer._orig_input_dim, layer.units),
+            compute_dtype=layer.compute_dtype,
+        )
+
     def call(self, layer, inputs, **kwargs):
         # Sparseskip inference path. Weights split into pos (+1) and neg (-1)
         # boolean masks so the matmul is structurally multiply-free — only
@@ -70,7 +85,7 @@ class TernaryMode(QuantizationMode):
         # call in this path; inference is slightly slower due to the unpack.
         # Realizing the full sparseskip speedup requires a native ternary
         # kernel that reads the packed format directly.
-        k = unpack_ternary(layer._packed_kernel, layer._orig_input_dim, axis=0)
+        k = self.qtensor(layer).unpack()
         pos = ops.cast(ops.equal(k, 1), layer.compute_dtype)
         neg = ops.cast(ops.equal(k, -1), layer.compute_dtype)
         x = ops.subtract(

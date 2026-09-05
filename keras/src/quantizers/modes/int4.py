@@ -12,6 +12,9 @@ from keras.src.quantizers.modes.common import add_matmul_lora_delta
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.modes.common import apply_logit_soft_cap
 from keras.src.quantizers.modes.common import cast_lookup_inputs
+from keras.src.quantizers.qtensor import Int4Pairs
+from keras.src.quantizers.qtensor import QTensor
+from keras.src.quantizers.qtensor import WeightScheme
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
@@ -56,13 +59,30 @@ def _flatten_rows_columns(kernel_shape, reduced_axes):
     return rows, columns
 
 
+def _int4_scheme(block_size, channel_axis, group_axis):
+    """The int4 scheme for a block size: per-channel or grouped."""
+    if _is_per_channel(block_size):
+        # Symmetric codes with a per-channel divisor scale.
+        return WeightScheme(
+            bits=4,
+            code_range=(-8, 7),
+            channel_axis=channel_axis,
+        )
+    # Asymmetric codes: `(code - zero_point) / scale` per group.
+    return WeightScheme(
+        bits=4,
+        code_range=(-8, 7),
+        zero_point_dtype="int8",
+        group_size=block_size,
+        group_axis=group_axis,
+    )
+
+
 class Int4Mode(GeometryDispatchMode):
     """W4A16 weight-only quantization (packed int4 weights)."""
 
     name = "int4"
     config_cls = Int4QuantizationConfig
-    # Packed sub-byte storage: two int4 values per byte.
-    summary_byte_multiplier = 2
 
     def resolve_block_size(self, layer, config):
         """Determine the block size for int4 quantization.
@@ -298,8 +318,7 @@ class Int4Mode(GeometryDispatchMode):
         x = add_matmul_lora_delta(layer, inputs, x)
         return apply_bias_activation(layer, x)
 
-    def _quantize_projection(self, layer, geometry, config):
-        kernel_shape = layer._kernel.shape
+    def _encode_projection(self, layer, geometry, weight, config):
         # Resolve the group size from the (already-resolved) config or the
         # layer's dtype policy. `Int4Mode.resolve_block_size` is the single
         # source of truth shared with the build path and the dtype-policy
@@ -319,16 +338,17 @@ class Int4Mode(GeometryDispatchMode):
                 ),
             )
             kernel_value_int4, kernel_scale = weight_quantizer(
-                layer._kernel, to_numpy=True
+                weight, to_numpy=True
             )
             kernel_scale = ops.squeeze(kernel_scale, axis=0)
+            kernel_zero = None
         else:
             # Sub-channel quantization with asymmetric zero point
             # Returns kernel [in, out], scale [n_groups, out], zero
             # [n_groups, out]
             kernel_value_int4, kernel_scale, kernel_zero = (
                 abs_max_quantize_grouped_with_zero_point(
-                    layer._kernel, block_size=block_size, to_numpy=True
+                    weight, block_size=block_size, to_numpy=True
                 )
             )
             kernel_scale = divisor_scale(kernel_scale, layer.variable_dtype)
@@ -336,11 +356,35 @@ class Int4Mode(GeometryDispatchMode):
         # Pack two int4 values per int8 byte along last axis
         # Stored as [in, ceil(out/2)]
         packed_kernel_value, _, _ = pack_int4(kernel_value_int4, axis=-1)
+        return packed_kernel_value, kernel_scale, kernel_zero
+
+    def _qtensor_projection(self, layer, geometry):
+        grouped = _is_grouped(layer._int4_block_size)
+        return QTensor(
+            codes=layer._kernel,
+            scale=layer.kernel_scale,
+            zero_point=layer.kernel_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            scheme=_int4_scheme(
+                layer._int4_block_size, channel_axis=-1, group_axis=0
+            ),
+            logical_shape=(layer._orig_input_dim, layer._orig_output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_projection(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        kernel_value, kernel_scale, kernel_zero = self._encode_projection(
+            layer, geometry, layer._kernel, config
+        )
         del layer._kernel
         layer.quantized_build(kernel_shape, "int4", config)
-        layer._kernel.assign(packed_kernel_value)
+
+        # Assign values to the newly created variables.
+        layer._kernel.assign(kernel_value)
         layer.kernel_scale.assign(kernel_scale)
-        if _is_grouped(block_size):
+        if kernel_zero is not None:
             layer.kernel_zero.assign(kernel_zero)
 
     # --- Einsum projection (EinsumDense) ----------------------------------
@@ -372,8 +416,6 @@ class Int4Mode(GeometryDispatchMode):
         block_size = self.resolve_block_size(layer, config)
         use_grouped = _is_grouped(block_size)
         layer._int4_block_size = block_size if use_grouped else None
-        layer._int4_unpacked_column_size = columns
-        layer._int4_rows = rows
 
         # Kernel packed along last axis (columns)
         # Stored shape: [rows, ceil(columns/2)]
@@ -423,6 +465,16 @@ class Int4Mode(GeometryDispatchMode):
                 ops.floor_divide(ops.arange(rows, dtype="float32"), block_size)
             )
 
+    @staticmethod
+    def _einsum_columns(layer):
+        """Unpacked column count of a built int4 einsum kernel.
+
+        `_build_einsum` allocates the scale as `(columns,)` per-channel and
+        `(n_groups, columns)` grouped, so the last axis of the stored scale
+        is the unpadded length of the packed kernel axis.
+        """
+        return int(layer.kernel_scale.shape[-1])
+
     def _call_einsum(self, layer, inputs, training=None):
         """Forward pass for int4 quantized EinsumDense.
 
@@ -430,6 +482,7 @@ class Int4Mode(GeometryDispatchMode):
         cannot differentiate through int4 operations.
         """
         block_size = getattr(layer, "_int4_block_size", None)
+        columns = self._einsum_columns(layer)
 
         if _is_per_channel(block_size):
 
@@ -442,7 +495,7 @@ class Int4Mode(GeometryDispatchMode):
                 # unpack along last axis
                 unpacked_kernel = unpack_int4(
                     packed_kernel,
-                    layer._int4_unpacked_column_size,
+                    columns,
                     axis=-1,
                     dtype="int8",
                 )
@@ -517,7 +570,7 @@ class Int4Mode(GeometryDispatchMode):
                 # unpack along last axis
                 unpacked_kernel = unpack_int4(
                     packed_kernel,
-                    layer._int4_unpacked_column_size,
+                    columns,
                     axis=-1,
                     dtype="int8",
                 )
@@ -561,8 +614,7 @@ class Int4Mode(GeometryDispatchMode):
         x = add_einsum_lora_delta(layer, inputs, x)
         return apply_bias_activation(layer, x)
 
-    def _quantize_einsum(self, layer, geometry, config):
-        kernel_shape = layer._kernel.shape
+    def _encode_einsum(self, layer, geometry, weight, config):
         layer._set_quantization_info()
         # `Int4Mode.resolve_block_size` is the single source of truth for the
         # group size, shared with the build path and the dtype-policy naming.
@@ -570,16 +622,14 @@ class Int4Mode(GeometryDispatchMode):
         # `Int4QuantizationConfig()` (grouped, block_size=128); `None`/`-1`
         # selects per-channel.
         block_size = self.resolve_block_size(layer, config)
-        use_grouped = _is_grouped(block_size)
 
         # Flatten kernel to 2D: rows = reduced dims, columns = non-reduced
         rows, columns = _flatten_rows_columns(
-            kernel_shape, layer._kernel_reduced_axes
+            weight.shape, layer._kernel_reduced_axes
         )
+        flat_kernel = ops.reshape(weight, (rows, columns))
 
-        flat_kernel = ops.reshape(layer._kernel, (rows, columns))
-
-        if not use_grouped:
+        if _is_per_channel(block_size):
             # Per-channel quantization
             kernel_value_int4, kernel_scale = abs_max_quantize(
                 flat_kernel,
@@ -589,6 +639,7 @@ class Int4Mode(GeometryDispatchMode):
                 to_numpy=True,
             )
             kernel_scale = ops.squeeze(kernel_scale, axis=0)
+            kernel_zero = None
         else:
             # Sub-channel quantization with asymmetric zero point
             # Returns kernel [rows, columns], scale [n_groups, columns]
@@ -602,15 +653,35 @@ class Int4Mode(GeometryDispatchMode):
         # Pack two int4 values per int8 byte along last axis
         # Stored as [rows, ceil(columns/2)]
         packed_kernel_value, _, _ = pack_int4(kernel_value_int4, axis=-1)
-        kernel_value = packed_kernel_value
+        return packed_kernel_value, kernel_scale, kernel_zero
+
+    def _qtensor_einsum(self, layer, geometry):
+        grouped = _is_grouped(layer._int4_block_size)
+        return QTensor(
+            codes=layer._kernel,
+            scale=layer.kernel_scale,
+            zero_point=layer.kernel_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=-1, orig_len=self._einsum_columns(layer)),
+            scheme=_int4_scheme(
+                layer._int4_block_size, channel_axis=-1, group_axis=0
+            ),
+            logical_shape=layer.original_kernel_shape,
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_einsum(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        kernel_value, kernel_scale, kernel_zero = self._encode_einsum(
+            layer, geometry, layer._kernel, config
+        )
         del layer._kernel
         layer.quantized_build(kernel_shape, "int4", config)
 
         # Assign values to the newly created variables.
         layer._kernel.assign(kernel_value)
         layer.kernel_scale.assign(kernel_scale)
-        # Assign zero point for sub-channel int4 quantization
-        if use_grouped:
+        if kernel_zero is not None:
             layer.kernel_zero.assign(kernel_zero)
 
     # --- Embeddings lookup (Embedding, ReversibleEmbedding) ---------------
@@ -836,17 +907,15 @@ class Int4Mode(GeometryDispatchMode):
 
             return apply_logit_soft_cap(layer, logits)
 
-    def _quantize_lookup(self, layer, geometry, config):
-        embeddings_shape = (layer.input_dim, layer.output_dim)
+    def _encode_lookup(self, layer, geometry, weight, config):
         # `Int4Mode.resolve_block_size` is the single source of truth for the
         # group size, shared with the build path and the dtype-policy naming.
         # A bare `quantize("int4")` resolves to the canonical
         # `Int4QuantizationConfig()` (grouped, block_size=128); `None`/`-1`
         # selects per-channel.
         block_size = self.resolve_block_size(layer, config)
-        use_grouped = _is_grouped(block_size)
 
-        if not use_grouped:
+        if _is_per_channel(block_size):
             # Per-channel quantization
             weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
                 config,
@@ -855,13 +924,14 @@ class Int4Mode(GeometryDispatchMode):
                 ),
             )
             embeddings_value, embeddings_scale = weight_quantizer(
-                layer._embeddings, to_numpy=True
+                weight, to_numpy=True
             )
             embeddings_scale = ops.squeeze(embeddings_scale, axis=-1)
+            embeddings_zero = None
         else:
             # Sub-channel quantization with asymmetric zero point
             # Transpose to put output_dim first for grouped quantization
-            embeddings_t = ops.transpose(layer._embeddings)
+            embeddings_t = ops.transpose(weight)
 
             embeddings_value_t, scale_t, zero_t = (
                 abs_max_quantize_grouped_with_zero_point(
@@ -880,6 +950,30 @@ class Int4Mode(GeometryDispatchMode):
             embeddings_zero = ops.transpose(zero_t)
 
         packed_embeddings_value, _, _ = pack_int4(embeddings_value, axis=-1)
+        return packed_embeddings_value, embeddings_scale, embeddings_zero
+
+    def _qtensor_lookup(self, layer, geometry):
+        grouped = _is_grouped(layer._int4_block_size)
+        return QTensor(
+            codes=layer._embeddings,
+            scale=layer.embeddings_scale,
+            zero_point=layer.embeddings_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            scheme=_int4_scheme(
+                layer._int4_block_size, channel_axis=0, group_axis=-1
+            ),
+            logical_shape=(layer.input_dim, layer.output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_lookup(self, layer, geometry, config):
+        embeddings_shape = (layer.input_dim, layer.output_dim)
+        block_size = self.resolve_block_size(layer, config)
+        use_grouped = _is_grouped(block_size)
+        packed_embeddings_value, embeddings_scale, embeddings_zero = (
+            self._encode_lookup(layer, geometry, layer._embeddings, config)
+        )
         del layer._embeddings
 
         # Quantize reverse embeddings if not tied

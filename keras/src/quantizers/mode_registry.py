@@ -11,7 +11,10 @@ owns:
   class parses its own grammar),
 - the mode's math: the `build`/`call`/`quantize` adapters create the mode's
   variables, run its forward pass, and compute its quantized values against
-  the layer's quantization geometry (`keras.src.quantizers.geometry`),
+  the layer's quantization geometry (`keras.src.quantizers.geometry`);
+  `encode` turns a float weight into the stored form and `qtensor` exposes
+  the stored variables as a `QTensor` view (`keras.src.quantizers.qtensor`)
+  that unpacks and dequantizes them,
 - per-layer hyperparameter resolution (block size, weight bits, group size),
 - model-level orchestration hooks (calibration for structure-aware modes).
 
@@ -69,10 +72,6 @@ class QuantizationMode:
     # Whether `Model.quantize` must resolve a quantization layer structure
     # (pre-block layers + sequential blocks) before mutating any layer.
     requires_layer_structure = False
-
-    # Storage byte multiplier used by `Model.quantization_summary` (packed
-    # sub-byte formats store two values per byte).
-    summary_byte_multiplier = 1
 
     # --- Config resolution ------------------------------------------------
 
@@ -180,6 +179,29 @@ class QuantizationMode:
         raise NotImplementedError(
             f"Quantization mode '{self.name}' does not implement `quantize`."
         )
+
+    def encode(self, layer, weight, config=None):
+        """Quantizes a float `weight` into this mode's stored form.
+
+        Returns `(codes, scale, zero_point)` exactly as the mode's variables
+        hold them (packed and oriented for storage), ready to assign.
+        `quantize` uses it to convert the layer's float weight, and the
+        LoRA-merged save path uses it to re-quantize a merged weight.
+        `zero_point` is `None` for a symmetric scheme.
+        """
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `encode`."
+        )
+
+    def qtensor(self, layer):
+        """Returns the `QTensor` view of `layer`'s quantized weight, or `None`.
+
+        `None` means the mode holds no integer codes for the layer: it keeps
+        the float weight (float8), or the codes are not available yet (a
+        calibration mode before its calibration pass).
+        """
+        del layer
+        return None
 
     # --- Model-level orchestration ----------------------------------------
 

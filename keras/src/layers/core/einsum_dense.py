@@ -8,7 +8,6 @@ from keras.src import activations
 from keras.src import constraints
 from keras.src import initializers
 from keras.src import ops
-from keras.src import quantizers
 from keras.src import regularizers
 from keras.src.api_export import keras_export
 from keras.src.initializers.random_initializers import VarianceScaling
@@ -16,7 +15,6 @@ from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers import mode_registry
 from keras.src.quantizers.geometry import EinsumProjectionGeometry
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.saving import serialization_lib
 
 
@@ -135,7 +133,6 @@ class EinsumDense(Layer):
         bias_constraint=None,
         lora_rank=None,
         lora_alpha=None,
-        gptq_unpacked_column_size=None,
         quantization_config=None,
         **kwargs,
     ):
@@ -156,7 +153,6 @@ class EinsumDense(Layer):
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha if lora_alpha is not None else lora_rank
         self.lora_enabled = False
-        self.gptq_unpacked_column_size = gptq_unpacked_column_size
         self.quantization_config = quantization_config
 
     def _update_kernel_initializer(self, input_axes, output_axes):
@@ -235,57 +231,12 @@ class EinsumDense(Layer):
             raise AttributeError(
                 "You must build the layer before accessing `kernel`."
             )
-
-        mode = self.quantization_mode
-        is_gptq = mode == "gptq"
-        is_awq = mode == "awq"
-        is_int4 = mode == "int4"
-        gptq_calibrated = bool(getattr(self, "is_gptq_calibrated", False))
-        awq_calibrated = bool(getattr(self, "is_awq_calibrated", False))
-        # Resolved once when the GPTQ variables are built, so the
-        # inference path never re-parses the dtype policy.
-        gptq_bits = self._gptq_weight_bits if is_gptq else None
-
-        # Decide the source tensor first (packed vs already-quantized vs plain
-        # kernel)
-        if is_gptq and gptq_calibrated and gptq_bits not in (2, 4):
-            # calibrated GPTQ, not a packed bit-width, no unpacking needed
-            kernel = self.quantized_kernel
-        else:
-            # Start with the stored kernel
-            kernel = getattr(self, "_kernel", None)
-
-            # Handle int4 unpacking cases in one place
-            if is_int4:
-                # unpack [rows, ceil(columns/2)] to [rows, columns]
-                kernel = quantizers.unpack_int4(
-                    kernel,
-                    self._int4_unpacked_column_size,
-                    axis=-1,
-                )
-                kernel = ops.reshape(kernel, self.original_kernel_shape)
-            elif is_gptq and gptq_calibrated and gptq_bits == 4:
-                kernel = quantizers.unpack_int4(
-                    self.quantized_kernel,
-                    orig_len=self.gptq_unpacked_column_size,
-                    axis=-1,
-                    dtype="uint8",
-                )
-            elif is_gptq and gptq_calibrated and gptq_bits == 2:
-                kernel = quantizers.unpack_int2(
-                    self.quantized_kernel,
-                    orig_len=self.gptq_unpacked_column_size,
-                    axis=-1,
-                    dtype="uint8",
-                )
-            elif is_awq and awq_calibrated:
-                # AWQ always uses 4-bit quantization
-                kernel = quantizers.unpack_int4(
-                    self.quantized_kernel,
-                    orig_len=self.awq_unpacked_column_size,
-                    axis=-1,
-                    dtype="uint8",
-                )
+        # A quantized layer exposes its integer codes, unpacked to the
+        # kernel's own shape by the mode's `QTensor` view; otherwise the
+        # float kernel (also the case for a calibration mode before its
+        # calibration pass, which keeps the float kernel until then).
+        qtensor = self._qtensor()
+        kernel = self._kernel if qtensor is None else qtensor.unpack()
 
         # Apply LoRA if enabled
         if self.lora_enabled:
@@ -297,7 +248,6 @@ class EinsumDense(Layer):
                 ),
                 dtype=self.compute_dtype,
             )
-
         return kernel
 
     def compute_output_shape(self, input_shape):
@@ -513,13 +463,14 @@ class EinsumDense(Layer):
         if self.lora_rank:
             config["lora_rank"] = self.lora_rank
             config["lora_alpha"] = self.lora_alpha
-        if self.gptq_unpacked_column_size:
-            config["gptq_unpacked_column_size"] = self.gptq_unpacked_column_size
         return {**base_config, **config}
 
     @classmethod
     def from_config(cls, config):
         config = config.copy()
+        # Written by earlier releases; the unpacked column count is read
+        # from the stored group parameters now.
+        config.pop("gptq_unpacked_column_size", None)
         config["quantization_config"] = (
             serialization_lib.deserialize_keras_object(
                 config.get("quantization_config", None)
@@ -634,22 +585,21 @@ class EinsumDense(Layer):
         for deploying the model or for continuing training after permanently
         applying the LoRA update.
 
-        If the layer is quantized (`int8` or `int4`), the process is:
-        1. Dequantize the base kernel to float.
-        2. Adjust the scale tensor layout for dequantization. This is the
-            reverse order of operations used when building the layer.
-        3. Compute the LoRA delta (`lora_kernel_a @ lora_kernel_b`) and add
+        If the layer is quantized, the process is:
+        1. Dequantize the base kernel to float (`QTensor.dequantize`), which
+            restores the kernel's N-D shape and aligns the stored scale
+            with it.
+        2. Compute the LoRA delta (`lora_kernel_a @ lora_kernel_b`) and add
             it to the dequantized kernel.
-        4. Re-quantize the merged result back to the original quantized
-            type (`int8` or packed `int4`), calculating a new scale factor.
-        5. Adjust the scale tensor layout for quantization. This is the forward
-            order of operations used when building the layer.
+        3. Re-quantize the merged result into the mode's stored form
+            (`QuantizationMode.encode`), calculating a new scale factor in
+            the stored scale layout.
 
-        If the layer is not quantized, this method returns the result of the
-        `kernel` property (which computes the merge in floating-point) and a
-        scale of `None`.
+        If the layer is not quantized (or its mode holds no integer codes
+        for it), this method returns the result of the `kernel` property
+        (which computes the merge in floating-point) and a scale of `None`.
 
-        If LoRA is not enabled, it returns the original kernel and scale
+        If LoRA is not enabled, it returns the stored kernel and scale
         without modification.
 
         Returns:
@@ -661,102 +611,19 @@ class EinsumDense(Layer):
                 `kernel_zero`: The zero point for sub-channel int4 quantization.
                     This is `None` for per-channel or non-int4 modes.
         """
-        # If not a quantized layer, return the full-precision kernel directly.
-        if self.dtype_policy.quantization_mode in (None, "gptq", "awq"):
+        qtensor = self._qtensor()
+        if qtensor is None:
             return self.kernel, None, None
-
-        kernel_zero = getattr(self, "kernel_zero", None)
-
-        # If quantized but LoRA is not enabled, return the original quantized
-        # kernel.
         if not self.lora_enabled:
-            return self._kernel, self.kernel_scale, kernel_zero
+            return qtensor.codes, qtensor.scale, qtensor.zero_point
 
-        # Dequantize, Merge, and Re-quantize
-
-        # 1. Dequantize the kernel
-        if self.quantization_mode == "int4":
-            # Unpack [rows, ceil(columns/2)] to [rows, columns]
-            unpacked_kernel = quantizers.unpack_int4(
-                self._kernel,
-                self._int4_unpacked_column_size,
-                axis=-1,
-            )
-            block_size = getattr(self, "_int4_block_size", None)
-            if block_size is not None and block_size != -1:
-                # Grouped dequantization with group_axis=0
-                kernel_fp = dequantize_with_sz_map(
-                    unpacked_kernel,
-                    self.kernel_scale,
-                    self.kernel_zero,
-                    self.g_idx,
-                    group_axis=0,
-                )
-            else:
-                # Per-channel dequantization:
-                # kernel [rows, columns], scale [columns]
-                kernel_fp = ops.divide(
-                    ops.cast(unpacked_kernel, self.compute_dtype),
-                    self.kernel_scale,
-                )
-            kernel_fp = ops.reshape(kernel_fp, self.original_kernel_shape)
-        elif self.quantization_mode == "int8":
-            adjusted_scale = self._adjust_scale_for_dequant(self.kernel_scale)
-            kernel_fp = ops.divide(self._kernel, adjusted_scale)
-        else:
-            raise ValueError(
-                f"Unsupported quantization mode: {self.quantization_mode}"
-            )
-
-        # 2. Merge the LoRA update in the float domain
+        # Merge the LoRA update in the float domain, then re-quantize.
         lora_update = (self.lora_alpha / self.lora_rank) * ops.matmul(
             self.lora_kernel_a, self.lora_kernel_b
         )
-        merged_kernel = ops.add(kernel_fp, lora_update)
-
-        # 3. Re-quantize the merged float kernel back to the target format
-        if self.quantization_mode == "int4":
-            block_size = getattr(self, "_int4_block_size", None)
-            rows = self._int4_rows
-            columns = self._int4_unpacked_column_size
-
-            # Flatten to 2D [rows, columns]
-            flat_kernel = ops.reshape(merged_kernel, (rows, columns))
-
-            if block_size is not None and block_size != -1:
-                # Use abs_max_quantize_grouped_with_zero_point for proper
-                # signed quantization (same as quantize() method)
-                # Returns kernel [rows, columns], scale [n_groups, columns]
-                kernel_quant, new_scale, new_zero = (
-                    quantizers.abs_max_quantize_grouped_with_zero_point(
-                        flat_kernel, block_size=block_size, to_numpy=True
-                    )
-                )
-                kernel_zero = new_zero
-            else:
-                # Per-channel: quantize along rows axis
-                kernel_quant, new_scale = quantizers.abs_max_quantize(
-                    flat_kernel,
-                    axis=0,
-                    value_range=(-8, 7),
-                    dtype="int8",
-                    to_numpy=True,
-                )
-                new_scale = ops.squeeze(new_scale, axis=0)
-                kernel_zero = None
-
-            # Pack along last axis
-            new_kernel, _, _ = quantizers.pack_int4(kernel_quant, axis=-1)
-        elif self.quantization_mode == "int8":
-            new_kernel, new_scale = quantizers.abs_max_quantize(
-                merged_kernel,
-                axis=self._kernel_reduced_axes,
-                to_numpy=True,
-            )
-            new_scale = self._adjust_scale_for_quant(new_scale, "kernel")
-            kernel_zero = None
-
-        return new_kernel, new_scale, kernel_zero
+        merged_kernel = ops.add(qtensor.dequantize(), lora_update)
+        descriptor = mode_registry.get_mode(self.quantization_mode)
+        return descriptor.encode(self, merged_kernel, self.quantization_config)
 
     def _adjust_scale_for_dequant(self, scale):
         """Adjusts scale tensor layout for dequantization.

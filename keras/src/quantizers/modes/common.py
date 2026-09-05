@@ -14,10 +14,10 @@ from keras.src.quantizers.mode_registry import require_geometry
 class GeometryDispatchMode(QuantizationMode):
     """A mode whose math is written once per geometry family.
 
-    `build`, `call` and `quantize` resolve the layer's geometry and hand
-    off to the matching `_<verb>_<family>` method. Subclasses implement
-    only the families they support; anything else reports the mode as
-    unsupported for that layer.
+    `build`, `call`, `quantize`, `encode` and `qtensor` resolve the layer's
+    geometry and hand off to the matching `_<verb>_<family>` method.
+    Subclasses implement only the families they support; anything else
+    reports the mode as unsupported for that layer.
     """
 
     def build(self, layer, input_shape, config):
@@ -35,6 +35,16 @@ class GeometryDispatchMode(QuantizationMode):
         geometry = require_geometry(layer, self.name)
         handler = self._handler("quantize", geometry.family, layer)
         handler(layer, geometry, config)
+
+    def encode(self, layer, weight, config=None):
+        geometry = require_geometry(layer, self.name)
+        handler = self._handler("encode", geometry.family, layer)
+        return handler(layer, geometry, weight, config)
+
+    def qtensor(self, layer):
+        geometry = require_geometry(layer, self.name)
+        handler = self._handler("qtensor", geometry.family, layer)
+        return handler(layer, geometry)
 
     def _handler(self, verb, family, layer):
         """Returns this mode's implementation for one geometry family."""

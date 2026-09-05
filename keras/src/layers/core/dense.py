@@ -2,14 +2,12 @@ from keras.src import activations
 from keras.src import constraints
 from keras.src import initializers
 from keras.src import ops
-from keras.src import quantizers
 from keras.src import regularizers
 from keras.src.api_export import keras_export
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers import mode_registry
 from keras.src.quantizers.geometry import ProjectionGeometry
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.saving import serialization_lib
 
 
@@ -157,59 +155,12 @@ class Dense(Layer):
             raise AttributeError(
                 "You must build the layer before accessing `kernel`."
             )
-
-        mode = self.quantization_mode
-        is_gptq = mode == "gptq"
-        is_awq = mode == "awq"
-        is_int4 = mode == "int4"
-        gptq_calibrated = bool(getattr(self, "is_gptq_calibrated", False))
-        awq_calibrated = bool(getattr(self, "is_awq_calibrated", False))
-        # Resolved once when the GPTQ variables are built, so the
-        # inference path never re-parses the dtype policy.
-        gptq_bits = self._gptq_weight_bits if is_gptq else None
-
-        # Decide the source tensor first (packed vs already-quantized vs plain
-        # kernel)
-        if mode == "ternary":
-            # Ternary: unpack to int8 {-1, 0, +1} float view.
-            return quantizers.unpack_ternary(
-                self._packed_kernel, self._orig_input_dim, axis=0
-            )
-        if is_gptq and gptq_calibrated and gptq_bits not in (2, 4):
-            # calibrated GPTQ, not a packed bit-width, no unpacking needed
-            kernel = self.quantized_kernel
-        else:
-            # Start with the stored kernel
-            kernel = getattr(self, "_kernel", None)
-
-            # Handle int4 unpacking cases in one place
-            if is_int4:
-                # unpack [in, ceil(out/2)] to [in, out]
-                kernel = quantizers.unpack_int4(
-                    kernel, self._orig_output_dim, axis=-1
-                )
-            elif is_gptq and gptq_calibrated and gptq_bits == 4:
-                kernel = quantizers.unpack_int4(
-                    self.quantized_kernel,
-                    orig_len=self.units,
-                    axis=-1,
-                    dtype="uint8",
-                )
-            elif is_gptq and gptq_calibrated and gptq_bits == 2:
-                kernel = quantizers.unpack_int2(
-                    self.quantized_kernel,
-                    orig_len=self.units,
-                    axis=-1,
-                    dtype="uint8",
-                )
-            elif is_awq and awq_calibrated:
-                # AWQ always uses 4-bit quantization
-                kernel = quantizers.unpack_int4(
-                    self.quantized_kernel,
-                    orig_len=self.units,
-                    axis=-1,
-                    dtype="uint8",
-                )
+        # A quantized layer exposes its integer codes, unpacked to the
+        # kernel's own shape by the mode's `QTensor` view; otherwise the
+        # float kernel (also the case for a calibration mode before its
+        # calibration pass, which keeps the float kernel until then).
+        qtensor = self._qtensor()
+        kernel = self._kernel if qtensor is None else qtensor.unpack()
 
         # Apply LoRA once at the end.
         if self.lora_enabled:
@@ -263,18 +214,9 @@ class Dense(Layer):
                 "lora is not currently supported with GPTQ quantization."
             )
         self._tracker.unlock()
-        # Determine the correct input dimension for the LoRA A matrix. When
-        # the layer has been int4-quantized, `self._kernel` stores a *packed*
-        # representation whose first dimension is `ceil(input_dim/2)`. We
-        # saved the true, *unpacked* input dimension in `self._orig_input_dim`
-        # during quantization. Use it if available; otherwise fall back to the
-        # first dimension of `self.kernel`.
-        if self.quantization_mode == "int4" and hasattr(
-            self, "_orig_input_dim"
-        ):
-            input_dim_for_lora = self._orig_input_dim
-        else:
-            input_dim_for_lora = self.kernel.shape[0]
+        # `kernel` is the unpacked kernel in its own shape whatever the
+        # quantization mode, so its first dimension is the input dimension.
+        input_dim_for_lora = self.kernel.shape[0]
 
         # LoRA weights should be float32 to avoid the risk of underflow or
         # overflow during fine-tuning.
@@ -338,10 +280,7 @@ class Dense(Layer):
         idx = 0
         for name in self.variable_serialization_spec[mode]:
             if name == "kernel":
-                if mode == "ternary":
-                    value = self._packed_kernel
-                else:
-                    value = kernel_value
+                value = kernel_value
             elif name == "bias" and self.bias is None:
                 continue
             elif name == "kernel_zero" and mode == "int4":
@@ -517,18 +456,18 @@ class Dense(Layer):
         for deploying the model or for continuing training after permanently
         applying the LoRA update.
 
-        If the layer is quantized (`int8` or `int4`), the process is:
-        1. Dequantize the base kernel to float.
+        If the layer is quantized, the process is:
+        1. Dequantize the base kernel to float (`QTensor.dequantize`).
         2. Compute the LoRA delta (`lora_kernel_a @ lora_kernel_b`) and add
             it to the dequantized kernel.
-        3. Re-quantize the merged result back to the original quantized
-            type (`int8` or packed `int4`), calculating a new scale factor.
+        3. Re-quantize the merged result into the mode's stored form
+            (`QuantizationMode.encode`), calculating a new scale factor.
 
-        If the layer is not quantized, this method returns the result of the
-        `kernel` property (which computes the merge in floating-point) and a
-        scale of `None`.
+        If the layer is not quantized (or its mode holds no integer codes
+        for it), this method returns the result of the `kernel` property
+        (which computes the merge in floating-point) and a scale of `None`.
 
-        If LoRA is not enabled, it returns the original kernel and scale
+        If LoRA is not enabled, it returns the stored kernel and scale
         without modification.
 
         Returns:
@@ -540,99 +479,20 @@ class Dense(Layer):
                 `kernel_zero`: The zero point for sub-channel int4 quantization.
                     This is `None` for per-channel or non-int4 modes.
         """
-        if self.dtype_policy.quantization_mode in (None, "gptq", "awq"):
+        qtensor = self._qtensor()
+        if qtensor is None:
             return self.kernel, None, None
-        if self.dtype_policy.quantization_mode == "ternary":
-            return self._packed_kernel, None, None
-
-        kernel_value = self._kernel
-        kernel_scale = self.kernel_scale
-        kernel_zero = getattr(self, "kernel_zero", None)
-
         if not self.lora_enabled:
-            return kernel_value, kernel_scale, kernel_zero
+            return qtensor.codes, qtensor.scale, qtensor.zero_point
 
-        # Dequantize, Merge, and Re-quantize
-        block_size = getattr(self, "_int4_block_size", None)
-
-        # Step 1: Dequantize kernel to float
-        if self.quantization_mode == "int4":
-            # Unpack along last axis ([in, out])
-            unpacked_kernel = quantizers.unpack_int4(
-                kernel_value, self._orig_output_dim, axis=-1
-            )
-            if block_size is None or block_size == -1:
-                # Per-channel: kernel [in, out], scale [out]
-                float_kernel = ops.divide(
-                    ops.cast(unpacked_kernel, self.compute_dtype),
-                    kernel_scale,
-                )
-            else:
-                # Sub-channel: scale/zero are [n_groups, out]
-                float_kernel = dequantize_with_sz_map(
-                    unpacked_kernel,
-                    kernel_scale,
-                    self.kernel_zero,
-                    self.g_idx,
-                    group_axis=0,
-                )
-                float_kernel = ops.cast(float_kernel, self.compute_dtype)
-            quant_range = (-8, 7)
-        elif self.quantization_mode == "int8":
-            float_kernel = ops.divide(
-                ops.cast(kernel_value, self.compute_dtype), kernel_scale
-            )
-            quant_range = (-127, 127)
-        else:
-            raise ValueError(
-                f"Unsupported quantization mode: {self.quantization_mode}"
-            )
-
-        # Step 2: Merge LoRA weights in float domain
+        # Merge the LoRA update in the float domain, then re-quantize.
         lora_delta = (self.lora_alpha / self.lora_rank) * ops.matmul(
             self.lora_kernel_a, self.lora_kernel_b
         )
-        merged_float_kernel = ops.add(float_kernel, lora_delta)
-
-        # Step 3: Re-quantize the merged kernel
-        if (
-            self.quantization_mode == "int4"
-            and block_size is not None
-            and block_size != -1
-        ):
-            # Sub-channel: returns kernel [in, out], scale [n_groups, out]
-            requantized_kernel, kernel_scale, kernel_zero = (
-                quantizers.abs_max_quantize_grouped_with_zero_point(
-                    merged_float_kernel, block_size=block_size, to_numpy=True
-                )
-            )
-        elif self.quantization_mode == "int4":
-            # Per-channel: quantize along input axis (axis=0)
-            requantized_kernel, kernel_scale = quantizers.abs_max_quantize(
-                merged_float_kernel,
-                axis=0,
-                value_range=quant_range,
-                dtype="int8",
-                to_numpy=True,
-            )
-            kernel_scale = ops.squeeze(kernel_scale, axis=0)
-            kernel_zero = None
-        else:
-            requantized_kernel, kernel_scale = quantizers.abs_max_quantize(
-                merged_float_kernel,
-                axis=0,
-                value_range=quant_range,
-                dtype="int8",
-                to_numpy=True,
-            )
-            kernel_scale = ops.squeeze(kernel_scale, axis=0)
-            kernel_zero = None
-
-        if self.quantization_mode == "int4":
-            # Pack along last axis
-            kernel_value, _, _ = quantizers.pack_int4(
-                requantized_kernel, axis=-1
-            )
-        else:
-            kernel_value = requantized_kernel
-        return kernel_value, kernel_scale, kernel_zero
+        merged_float_kernel = ops.add(qtensor.dequantize(), lora_delta)
+        descriptor = mode_registry.get_mode(self.quantization_mode)
+        return descriptor.encode(
+            self,
+            merged_float_kernel,
+            self.quantization_config,
+        )

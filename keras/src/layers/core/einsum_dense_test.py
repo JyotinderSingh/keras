@@ -1233,7 +1233,7 @@ class EinsumDenseTest(testing.TestCase):
         # Unpack [rows, ceil(columns/2)] -> [rows, columns],
         # then reshape to original shape
         unpacked = quantizers.unpack_int4(
-            packed_kernel, layer._int4_unpacked_column_size, axis=-1
+            packed_kernel, layer.kernel_scale.shape[-1], axis=-1
         )
         expected = ops.reshape(unpacked, layer.original_kernel_shape)
         self.assertAllClose(layer.kernel, expected)
@@ -1511,6 +1511,21 @@ class EinsumDenseTest(testing.TestCase):
             quantized_kernel_params,
             original_kernel_params // 2,
         )
+
+    def test_from_config_ignores_legacy_gptq_unpacked_column_size(self):
+        # Configs written by earlier releases carried the unpacked column
+        # count of a GPTQ kernel; it is read from the stored group
+        # parameters now, so the key is accepted and dropped.
+        layer = layers.EinsumDense(
+            "ab,bc->ac", output_shape=(4,), dtype="gptq/4/8_from_float32"
+        )
+        config = layer.get_config()
+        self.assertNotIn("gptq_unpacked_column_size", config)
+        config["gptq_unpacked_column_size"] = 4
+        restored = layers.EinsumDense.from_config(config)
+        restored.build((None, 8))
+        self.assertEqual(restored.quantization_mode, "gptq")
+        self.assertEqual(tuple(restored.kernel_scale.shape), (1, 4))
 
     def test_int4_awq_kernel_returns_unpacked_form(self):
         """Test that the `kernel` property returns the unpacked int4 AWQ
