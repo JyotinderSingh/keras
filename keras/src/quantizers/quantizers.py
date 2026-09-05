@@ -1175,6 +1175,21 @@ def unpack_int2(packed, orig_len, axis=0, dtype="int8"):
     return unpacked
 
 
+def bitnet_ternary_values(weight):
+    """Ternarizes a float weight with the BitNet b1.58 rule.
+
+    Returns `(codes, scale)`: `codes` is a NumPy array in the weight's dtype
+    holding `sign(w)` where `|w| > 0.5 * mean(|w|)` and `0` elsewhere, and
+    `scale` is the Python float `mean(|w|)`.
+    """
+    abs_w = ops.abs(weight)
+    threshold = 0.5 * float(ops.convert_to_numpy(ops.mean(abs_w)))
+    weight_np = ops.convert_to_numpy(weight)
+    abs_np = ops.convert_to_numpy(abs_w)
+    codes = np.sign(weight_np) * (abs_np > threshold).astype(weight_np.dtype)
+    return codes, float(np.mean(abs_np))
+
+
 @keras_export("keras.quantizers.pack_ternary")
 def pack_ternary(arr, axis=0):
     """Pack a ternary tensor into a `uint8` tensor at ~1.6 bits per value.
@@ -1309,6 +1324,19 @@ def unpack_ternary(packed, orig_len, axis=0):
         stacked = ops.stack(digits, axis=1)
         unpacked = ops.reshape(stacked, (-1, ops.shape(packed)[1]))
         unpacked = unpacked[:orig_len, ...]
+        return ops.cast(unpacked, "int8")
+    # Fast path: last axis of a rank-2 tensor, the layout the ternary mode
+    # stores; byte j of a row holds trits [5*j, 5*j + 4].
+    if axis == 1 and rank == 2:
+        codes = ops.cast(packed, "int32")
+        codes = ops.where(codes < 0, codes + 256, codes)
+        digits = []
+        for place in (1, 3, 9, 27, 81):
+            digit = ops.mod(ops.floor_divide(codes, place), 3)
+            digits.append(ops.subtract(digit, 1))
+        stacked = ops.stack(digits, axis=2)
+        unpacked = ops.reshape(stacked, (ops.shape(packed)[0], -1))
+        unpacked = unpacked[:, :orig_len]
         return ops.cast(unpacked, "int8")
 
     # General path: move the pack axis to the front, decode, restore layout.

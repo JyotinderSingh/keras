@@ -262,43 +262,31 @@ class Embedding(Layer):
         mode = self.quantization_mode
         if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
+        descriptor = mode_registry.get_mode(mode)
+        if descriptor is not None:
+            descriptor.check_saveable(self)
 
         # Embeddings plus optional merged LoRA-aware scale/zero (returns
-        # (embeddings, None, None) for `None` mode).
+        # (embeddings, None, None) for modes without a code view).
         embeddings_value, merged_embeddings_scale, merged_embeddings_zero = (
             self._get_embeddings_with_merged_lora()
         )
         # Variables are stored under their integer position ("0", "1", ...)
-        # within the mode's serialization spec. Each branch picks the value
-        # for the current spec entry (or skips it); the write happens at a
-        # single point so save and load stay position-consistent.
+        # within the mode's serialization spec. An entry whose variable is
+        # `None` for this configuration (the zero point and group index of
+        # per-channel int4, including a subclass's reverse ones) is skipped.
         idx = 0
         for name in self.variable_serialization_spec[mode]:
             if name == "embeddings":
                 value = embeddings_value
-            elif name == "embeddings_zero":
-                if merged_embeddings_zero is None:
-                    # embeddings_zero only exists for sub-channel int4
-                    # quantization
-                    continue
-                value = merged_embeddings_zero
-            elif name == "g_idx" and not hasattr(self, "g_idx"):
-                # g_idx only exists for sub-channel int4 quantization
-                continue
             elif name == "embeddings_scale" and mode in ("int4", "int8"):
-                # For int4/int8, the merged LoRA scale (if any) comes from
-                # `_get_embeddings_with_merged_lora()`
                 value = merged_embeddings_scale
+            elif name == "embeddings_zero":
+                value = merged_embeddings_zero
             else:
-                # Generic handling for subclass variables:
-                # Check if the attribute exists on the instance before saving.
-                # This supports optional variables in subclasses (e.g.,
-                # `reverse_embeddings_zero` in ReversibleEmbedding) that are
-                # present in the spec but may not exist on the object depending
-                # on configuration (e.g., per-channel vs. sub-channel).
-                if not hasattr(self, name):
-                    continue
                 value = getattr(self, name)
+            if value is None:
+                continue
             store[str(idx)] = value
             idx += 1
 
@@ -312,40 +300,24 @@ class Embedding(Layer):
         if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
 
-        spec = self.variable_serialization_spec[mode]
         # Variables are keyed by their integer position ("0", "1", ...) within
-        # the mode's serialization spec. Each branch picks the target variable
-        # for the current spec entry (or skips it); the assign happens at a
-        # single point so save and load stay position-consistent.
+        # the mode's serialization spec; entries whose variable is `None` for
+        # this configuration are skipped, mirroring `save_own_variables`.
         idx = 0
-        for name in spec:
-            key = str(idx)
+        for name in self.variable_serialization_spec[mode]:
             if name == "embeddings":
                 target = self._embeddings
-            elif name == "embeddings_zero" and not hasattr(
-                self, "embeddings_zero"
-            ):
-                # embeddings_zero only exists for sub-channel int4 quantization
+            else:
+                target = getattr(self, name)
+            if target is None:
                 continue
-            elif name == "g_idx":
-                if not hasattr(self, "g_idx"):
-                    # g_idx only exists for sub-channel int4 quantization
-                    continue
+            value = store[str(idx)]
+            if name == "g_idx":
                 # `g_idx` is stored as `float32` (see build). Cast to the
                 # variable dtype on assign so both legacy `float32`
                 # checkpoints and any `int32`-saved ones load correctly.
-                self.g_idx.assign(ops.cast(store[key], self.g_idx.dtype))
-                idx += 1
-                continue
-            else:
-                # Generic handling for subclass variables:
-                # Check if the attribute exists before attempting to assign.
-                # If the variable is in the spec but missing from the object,
-                # we skip it to prevent AttributeError.
-                if not hasattr(self, name):
-                    continue
-                target = getattr(self, name)
-            target.assign(store[key])
+                value = ops.cast(value, target.dtype)
+            target.assign(value)
             idx += 1
         if self.lora_enabled:
             self.lora_embeddings_a.assign(
@@ -354,6 +326,9 @@ class Embedding(Layer):
             self.lora_embeddings_b.assign(
                 ops.zeros(self.lora_embeddings_b.shape)
             )
+        descriptor = mode_registry.get_mode(mode)
+        if descriptor is not None:
+            descriptor.variables_loaded(self)
 
     def get_config(self):
         base_config = super().get_config()

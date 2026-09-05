@@ -37,6 +37,9 @@ class AWQMode(CalibrationMode):
     def _input_scales(self, layer):
         return layer.awq_scales
 
+    def _assign_extra_variables(self, layer, awq_scales):
+        layer.awq_scales.assign(awq_scales)
+
     def finalize_model_quantization(self, model, config, structure, filters):
         from keras.src.quantizers.awq_core import awq_quantize
 

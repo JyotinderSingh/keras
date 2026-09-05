@@ -1444,6 +1444,8 @@ class Layer(BackendLayer, Operation):
         `None` when the layer is not quantized, or when its mode holds no
         integer codes for it (see `QuantizationMode.qtensor`).
         """
+        if not self.built:
+            return None
         descriptor = mode_registry.get_mode(self.quantization_mode)
         if descriptor is None:
             return None

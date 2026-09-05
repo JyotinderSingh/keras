@@ -125,16 +125,12 @@ class Int8Mode(GeometryDispatchMode):
     # --- Einsum projection (EinsumDense) ----------------------------------
 
     def _build_einsum(self, layer, geometry, kernel_shape, config):
-        layer._set_quantization_info()
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(
                 config,
                 AbsMaxQuantizer(),
             )
         )
-        # If the config provided a default AbsMaxQuantizer, we need to
-        # override the axis to match the equation's reduction axes.
-        layer.quantization_axis = tuple(layer._input_reduced_axes)
         layer._kernel = layer.add_weight(
             name="kernel",
             shape=kernel_shape,
@@ -189,13 +185,15 @@ class Int8Mode(GeometryDispatchMode):
                 )
                 # From https://stackoverflow.com/a/47609896
                 inputs_grad = ops.einsum(
-                    layer._custom_gradient_equation, upstream, float_kernel
+                    layer.einsum_axes.custom_gradient_equation,
+                    upstream,
+                    float_kernel,
                 )
                 return (inputs_grad, None, None)
 
             if layer.inputs_quantizer:
                 inputs, inputs_scale = layer.inputs_quantizer(
-                    inputs, axis=layer.quantization_axis
+                    inputs, axis=layer.einsum_axes.input_reduced_axes
                 )
                 # Align `inputs_scale` axes with the output
                 # for correct broadcasting
@@ -234,10 +232,9 @@ class Int8Mode(GeometryDispatchMode):
         return apply_bias_activation(layer, x)
 
     def _encode_einsum(self, layer, geometry, weight, config):
-        layer._set_quantization_info()
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config,
-            AbsMaxQuantizer(axis=layer._kernel_reduced_axes),
+            AbsMaxQuantizer(axis=layer.einsum_axes.kernel_reduced_axes),
         )
         kernel_value, kernel_scale = weight_quantizer(weight, to_numpy=True)
         kernel_scale = layer._adjust_scale_for_quant(kernel_scale, "kernel")

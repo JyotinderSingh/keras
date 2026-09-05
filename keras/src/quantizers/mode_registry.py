@@ -203,6 +203,16 @@ class QuantizationMode:
         del layer
         return None
 
+    # --- Serialization ----------------------------------------------------
+
+    def check_saveable(self, layer):
+        """Raises if `layer`'s variables are not in a persistable state."""
+        del layer
+
+    def variables_loaded(self, layer):
+        """Called after `layer`'s variables were assigned from a store."""
+        del layer
+
     # --- Model-level orchestration ----------------------------------------
 
     def finalize_model_quantization(self, model, config, structure, filters):

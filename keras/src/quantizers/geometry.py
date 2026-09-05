@@ -43,11 +43,12 @@ The geometry is a thin adapter, so the mode implementations still read
 state directly off the layer. Beyond what `Layer` already provides, a
 quantizable layer must define:
 
-- Projections: `_kernel` (the float kernel variable), `units`, `bias` and
+- Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
+  shape, recorded in `build()`), `units`, `bias` and
   `activation` (either may be `None`), and, while LoRA is enabled,
   `lora_enabled`, `lora_kernel_a`, `lora_kernel_b`, `lora_alpha` and
   `lora_rank`. `EinsumProjectionGeometry` additionally relies on the
-  equation analysis `EinsumDense` prepares in `_set_quantization_info()`.
+  `einsum_axes` record `EinsumDense` derives from its equation in `build()`.
 - Lookups: `_embeddings`, `input_dim`, `output_dim`, and the
   `lora_embeddings_a` / `lora_embeddings_b` equivalents. A reversible
   lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
@@ -84,9 +85,8 @@ and implement the mode's `_build_<family>`, `_call_<family>` and
 `_quantize_<family>` methods.
 """
 
-import numpy as np
-
 from keras.src import ops
+from keras.src.quantizers.quantizers import bitnet_ternary_values
 
 
 class QuantizationGeometry:
@@ -126,11 +126,12 @@ class ProjectionGeometry(QuantizationGeometry):
 
     @property
     def weight_shape(self):
-        """Shape of the float weight that quantization replaces."""
-        return self.layer._kernel.shape
+        """Shape of the float kernel, as the layer recorded it in `build()`.
 
-    def prepare(self):
-        """Computes any layout analysis the geometry needs (idempotent)."""
+        Quantized storage may be packed or flattened, so this is the
+        logical shape every mode reads rather than a variable's shape.
+        """
+        return tuple(self.layer.kernel_shape)
 
     def calibration_rows_columns(self, kernel_shape):
         """2D `(rows, columns)` view used by the calibration modes."""
@@ -140,14 +141,6 @@ class ProjectionGeometry(QuantizationGeometry):
         """Contracts `inputs` against a kernel in the contraction shape."""
         return ops.matmul(inputs, kernel)
 
-    def record_calibration_kernel_shape(self, kernel_shape):
-        """Records the float kernel shape for the calibration write-back."""
-        self.layer.kernel_shape = kernel_shape
-
-    def calibration_kernel_shape(self):
-        """The float kernel shape recorded at calibration build time."""
-        return self.layer.kernel_shape
-
     def ternary_values(self):
         """Returns `(ternary_kernel, scale)` for ternary quantization.
 
@@ -156,29 +149,18 @@ class ProjectionGeometry(QuantizationGeometry):
         owns its own ternarization rule (`TernaryDense` and its straight-
         through estimator) overrides this in its geometry.
         """
-        kernel = self.layer._kernel
-        kernel_np = ops.convert_to_numpy(kernel)
-        abs_k = ops.convert_to_numpy(ops.abs(kernel))
-        t = float(ops.convert_to_numpy(ops.mean(abs_k))) * 0.5
-        kernel_ternary = np.sign(kernel_np) * (abs_k > t).astype(
-            kernel_np.dtype
-        )
-        beta = float(np.mean(abs_k))
-        return kernel_ternary, beta
+        return bitnet_ternary_values(self.layer._kernel)
 
 
 class EinsumProjectionGeometry(ProjectionGeometry):
     """Geometry of an N-D einsum kernel (`EinsumDense`).
 
-    The equation-derived axis analysis (reduced/transpose/expand/squeeze
-    axes, the custom-gradient equation) is the layer's own geometry
-    implementation; this class routes the mode descriptors to it.
+    The equation-derived axis analysis (`EinsumDense.einsum_axes`) is
+    the layer's own geometry implementation; this class routes the mode
+    descriptors to it.
     """
 
     family = "einsum"
-
-    def prepare(self):
-        self.layer._set_quantization_info()
 
     def calibration_rows_columns(self, kernel_shape):
         if len(kernel_shape) == 2:
@@ -198,12 +180,6 @@ class EinsumProjectionGeometry(ProjectionGeometry):
 
     def contract(self, inputs, kernel):
         return ops.einsum(self.layer.equation, inputs, kernel)
-
-    def record_calibration_kernel_shape(self, kernel_shape):
-        self.layer.original_kernel_shape = kernel_shape
-
-    def calibration_kernel_shape(self):
-        return self.layer.original_kernel_shape
 
 
 class LookupGeometry(QuantizationGeometry):

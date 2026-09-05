@@ -1,14 +1,18 @@
 import ml_dtypes
+import numpy as np
 
 from keras.src import backend
 from keras.src import initializers
 from keras.src import ops
 from keras.src.quantizers.mode_registry import QuantizationMode
 from keras.src.quantizers.mode_registry import require_geometry
+from keras.src.quantizers.modes.common import add_matmul_lora_delta
+from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.qtensor import QTensor
 from keras.src.quantizers.qtensor import TernaryTrits
 from keras.src.quantizers.qtensor import WeightScheme
 from keras.src.quantizers.quantization_config import TernaryQuantizationConfig
+from keras.src.quantizers.quantizers import bitnet_ternary_values
 from keras.src.quantizers.quantizers import pack_ternary
 
 
@@ -40,11 +44,11 @@ class TernaryMode(QuantizationMode):
         del config
         require_geometry(layer, self.name)
         input_dim, units = input_shape
-        # Five trits per byte (3^5 == 243 <= 256): ceil(input_dim / 5) rows.
-        packed_rows = (input_dim + 4) // 5
-        layer._packed_kernel = layer.add_weight(
+        # Stored as `[in, packed(out)]` like every other packed projection:
+        # five trits per byte (3^5 == 243 <= 256) along the output axis.
+        layer._kernel = layer.add_weight(
             name="kernel",
-            shape=(packed_rows, units),
+            shape=(input_dim, (units + 4) // 5),
             # 121 = 1+3+9+27+81: byte whose five base-3 digits are all 0,
             # decoding to trit 0 (neutral). "zeros" (byte 0) has the same
             # digits but maps to trit -1, giving an all-minus-one kernel.
@@ -60,58 +64,56 @@ class TernaryMode(QuantizationMode):
             initializer="ones",
             trainable=False,
         )
-        layer._orig_input_dim = input_dim
 
     def qtensor(self, layer):
+        geometry = require_geometry(layer, self.name)
         # Codes are exactly {-1, 0, +1}; the scalar scale is `1 / beta`, so
         # dividing by it applies the BitNet beta (the forward pass divides
         # the matmul output, which is the same product).
         return QTensor(
-            codes=layer._packed_kernel,
+            codes=layer._kernel,
             scale=layer.kernel_scale,
-            layout=TernaryTrits(axis=0, orig_len=layer._orig_input_dim),
+            layout=TernaryTrits(axis=-1, orig_len=layer.units),
             scheme=WeightScheme(bits=2, code_range=(-1, 1)),
-            logical_shape=(layer._orig_input_dim, layer.units),
+            logical_shape=geometry.weight_shape,
             compute_dtype=layer.compute_dtype,
         )
 
     def call(self, layer, inputs, **kwargs):
-        # Sparseskip inference path. Weights split into pos (+1) and neg (-1)
-        # boolean masks so the matmul is structurally multiply-free — only
-        # additions, subtractions, and zero-skips on kernel values.
-        # Note: the packed kernel is unpacked to full float on every call and
-        # fed to a standard matmul. Standard BLAS does not skip zero
-        # multiplications, so there is no compute speedup over a plain Dense
-        # call in this path; inference is slightly slower due to the unpack.
-        # Realizing the full sparseskip speedup requires a native ternary
-        # kernel that reads the packed format directly.
-        k = self.qtensor(layer).unpack()
-        pos = ops.cast(ops.equal(k, 1), layer.compute_dtype)
-        neg = ops.cast(ops.equal(k, -1), layer.compute_dtype)
-        x = ops.subtract(
-            ops.matmul(inputs, pos),
-            ops.matmul(inputs, neg),
-        )
+        # A storage format, not a compute win: the packed kernel is unpacked
+        # to `{-1, 0, +1}` on every call and fed to a standard matmul, so
+        # inference is slightly slower than a float `Dense` call. A native
+        # ternary kernel reading the packed format would be needed for a
+        # speedup.
+        kernel = ops.cast(self.qtensor(layer).unpack(), layer.compute_dtype)
+        x = ops.matmul(inputs, kernel)
         x = ops.divide(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
-        if layer.bias is not None:
-            x = ops.add(x, layer.bias)
-        if layer.activation is not None:
-            x = layer.activation(x)
-        return x
+        x = add_matmul_lora_delta(layer, inputs, x)
+        return apply_bias_activation(layer, x)
+
+    def encode(self, layer, weight, config=None):
+        del config
+        # The BitNet b1.58 rule on an arbitrary float weight (the LoRA-merged
+        # kernel at save time). `quantize` instead applies the layer's own
+        # rule through its geometry.
+        codes, scale = bitnet_ternary_values(weight)
+        packed, _, _ = pack_ternary(codes, axis=-1)
+        scale = _ternary_divisor(scale, layer.variable_dtype)
+        return packed, np.array(scale, dtype="float32"), None
 
     def quantize(self, layer, config):
         del config
         geometry = require_geometry(layer, self.name)
-        kernel_shape = layer._kernel.shape
+        kernel_shape = geometry.weight_shape
         # The geometry owns the ternarization rule: the BitNet b1.58 rule by
         # default, or the layer's own values (`TernaryDense` freezes exactly
         # the forward value of its straight-through kernel, so quantizing
         # does not change the layer's outputs).
         kernel_ternary, beta = geometry.ternary_values()
-        packed_kernel, _, _ = pack_ternary(kernel_ternary, axis=0)
+        packed_kernel, _, _ = pack_ternary(kernel_ternary, axis=-1)
         del layer._kernel
         layer.quantized_build(kernel_shape, "ternary")
-        layer._packed_kernel.assign(packed_kernel)
+        layer._kernel.assign(packed_kernel)
         layer.kernel_scale.assign(
             _ternary_divisor(beta, layer.kernel_scale.dtype)
         )

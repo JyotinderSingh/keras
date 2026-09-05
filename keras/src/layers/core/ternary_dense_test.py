@@ -149,11 +149,26 @@ class TernaryDenseTest(testing.TestCase):
         self.assertEqual(k.shape, (11, 16))
         self.assertTrue(set(np.unique(k).tolist()) <= {-1, 0, 1})
         self.assertEqual(
-            backend.standardize_dtype(layer._packed_kernel.dtype), "uint8"
+            backend.standardize_dtype(layer._kernel.dtype), "uint8"
         )
 
         y_quantized = layer(x)
         self.assertAllClose(y_float, y_quantized)
+
+    def test_quantize_matches_mixed_precision_forward(self):
+        # The freeze evaluates the straight-through kernel under the layer's
+        # autocast scope, so the packed codes are exactly the trits a
+        # mixed-precision forward pass used.
+        layer = layers.TernaryDense(16, dtype="mixed_float16")
+        layer.build((None, 11))
+        x = np.random.rand(4, 11).astype("float32")
+        y_float = layer(x)
+        with backend.AutocastScope("float16"):
+            k_ste = ops.convert_to_numpy(layer._ternary_kernel())
+
+        layer.quantize("ternary")
+        self.assertAllClose(ops.convert_to_numpy(layer.kernel), k_ste)
+        self.assertAllClose(y_float, layer(x), atol=1e-3, rtol=1e-3)
 
     def test_quantize_fixed_threshold_matches_float_forward(self):
         # Fixed-threshold mode applies no beta rescaling (scale == 1.0).
@@ -167,15 +182,15 @@ class TernaryDenseTest(testing.TestCase):
         self.assertAllClose(y_float, layer(x))
 
     def test_quantized_kernel_is_packed_at_floor(self):
-        # input_dim=40 -> ceil(40/5)=8 packed rows; 8 bytes encode 40 trits.
-        layer = layers.TernaryDense(32)
-        layer.build((None, 40))
+        # units=40 -> ceil(40/5)=8 bytes per row; each byte holds 5 trits.
+        layer = layers.TernaryDense(40)
+        layer.build((None, 32))
         layer.quantize("ternary")
 
-        self.assertEqual(tuple(layer._packed_kernel.shape), (8, 32))
+        self.assertEqual(tuple(layer._kernel.shape), (32, 8))
 
-        n_weights = 40 * 32
-        n_bytes = 8 * 32
+        n_weights = 32 * 40
+        n_bytes = int(np.prod(layer._kernel.shape))
         bits_per_weight = 8 * n_bytes / n_weights
         self.assertEqual(bits_per_weight, 1.6)
         # Strictly denser than int4 (would need n_weights / 2 bytes).

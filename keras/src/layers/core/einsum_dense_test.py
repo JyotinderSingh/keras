@@ -1235,7 +1235,7 @@ class EinsumDenseTest(testing.TestCase):
         unpacked = quantizers.unpack_int4(
             packed_kernel, layer.kernel_scale.shape[-1], axis=-1
         )
-        expected = ops.reshape(unpacked, layer.original_kernel_shape)
+        expected = ops.reshape(unpacked, layer.kernel_shape)
         self.assertAllClose(layer.kernel, expected)
 
     def test_legacy_load_own_variables(self):
@@ -1343,7 +1343,7 @@ class EinsumDenseTest(testing.TestCase):
         layer = layers.EinsumDense(**config, dtype="gptq/4/8_from_float32")
         layer.build((None, 3))
         layer.load_own_variables(gptq_store)
-        self.assertTrue(layer.is_gptq_calibrated)
+        self.assertFalse(layer.calibration_pending)
         self.assertAllClose(layer.bias, gptq_store["0"])
         self.assertAllClose(layer.quantized_kernel, gptq_store["1"])
         self.assertAllClose(layer.kernel_scale, gptq_store["2"])
@@ -1356,7 +1356,7 @@ class EinsumDenseTest(testing.TestCase):
         layer = layers.EinsumDense(**config, dtype="awq/4/8_from_float32")
         layer.build((None, 3))
         layer.load_own_variables(awq_store)
-        self.assertTrue(layer.is_awq_calibrated)
+        self.assertFalse(layer.calibration_pending)
         self.assertAllClose(layer.bias, awq_store["0"])
         self.assertAllClose(layer.quantized_kernel, awq_store["1"])
         self.assertAllClose(layer.kernel_scale, awq_store["2"])
@@ -1441,8 +1441,7 @@ class EinsumDenseTest(testing.TestCase):
 
                 target = self._build_einsum_for_mode(mode)
                 target.load_own_variables(test_utils.positional_store(source))
-                self.assertEqual(target.is_gptq_calibrated, mode == "gptq")
-                self.assertEqual(target.is_awq_calibrated, mode == "awq")
+                self.assertFalse(target.calibration_pending)
                 test_utils.assert_serialized_variables_equal(
                     self, source, target
                 )
@@ -1480,7 +1479,7 @@ class EinsumDenseTest(testing.TestCase):
                 dataset=None, tokenizer=None, weight_bits=4, group_size=8
             ),
         )
-        layer.is_gptq_calibrated = True  # Bypass calibration check
+        layer.calibration_pending = False  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
             layer.kernel,
@@ -1541,7 +1540,7 @@ class EinsumDenseTest(testing.TestCase):
                 dataset=None, tokenizer=None, group_size=8, num_grid_points=10
             ),
         )
-        layer.is_awq_calibrated = True  # Bypass calibration check
+        layer.calibration_pending = False  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
             layer.kernel,
@@ -1633,9 +1632,12 @@ class EinsumDenseTest(testing.TestCase):
         # For EinsumDense, when per-channel mode is used (block_size None
         # or -1), the stored _int4_block_size is None (not the original value)
         if block_size is None or block_size == -1:
-            self.assertIsNone(layer._int4_block_size)
+            self.assertIsNone(layer._qtensor().scheme.group_size)
         else:
-            self.assertEqual(layer._int4_block_size, block_size)
+            self.assertEqual(
+                layer._qtensor().scheme.group_size,
+                None if block_size in (None, -1) else block_size,
+            )
 
         # Verify kernel_scale shape (GPTQ layout)
         if block_size is None or block_size == -1:
@@ -1912,8 +1914,14 @@ class EinsumDenseTest(testing.TestCase):
         layer_multi.quantize("int4", config=config)
 
         # Both should use grouped quantization (block_size stored)
-        self.assertEqual(layer_single._int4_block_size, block_size)
-        self.assertEqual(layer_multi._int4_block_size, block_size)
+        self.assertEqual(
+            layer_single._qtensor().scheme.group_size,
+            None if block_size in (None, -1) else block_size,
+        )
+        self.assertEqual(
+            layer_multi._qtensor().scheme.group_size,
+            None if block_size in (None, -1) else block_size,
+        )
 
         # Verify forward pass works for both
         x_single = np.random.random((2, 128)).astype("float32")
@@ -1945,7 +1953,7 @@ class EinsumDenseTest(testing.TestCase):
         layer.quantize("int4", config=config)
 
         # Verify g_idx is created
-        self.assertTrue(hasattr(layer, "g_idx"))
+        self.assertIsNotNone(layer.g_idx)
 
         # Verify g_idx shape (128 = input_dim = reduced dimension)
         self.assertEqual(layer.g_idx.shape, (128,))
@@ -1970,7 +1978,7 @@ class EinsumDenseTest(testing.TestCase):
         layer.quantize("int4", config=config)
 
         # Verify g_idx is NOT created for per-channel
-        self.assertFalse(hasattr(layer, "g_idx"))
+        self.assertIsNone(layer.g_idx)
 
     @pytest.mark.skipif(
         testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
@@ -2002,7 +2010,7 @@ class EinsumDenseTest(testing.TestCase):
 
         # Verify g_idx is preserved
         loaded_layer = loaded_model.layers[0]
-        self.assertTrue(hasattr(loaded_layer, "g_idx"))
+        self.assertIsNotNone(loaded_layer.g_idx)
         self.assertAllClose(loaded_layer.g_idx, g_idx_before)
 
         # Verify outputs match
@@ -2069,8 +2077,8 @@ class EinsumDenseTest(testing.TestCase):
         layer.quantize(
             "int4", config=Int4QuantizationConfig(block_size=block_size)
         )
-        self.assertFalse(hasattr(layer, "kernel_zero"))
-        self.assertFalse(hasattr(layer, "g_idx"))
+        self.assertIsNone(layer.kernel_zero)
+        self.assertIsNone(layer.g_idx)
         self.assertEqual(layer.dtype_policy.name, "int4/-1_from_float32")
 
     @parameterized.named_parameters(
@@ -2099,9 +2107,9 @@ class EinsumDenseTest(testing.TestCase):
 
         self.assertEqual(layer.quantization_mode, "int4")
         if per_channel:
-            self.assertFalse(hasattr(layer, "g_idx"))
+            self.assertIsNone(layer.g_idx)
         else:
-            self.assertTrue(hasattr(layer, "g_idx"))
+            self.assertIsNotNone(layer.g_idx)
             self.assertEqual(tuple(layer.g_idx.shape), (input_dim,))
         self.assertEqual(backend.standardize_dtype(layer._kernel.dtype), "int8")
 

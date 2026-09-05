@@ -18,6 +18,7 @@ from keras.src.quantizers.qtensor import Int4Pairs
 from keras.src.quantizers.qtensor import NoPack
 from keras.src.quantizers.qtensor import QTensor
 from keras.src.quantizers.qtensor import WeightScheme
+from keras.src.quantizers.quantizers import divisor_scale
 
 
 class CalibrationMode(QuantizationMode):
@@ -31,6 +32,9 @@ class CalibrationMode(QuantizationMode):
         # mode's variables from the layer's current weight shape.
         geometry = require_geometry(layer, self.name)
         layer.quantized_build(geometry.weight_shape, self.name, config)
+        # A live float layer keeps its float kernel as the weight until
+        # `write_back` installs the calibrated codes.
+        layer.calibration_pending = True
 
     # --- Config and policy-string surface ---------------------------------
 
@@ -89,11 +93,10 @@ class CalibrationMode(QuantizationMode):
         (run by `Model.quantize`) writes the quantized weights back.
         """
         geometry = require_geometry(layer, self.name)
-
-        # Ensures the forward pass uses the original high-precision kernel
-        # until calibration has been performed.
-        setattr(layer, f"is_{self.name}_calibrated", False)
-        geometry.record_calibration_kernel_shape(input_shape)
+        # Allocation alone leaves nothing pending: a layer built under a
+        # calibration policy loads its codes from a checkpoint. `quantize`
+        # marks a live float layer pending after this returns.
+        layer.calibration_pending = False
 
         if len(input_shape) not in (2, 3):
             raise ValueError(
@@ -106,8 +109,6 @@ class CalibrationMode(QuantizationMode):
         kernel_columns = self._pack_layout(bits, columns).packed_length(columns)
         group_size = self.resolve_group_size(layer, config)
         n_groups = 1 if group_size == -1 else math.ceil(rows / group_size)
-
-        geometry.prepare()
 
         # Stored in the kernel's own `[in, out]` orientation and packed
         # along the output axis, like the int4 layout, so the forward pass
@@ -152,6 +153,55 @@ class CalibrationMode(QuantizationMode):
         del layer
         return None
 
+    # --- Calibration state ------------------------------------------------
+
+    def write_back(self, layer, codes, scale, zero_point, g_idx, **extra):
+        """Installs the calibrated values and retires the float kernel.
+
+        `scale` is the multiplier the algorithm computed; the layer stores
+        the divisor it divides by.
+        """
+        require_geometry(layer, self.name)
+        del layer._kernel
+        layer.quantized_kernel.assign(codes)
+        layer.kernel_scale.assign(
+            divisor_scale(scale, layer.kernel_scale.dtype)
+        )
+        layer.kernel_zero.assign(zero_point)
+        layer.g_idx.assign(g_idx)
+        self._assign_extra_variables(layer, **extra)
+        layer.calibration_pending = False
+
+    def _assign_extra_variables(self, layer, **extra):
+        """Assigns any mode-specific calibrated values."""
+        del layer
+        if extra:
+            raise TypeError(
+                f"Quantization mode '{self.name}' has no extra calibrated "
+                f"variables. Received: {sorted(extra)}"
+            )
+
+    def check_saveable(self, layer):
+        if layer.calibration_pending:
+            raise ValueError(
+                f"Cannot save layer '{layer.name}' because it is quantized "
+                f"with mode '{self.name}' but has never been calibrated. Its "
+                "quantized weights are uninitialized, so saving would "
+                "produce a corrupted model. Run calibration first, e.g. via "
+                "`model.quantize(...)` with a quantization layer structure "
+                "that covers this layer, or exclude the layer from "
+                "quantization with `filters`."
+            )
+
+    def variables_loaded(self, layer):
+        # A stored calibration checkpoint is always calibrated: loading
+        # completes the transition and retires the float kernel a live
+        # `quantize()` left in place.
+        if layer.calibration_pending:
+            require_geometry(layer, self.name)
+            del layer._kernel
+            layer.calibration_pending = False
+
     @staticmethod
     def _pack_layout(bits, columns):
         """How `columns` codes of `bits` bits pack along the output axis."""
@@ -166,9 +216,9 @@ class CalibrationMode(QuantizationMode):
     # --- Quantized weight view --------------------------------------------
 
     def qtensor(self, layer):
-        if not getattr(layer, f"is_{self.name}_calibrated", False):
-            # Before calibration the codes are uninitialized and the float
-            # kernel is still the layer's weight.
+        if layer.calibration_pending:
+            # The codes are uninitialized; the float kernel is still the
+            # layer's weight.
             return None
         geometry = require_geometry(layer, self.name)
         config = layer.quantization_config
@@ -194,7 +244,7 @@ class CalibrationMode(QuantizationMode):
                 group_axis=0,
             ),
             input_scales=self._input_scales(layer),
-            logical_shape=geometry.calibration_kernel_shape(),
+            logical_shape=geometry.weight_shape,
             compute_dtype=layer.compute_dtype,
         )
 
