@@ -317,13 +317,3 @@ def _validate_mode(mode):
             f"Expected one of {mode_registry.registered_mode_names()}. "
             f"Received: mode={mode}"
         )
-
-
-def get_block_size_for_layer(layer, config):
-    """Determine the block size for int4 quantization.
-
-    The resolution logic lives on the int4 mode descriptor
-    (`Int4Mode.resolve_block_size`); this wrapper remains until the layer
-    call sites dispatch through the registry.
-    """
-    return mode_registry.get_mode("int4").resolve_block_size(layer, config)

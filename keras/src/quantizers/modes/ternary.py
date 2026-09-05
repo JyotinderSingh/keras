@@ -1,3 +1,6 @@
+import ml_dtypes
+
+from keras.src import backend
 from keras.src import initializers
 from keras.src import ops
 from keras.src.quantizers.mode_registry import QuantizationMode
@@ -5,6 +8,18 @@ from keras.src.quantizers.mode_registry import require_geometry
 from keras.src.quantizers.quantization_config import TernaryQuantizationConfig
 from keras.src.quantizers.quantizers import pack_ternary
 from keras.src.quantizers.quantizers import unpack_ternary
+
+
+def _ternary_divisor(beta, dtype):
+    """The stored scale for a BitNet beta: `1 / beta`, finite in `dtype`.
+
+    An all-zero kernel has `beta == 0` and all-zero codes, so any finite
+    scale reproduces it: store 1.0 rather than an infinite reciprocal.
+    """
+    if beta <= 0.0:
+        return 1.0
+    tiny = float(ml_dtypes.finfo(backend.standardize_dtype(dtype)).tiny)
+    return 1.0 / max(float(beta), tiny)
 
 
 class TernaryMode(QuantizationMode):
@@ -35,7 +50,8 @@ class TernaryMode(QuantizationMode):
             dtype="uint8",
             trainable=False,
         )
-        # Scalar BitNet b1.58 beta scale; 1.0 in fixed-threshold mode.
+        # Scalar divisor scale, `1 / beta` (BitNet b1.58); 1.0 with a
+        # fixed threshold.
         layer.kernel_scale = layer.add_weight(
             name="kernel_scale",
             shape=(),
@@ -61,7 +77,7 @@ class TernaryMode(QuantizationMode):
             ops.matmul(inputs, pos),
             ops.matmul(inputs, neg),
         )
-        x = ops.multiply(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
+        x = ops.divide(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
         if layer.bias is not None:
             x = ops.add(x, layer.bias)
         if layer.activation is not None:
@@ -81,4 +97,6 @@ class TernaryMode(QuantizationMode):
         del layer._kernel
         layer.quantized_build(kernel_shape, "ternary")
         layer._packed_kernel.assign(packed_kernel)
-        layer.kernel_scale.assign(beta)
+        layer.kernel_scale.assign(
+            _ternary_divisor(beta, layer.kernel_scale.dtype)
+        )
