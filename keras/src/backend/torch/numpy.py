@@ -100,6 +100,18 @@ def einsum(subscripts, *operands, **kwargs):
         # prevent overflow
         operands = [cast(operand, compute_dtype) for operand in operands]
         return cast(torch.einsum(subscripts, *operands), "int32")
+    if len(dtypes_to_resolve) > 1:
+        # `torch.einsum` does not promote mixed dtypes (e.g. a float input
+        # against an int8 kernel), unlike `matmul` above and the other
+        # backends. Resolve the result dtype the way the op's output spec
+        # does and cast the operands to it.
+        result_dtype = dtypes.result_type(*dtypes_to_resolve)
+        compute_dtype = result_dtype
+        # TODO: torch.einsum doesn't support integer types with cuda
+        if get_device() == "cuda" and "int" in compute_dtype:
+            compute_dtype = config.floatx()
+        operands = [cast(operand, compute_dtype) for operand in operands]
+        return cast(torch.einsum(subscripts, *operands), result_dtype)
     return torch.einsum(subscripts, *operands)
 
 
