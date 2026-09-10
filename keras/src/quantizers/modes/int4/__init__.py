@@ -23,8 +23,6 @@ class Int4Strategy(
 
     name = "int4"
     config_cls = Int4QuantizationConfig
-    # Packed sub-byte storage: two int4 values per byte.
-    summary_byte_multiplier = 2
 
     def resolve_block_size(self, layer, config):
         """Determine the block size for int4 quantization.

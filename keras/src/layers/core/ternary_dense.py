@@ -7,7 +7,6 @@ from keras.src.api_export import keras_export
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers.geometry import ProjectionGeometry
-from keras.src.quantizers.quantizers import unpack_ternary
 
 
 @keras_export("keras.layers.TernaryDense")
@@ -186,12 +185,10 @@ class TernaryDense(Layer):
             raise AttributeError(
                 "You must build the layer before accessing `kernel`."
             )
-        if self.quantization_mode == "ternary":
-            # Frozen: the packed codes, unpacked to `{-1, 0, +1}`.
-            return unpack_ternary(
-                self._packed_kernel, self._orig_input_dim, axis=0
-            )
-        return self._kernel
+        # Frozen: the codes, unpacked to `{-1, 0, +1}` by the mode's
+        # `QTensor` view; otherwise the float kernel.
+        qtensor = self._qtensor()
+        return self._kernel if qtensor is None else qtensor.unpack()
 
     def _ternary_kernel(self):
         """Forward value is in {-1, 0, +1}; gradients flow via STE."""

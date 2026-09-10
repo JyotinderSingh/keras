@@ -4,9 +4,21 @@ from keras.src.quantizers.modes.common import add_lookup_lora_delta
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.modes.common import apply_logit_soft_cap
 from keras.src.quantizers.modes.common import cast_lookup_inputs
+from keras.src.quantizers.qtensor import NoPack
+from keras.src.quantizers.qtensor import QTensor
+from keras.src.quantizers.qtensor import WeightScheme
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
+
+
+def _int8_scheme(channel_axis):
+    """Symmetric int8 codes with a per-channel divisor scale."""
+    return WeightScheme(
+        bits=8,
+        code_range=(-127, 127),
+        channel_axis=channel_axis,
+    )
 
 
 class Int8Strategy(GeometryDispatchStrategy):
@@ -20,6 +32,8 @@ class Int8Strategy(GeometryDispatchStrategy):
 
     name = "int8"
     config_cls = Int8QuantizationConfig
+
+    # --- Projection (Dense, EinsumDense) ----------------------------------
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
         geometry.prepare()
@@ -91,16 +105,36 @@ class Int8Strategy(GeometryDispatchStrategy):
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 
-    def _quantize_projection(self, layer, geometry, config):
-        kernel_shape = layer._kernel.shape
+    def _encode_projection(self, layer, geometry, weight, config):
         geometry.prepare()
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config, AbsMaxQuantizer(axis=geometry.kernel_reduced_axes)
         )
-        kernel_value, kernel_scale = weight_quantizer(
-            layer._kernel, to_numpy=True
+        kernel_value, kernel_scale = weight_quantizer(weight, to_numpy=True)
+        return (
+            kernel_value,
+            geometry.kernel_scale_for_storage(kernel_scale),
+            None,
         )
-        kernel_scale = geometry.kernel_scale_for_storage(kernel_scale)
+
+    def _qtensor_projection(self, layer, geometry):
+        # The stored scale is laid out for the outputs; the geometry aligns
+        # it with the kernel again (a no-op for a matmul kernel).
+        return QTensor(
+            codes=layer._kernel,
+            scale=layer.kernel_scale,
+            layout=NoPack(),
+            scheme=_int8_scheme(channel_axis=None),
+            logical_shape=layer._kernel.shape,
+            align_scale=geometry.kernel_scale_for_dequant,
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_projection(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        kernel_value, kernel_scale, _ = self._encode_projection(
+            layer, geometry, layer._kernel, config
+        )
         del layer._kernel
         layer.quantized_build(kernel_shape, "int8", config)
         layer._kernel.assign(kernel_value)
@@ -179,18 +213,31 @@ class Int8Strategy(GeometryDispatchStrategy):
             logits = ops.divide(logits, ops.multiply(inputs_scale, scale))
             return apply_logit_soft_cap(layer, logits)
 
-    def _quantize_lookup(self, layer, geometry, config):
-        embeddings_shape = (layer.input_dim, layer.output_dim)
-        # Quantize `layer._embeddings` to int8 and compute corresponding
-        # scale.
+    def _encode_lookup(self, layer, geometry, weight, config):
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config,
             AbsMaxQuantizer(axis=-1),
         )
         embeddings_value, embeddings_scale = weight_quantizer(
-            layer._embeddings, to_numpy=True
+            weight, to_numpy=True
         )
-        embeddings_scale = ops.squeeze(embeddings_scale, axis=-1)
+        return embeddings_value, ops.squeeze(embeddings_scale, axis=-1), None
+
+    def _qtensor_lookup(self, layer, geometry):
+        return QTensor(
+            codes=layer._embeddings,
+            scale=layer.embeddings_scale,
+            layout=NoPack(),
+            scheme=_int8_scheme(channel_axis=0),
+            logical_shape=(layer.input_dim, layer.output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_lookup(self, layer, geometry, config):
+        embeddings_shape = (layer.input_dim, layer.output_dim)
+        embeddings_value, embeddings_scale, _ = self._encode_lookup(
+            layer, geometry, layer._embeddings, config
+        )
         del layer._embeddings
         untied = geometry.reversible and not layer.tie_weights
         if untied:

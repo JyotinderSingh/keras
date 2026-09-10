@@ -146,15 +146,6 @@ class ProjectionGeometry(QuantizationGeometry):
         """
         return kernel_shape[0], kernel_shape[1]
 
-    def store_unpacked_columns(self, mode, columns):
-        """Records the unpacked column count for the calibration call path."""
-        del mode, columns  # The matmul case reads `layer.units` instead.
-
-    def unpacked_columns(self, mode):
-        """The unpacked column count recorded at calibration build time."""
-        del mode
-        return self.layer.units
-
     def contract(self, inputs, kernel):
         """Contracts `inputs` against a kernel in the contraction shape."""
         return ops.matmul(inputs, kernel)
@@ -163,13 +154,13 @@ class ProjectionGeometry(QuantizationGeometry):
         """Gradient of `contract` with respect to its inputs."""
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
-    def reshape_kernel(self, kernel):
-        """Restores a 2D dequantized kernel to the contraction shape."""
-        return kernel
-
     def record_kernel_shape(self, kernel_shape):
-        """Records the float kernel shape for a later reshape or write-back."""
+        """Records the float kernel shape the codes stand for."""
         self.layer.kernel_shape = kernel_shape
+
+    def recorded_kernel_shape(self):
+        """The float kernel shape recorded when the codes were built."""
+        return self.layer.kernel_shape
 
     def rows_columns(self, kernel_shape):
         """2D `(rows, columns)` view: contracted axes times the rest."""
@@ -294,12 +285,6 @@ class EinsumProjectionGeometry(ProjectionGeometry):
             return heads * head_dim, out_features
         raise ValueError("Could not determine row/column split.")
 
-    def store_unpacked_columns(self, mode, columns):
-        setattr(self.layer, f"{mode}_unpacked_column_size", columns)
-
-    def unpacked_columns(self, mode):
-        return getattr(self.layer, f"{mode}_unpacked_column_size")
-
     def contract(self, inputs, kernel):
         return ops.einsum(self.layer.equation, inputs, kernel)
 
@@ -309,11 +294,11 @@ class EinsumProjectionGeometry(ProjectionGeometry):
             self.layer._custom_gradient_equation, upstream, float_kernel
         )
 
-    def reshape_kernel(self, kernel):
-        return ops.reshape(kernel, self.layer.original_kernel_shape)
-
     def record_kernel_shape(self, kernel_shape):
         self.layer.original_kernel_shape = kernel_shape
+
+    def recorded_kernel_shape(self):
+        return self.layer.original_kernel_shape
 
     def rows_columns(self, kernel_shape):
         rows = 1

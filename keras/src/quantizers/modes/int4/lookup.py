@@ -6,8 +6,11 @@ from keras.src import ops
 from keras.src.quantizers.modes.common import add_lookup_lora_delta
 from keras.src.quantizers.modes.common import apply_logit_soft_cap
 from keras.src.quantizers.modes.common import cast_lookup_inputs
+from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_grouped
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
+from keras.src.quantizers.qtensor import Int4Pairs
+from keras.src.quantizers.qtensor import QTensor
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
@@ -21,9 +24,7 @@ from keras.src.quantizers.quantizers import unpack_int4
 
 class Int4LookupHandlers:
     """`_build_lookup` / `_call_lookup` / `_call_reversible_lookup` /
-    `_quantize_lookup`."""
-
-    # --- Embeddings lookup (Embedding, ReversibleEmbedding) ---------------
+    `_encode_lookup` / `_qtensor_lookup` / `_quantize_lookup`."""
 
     def _build_lookup(self, layer, geometry, embeddings_shape, config):
         """Build variables for int4 quantization of an embeddings table.
@@ -246,17 +247,15 @@ class Int4LookupHandlers:
 
             return apply_logit_soft_cap(layer, logits)
 
-    def _quantize_lookup(self, layer, geometry, config):
-        embeddings_shape = (layer.input_dim, layer.output_dim)
+    def _encode_lookup(self, layer, geometry, weight, config):
         # `Int4Strategy.resolve_block_size` is the single source of truth for
         # the group size, shared with the build path and the dtype-policy
         # naming. A bare `quantize("int4")` resolves to the canonical
         # `Int4QuantizationConfig()` (grouped, block_size=128); `None`/`-1`
         # selects per-channel.
         block_size = self.resolve_block_size(layer, config)
-        use_grouped = is_grouped(block_size)
 
-        if not use_grouped:
+        if is_per_channel(block_size):
             # Per-channel quantization
             weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
                 config,
@@ -265,13 +264,14 @@ class Int4LookupHandlers:
                 ),
             )
             embeddings_value, embeddings_scale = weight_quantizer(
-                layer._embeddings, to_numpy=True
+                weight, to_numpy=True
             )
             embeddings_scale = ops.squeeze(embeddings_scale, axis=-1)
+            embeddings_zero = None
         else:
             # Sub-channel quantization with asymmetric zero point
             # Transpose to put output_dim first for grouped quantization
-            embeddings_t = ops.transpose(layer._embeddings)
+            embeddings_t = ops.transpose(weight)
 
             embeddings_value_t, scale_t, zero_t = (
                 abs_max_quantize_grouped_with_zero_point(
@@ -290,6 +290,30 @@ class Int4LookupHandlers:
             embeddings_zero = ops.transpose(zero_t)
 
         packed_embeddings_value, _, _ = pack_int4(embeddings_value, axis=-1)
+        return packed_embeddings_value, embeddings_scale, embeddings_zero
+
+    def _qtensor_lookup(self, layer, geometry):
+        grouped = is_grouped(layer._int4_block_size)
+        return QTensor(
+            codes=layer._embeddings,
+            scale=layer.embeddings_scale,
+            zero_point=layer.embeddings_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            scheme=int4_scheme(
+                layer._int4_block_size, channel_axis=0, group_axis=-1
+            ),
+            logical_shape=(layer.input_dim, layer.output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_lookup(self, layer, geometry, config):
+        embeddings_shape = (layer.input_dim, layer.output_dim)
+        block_size = self.resolve_block_size(layer, config)
+        use_grouped = is_grouped(block_size)
+        packed_embeddings_value, embeddings_scale, embeddings_zero = (
+            self._encode_lookup(layer, geometry, layer._embeddings, config)
+        )
         del layer._embeddings
 
         # Quantize reverse embeddings if not tied
