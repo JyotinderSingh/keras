@@ -992,10 +992,10 @@ class DenseTest(testing.TestCase):
             "0": np.random.random((16,)).astype("float32"),
             # quantized_kernel
             "1": np.random.randint(0, 16, size=(8, 8), dtype="uint8"),
-            # kernel_scale.
-            "2": np.random.random((16, 1)).astype("float32"),
-            # kernel_zero
-            "3": np.random.random((16, 1)).astype("uint8"),
+            # kernel_scale: [n_groups, out].
+            "2": np.random.random((1, 16)).astype("float32"),
+            # kernel_zero: [n_groups, out].
+            "3": np.random.random((1, 16)).astype("uint8"),
             # g_idx: legacy checkpoints stored the integer group indices as
             # float32; they load into the float32 g_idx variable unchanged.
             "4": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="float32"),
@@ -1003,8 +1003,8 @@ class DenseTest(testing.TestCase):
         awq_store = {
             "0": np.random.random((16,)).astype("float32"),  # bias
             "1": np.random.randint(0, 16, size=(8, 8), dtype="uint8"),  # kernel
-            "2": np.random.random((16, 1)).astype("float32"),  # scale
-            "3": np.random.random((16, 1)).astype("uint8"),  # zero
+            "2": np.random.random((1, 16)).astype("float32"),  # scale
+            "3": np.random.random((1, 16)).astype("uint8"),  # zero
             "4": np.random.random((8,)).astype("float32"),  # awq_scales
             # g_idx saved as int32 by a newer checkpoint; the cast on load
             # brings it into the float32 storage variable (see above).
@@ -1193,7 +1193,8 @@ class DenseTest(testing.TestCase):
         layer.is_gptq_calibrated = True  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
-            layer.kernel, quantizers.unpack_int4(packed_kernel, 2)
+            layer.kernel,
+            quantizers.unpack_int4(packed_kernel, 2, axis=-1, dtype="uint8"),
         )
 
     def test_gptq_kernel_packing(self):
@@ -1227,7 +1228,8 @@ class DenseTest(testing.TestCase):
         layer.is_awq_calibrated = True  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
-            layer.kernel, quantizers.unpack_int4(packed_kernel, 2)
+            layer.kernel,
+            quantizers.unpack_int4(packed_kernel, 2, axis=-1, dtype="uint8"),
         )
 
     def test_awq_kernel_packing(self):
@@ -1657,8 +1659,8 @@ class DenseTest(testing.TestCase):
         self.assertAllClose(model.predict(x), new_model.predict(x))
 
     def test_dense_quantize_ternary_beta_scale(self):
-        # With default threshold (None), beta = mean(|W|) is stored in
-        # kernel_scale and applied in _ternary_call.
+        # With default threshold (None), the stored divisor scale is
+        # 1 / beta with beta = mean(|W|); the forward divides by it.
         layer = layers.Dense(units=4, use_bias=False)
         layer.build((None, 4))
         kernel = np.array(
@@ -1676,7 +1678,7 @@ class DenseTest(testing.TestCase):
 
         self.assertAllClose(
             float(ops.convert_to_numpy(layer.kernel_scale)),
-            beta_expected,
+            1.0 / beta_expected,
             atol=1e-5,
         )
 

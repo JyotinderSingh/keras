@@ -224,10 +224,7 @@ class TernaryDense(Layer):
     # then runs from the packed kernel via the ternary mode's forward pass.
 
     def quantize(self, mode="ternary", type_check=True, config=None):
-        # Prevent quantization of subclasses with a different kernel layout.
-        if type_check and type(self) is not TernaryDense:
-            raise self._not_implemented_error(self.quantize)
-        self._registry_quantize(mode, config)
+        super().quantize(mode, type_check=type_check, config=config)
 
     def _quantization_geometry(self):
         return _TernaryDenseGeometry(self)

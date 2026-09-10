@@ -19,7 +19,8 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
+from keras.src.quantizers.quantizers import dequantize_grouped
+from keras.src.quantizers.quantizers import divisor_scale
 
 
 class Int4LookupHandlers:
@@ -144,7 +145,7 @@ class Int4LookupHandlers:
             embeddings_zero = ops.take(layer.embeddings_zero, inputs, axis=0)
 
             # Scale/zero are [batch..., n_groups], g_idx is [output_dim]
-            outputs = dequantize_with_sz_map(
+            outputs = dequantize_grouped(
                 ops.cast(outputs, dtype=layer.compute_dtype),
                 embeddings_scale,
                 embeddings_zero,
@@ -180,7 +181,7 @@ class Int4LookupHandlers:
         else:
             # Asymmetric sub-channel: the zero point cannot be pulled out of
             # the matmul, so dequantize the embeddings first.
-            float_embeddings = dequantize_with_sz_map(
+            float_embeddings = dequantize_grouped(
                 ops.cast(unpacked_embeddings, dtype),
                 scale,
                 zero,
@@ -233,7 +234,9 @@ class Int4LookupHandlers:
             )
             # Transpose back to (input_dim, output_dim) layout
             embeddings_value = ops.transpose(embeddings_value_t)
-            embeddings_scale = ops.transpose(scale_t)
+            embeddings_scale = divisor_scale(
+                ops.transpose(scale_t), layer.variable_dtype
+            )
             embeddings_zero = ops.transpose(zero_t)
 
         packed_embeddings_value, _, _ = pack_int4(embeddings_value, axis=-1)

@@ -1277,11 +1277,11 @@ class EinsumDenseTest(testing.TestCase):
             # bias
             "0": np.random.random((32,)).astype("float32"),
             # quantized_kernel
-            "1": np.random.randint(0, 16, size=(16, 24), dtype="uint8"),
+            "1": np.random.randint(0, 16, size=(24, 16), dtype="uint8"),
             # kernel_scale.
-            "2": np.random.random((32, 3)).astype("float32"),
+            "2": np.random.random((3, 32)).astype("float32"),
             # kernel_zero
-            "3": np.random.random((32, 3)).astype("uint8"),
+            "3": np.random.random((3, 32)).astype("uint8"),
             # g_idx: legacy checkpoints stored the integer group indices as
             # float32; they load into the float32 g_idx variable unchanged.
             "4": (np.arange(24) // 8).astype("float32"),
@@ -1289,9 +1289,9 @@ class EinsumDenseTest(testing.TestCase):
         # kernel shape (3, 8, 32), packed: (16, 24) for 4-bit
         awq_store = {
             "0": np.random.random((32,)).astype("float32"),  # bias
-            "1": np.random.randint(0, 16, size=(16, 24), dtype="uint8"),
-            "2": np.random.random((32, 3)).astype("float32"),  # scale
-            "3": np.random.random((32, 3)).astype("uint8"),  # zero
+            "1": np.random.randint(0, 16, size=(24, 16), dtype="uint8"),
+            "2": np.random.random((3, 32)).astype("float32"),  # scale
+            "3": np.random.random((3, 32)).astype("uint8"),  # zero
             "4": np.random.random((24,)).astype("float32"),  # awq_scales
             # g_idx saved as int32 by a newer checkpoint; the cast on load
             # brings it into the float32 storage variable (see above).
@@ -1483,7 +1483,8 @@ class EinsumDenseTest(testing.TestCase):
         layer.is_gptq_calibrated = True  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
-            layer.kernel, quantizers.unpack_int4(packed_kernel, 2)
+            layer.kernel,
+            quantizers.unpack_int4(packed_kernel, 2, axis=-1, dtype="uint8"),
         )
 
     def test_gptq_kernel_packing(self):
@@ -1528,7 +1529,8 @@ class EinsumDenseTest(testing.TestCase):
         layer.is_awq_calibrated = True  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
-            layer.kernel, quantizers.unpack_int4(packed_kernel, 2)
+            layer.kernel,
+            quantizers.unpack_int4(packed_kernel, 2, axis=-1, dtype="uint8"),
         )
 
     def test_awq_kernel_packing(self):
