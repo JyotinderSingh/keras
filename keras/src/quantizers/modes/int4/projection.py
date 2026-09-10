@@ -31,13 +31,11 @@ class Int4ProjectionHandlers:
     """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
-        geometry.prepare()
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(config, None)
         )
         rows, columns = geometry.rows_columns(kernel_shape)
         block_size = self.resolve_block_size(layer, config)
-        geometry.record_kernel_shape(kernel_shape)
 
         # Codes packed along the columns: stored as `[rows, ceil(columns/2)]`.
         layer._kernel = layer.add_weight(
@@ -82,28 +80,27 @@ class Int4ProjectionHandlers:
                 dtype="float32",
                 trainable=False,
             )
-
-        # Recorded for unpacking and reshaping at runtime.
-        layer._int4_block_size = block_size
-        layer._orig_input_dim = rows
-        layer._orig_output_dim = columns
+        else:
+            layer.kernel_zero = None
+            layer.g_idx = None
 
     def _view(self, layer, geometry, codes, scale, zero_point, g_idx):
         """The `QTensor` over given tensors (the layer's, or traced ones)."""
-        block_size = layer._int4_block_size
+        block_size = self.block_size(layer)
+        _, columns = geometry.rows_columns(geometry.weight_shape)
         return QTensor(
             codes=codes,
             scale=scale,
             zero_point=zero_point,
             g_idx=g_idx,
-            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            layout=Int4Pairs(axis=-1, orig_len=columns),
             scheme=int4_scheme(block_size, channel_axis=-1, group_axis=0),
-            logical_shape=geometry.recorded_kernel_shape(),
+            logical_shape=geometry.weight_shape,
             compute_dtype=layer.compute_dtype,
         )
 
     def _qtensor_projection(self, layer, geometry):
-        grouped = is_grouped(layer._int4_block_size)
+        grouped = is_grouped(self.block_size(layer))
         return self._view(
             layer,
             geometry,
@@ -115,7 +112,7 @@ class Int4ProjectionHandlers:
 
     def _call_projection(self, layer, inputs, training=None):
         geometry = layer._quantization_geometry()
-        grouped = is_grouped(layer._int4_block_size)
+        grouped = is_grouped(self.block_size(layer))
 
         @ops.custom_gradient
         def contract_with_inputs_gradient(
@@ -170,7 +167,6 @@ class Int4ProjectionHandlers:
         return apply_bias_activation(layer, x)
 
     def _encode_projection(self, layer, geometry, weight, config):
-        geometry.prepare()
         # `Int4Strategy.resolve_block_size` is the single source of truth for
         # the group size, shared with the build path and the dtype-policy
         # naming, so the quantized values, the built variables, and the saved

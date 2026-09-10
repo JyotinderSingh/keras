@@ -229,16 +229,14 @@ class LayerViewTest(testing.TestCase):
         self.assertAllClose(view.unpack(), layer.kernel)
         if mode == "int4":
             expected = quantizers.unpack_int4(
-                layer._kernel, layer._orig_output_dim, axis=-1
+                layer._kernel, layer.units, axis=-1
             )
             self.assertAllClose(view.unpack(), expected)
 
     def test_dense_dequantize_matches_the_stored_scales(self):
         layer = self._dense("int4", Int4QuantizationConfig(block_size=4))
         view = layer._qtensor()
-        unpacked = quantizers.unpack_int4(
-            layer._kernel, layer._orig_output_dim, axis=-1
-        )
+        unpacked = quantizers.unpack_int4(layer._kernel, layer.units, axis=-1)
         expected = quantizers.dequantize_grouped(
             ops.cast(unpacked, layer.compute_dtype),
             layer.kernel_scale,
@@ -275,7 +273,7 @@ class LayerViewTest(testing.TestCase):
         self.assertAllClose(codes, layer._kernel)
         self.assertAllClose(scale, layer.kernel_scale)
         if zero is None:
-            self.assertFalse(hasattr(layer, "kernel_zero"))
+            self.assertIsNone(layer._qtensor().zero_point)
         else:
             self.assertAllClose(zero, layer.kernel_zero)
 
@@ -298,7 +296,7 @@ class LayerViewTest(testing.TestCase):
         self.assertEqual(view.logical_shape, (9, 4))
         self.assertAllClose(view.unpack(), layer.embeddings)
         unpacked = quantizers.unpack_int4(
-            layer._embeddings, layer._orig_output_dim, axis=-1
+            layer._embeddings, layer.output_dim, axis=-1
         )
         expected = quantizers.dequantize_grouped(
             ops.cast(unpacked, layer.compute_dtype),

@@ -36,7 +36,6 @@ class Int8Strategy(GeometryDispatchStrategy):
     # --- Projection (Dense, EinsumDense) ----------------------------------
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
-        geometry.prepare()
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(
                 config, AbsMaxQuantizer()
@@ -106,7 +105,6 @@ class Int8Strategy(GeometryDispatchStrategy):
         return apply_bias_activation(layer, x)
 
     def _encode_projection(self, layer, geometry, weight, config):
-        geometry.prepare()
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config, AbsMaxQuantizer(axis=geometry.kernel_reduced_axes)
         )
@@ -119,12 +117,13 @@ class Int8Strategy(GeometryDispatchStrategy):
 
     def _qtensor_projection(self, layer, geometry):
         # The stored scale is laid out for the outputs; the geometry aligns
-        # it with the kernel again (a no-op for a matmul kernel).
+        # it with the kernel again (a no-op for a matmul kernel, whose scale
+        # runs along the last axis).
         return QTensor(
             codes=layer._kernel,
             scale=layer.kernel_scale,
             layout=NoPack(),
-            scheme=_int8_scheme(channel_axis=None),
+            scheme=_int8_scheme(channel_axis=-1),
             logical_shape=layer._kernel.shape,
             align_scale=geometry.kernel_scale_for_dequant,
             compute_dtype=layer.compute_dtype,

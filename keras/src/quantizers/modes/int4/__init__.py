@@ -61,6 +61,16 @@ class Int4Strategy(
             # Int4DTypePolicy (legacy per-channel mode)
             return None
 
+    def block_size(self, layer):
+        """The block size a built int4 layer was built with.
+
+        Re-runs the resolution `build` performed, against the config the
+        layer recorded (or its dtype policy when built from a bare policy),
+        so the forward pass and the `QTensor` view read the fact the
+        variables' shapes were derived from.
+        """
+        return self.resolve_block_size(layer, layer.quantization_config)
+
     def policy_from_string(self, mode_str, source_name):
         # Legacy bare "int4" policies carry no block size and stay generic
         # (they resolve to per-channel quantization on reload).

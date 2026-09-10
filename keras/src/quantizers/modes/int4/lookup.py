@@ -49,7 +49,6 @@ class Int4LookupHandlers:
         )
 
         block_size = self.resolve_block_size(layer, config)
-        layer._int4_block_size = block_size
 
         if is_per_channel(block_size):
             scale_shape = (layer.input_dim,)
@@ -89,8 +88,9 @@ class Int4LookupHandlers:
                     ops.arange(output_dim, dtype="float32"), block_size
                 )
             )
-
-        layer._orig_output_dim = output_dim
+        else:
+            layer.embeddings_zero = None
+            layer.g_idx = None
 
         if geometry.reversible:
             layer.inputs_quantizer = (
@@ -133,17 +133,19 @@ class Int4LookupHandlers:
                         initializer="zeros",
                         trainable=False,
                     )
+                else:
+                    layer.reverse_embeddings_zero = None
 
     def _call_lookup(self, layer, inputs, training=None):
         """Forward pass for an int4 quantized embeddings lookup."""
         inputs = cast_lookup_inputs(inputs)
 
         unpacked_embeddings = unpack_int4(
-            layer._embeddings, layer._orig_output_dim, axis=-1
+            layer._embeddings, layer.output_dim, axis=-1
         )
         outputs = ops.take(unpacked_embeddings, inputs, axis=0)
 
-        block_size = getattr(layer, "_int4_block_size", None)
+        block_size = self.block_size(layer)
 
         if is_per_channel(block_size):
             embeddings_scale = ops.take(layer.embeddings_scale, inputs, axis=0)
@@ -172,7 +174,7 @@ class Int4LookupHandlers:
         if not reverse:
             return self._call_lookup(layer, inputs)
         else:
-            block_size = getattr(layer, "_int4_block_size", None)
+            block_size = self.block_size(layer)
 
             if layer.tie_weights:
                 embeddings = ops.transpose(layer._embeddings)
@@ -293,16 +295,15 @@ class Int4LookupHandlers:
         return packed_embeddings_value, embeddings_scale, embeddings_zero
 
     def _qtensor_lookup(self, layer, geometry):
-        grouped = is_grouped(layer._int4_block_size)
+        block_size = self.block_size(layer)
+        grouped = is_grouped(block_size)
         return QTensor(
             codes=layer._embeddings,
             scale=layer.embeddings_scale,
             zero_point=layer.embeddings_zero if grouped else None,
             g_idx=layer.g_idx if grouped else None,
-            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
-            scheme=int4_scheme(
-                layer._int4_block_size, channel_axis=0, group_axis=-1
-            ),
+            layout=Int4Pairs(axis=-1, orig_len=layer.output_dim),
+            scheme=int4_scheme(block_size, channel_axis=0, group_axis=-1),
             logical_shape=(layer.input_dim, layer.output_dim),
             compute_dtype=layer.compute_dtype,
         )
