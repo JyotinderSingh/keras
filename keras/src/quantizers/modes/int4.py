@@ -1,11 +1,11 @@
 from keras.src.dtype_policies.dtype_policy import Int4DTypePolicy
 from keras.src.dtype_policies.dtype_policy import QuantizedDTypePolicy
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
-from keras.src.quantizers.mode_registry import QuantizationMode
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
 
-class Int4Mode(QuantizationMode):
+class Int4Strategy(QuantizationStrategy):
     """W4A16 weight-only quantization (packed int4 weights)."""
 
     name = "int4"

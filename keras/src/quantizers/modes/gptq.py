@@ -1,9 +1,9 @@
 from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.modes.calibration import CalibrationMode
+from keras.src.quantizers.modes.calibration import CalibrationStrategy
 
 
-class GPTQMode(CalibrationMode):
+class GPTQStrategy(CalibrationStrategy):
     """GPTQ post-training quantization (calibration-based, 2/3/4/8-bit)."""
 
     name = "gptq"

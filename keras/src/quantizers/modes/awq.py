@@ -1,9 +1,9 @@
 from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
 from keras.src.quantizers.awq_config import AWQConfig
-from keras.src.quantizers.modes.calibration import CalibrationMode
+from keras.src.quantizers.modes.calibration import CalibrationStrategy
 
 
-class AWQMode(CalibrationMode):
+class AWQStrategy(CalibrationStrategy):
     """AWQ post-training quantization (activation-aware, 4-bit).
 
     AWQ uses 4-bit quantization with per-channel AWQ scales that protect

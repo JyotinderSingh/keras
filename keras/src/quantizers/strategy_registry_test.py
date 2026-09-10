@@ -3,38 +3,38 @@ from absl.testing import parameterized
 from keras.src import dtype_policies
 from keras.src import testing
 from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
-from keras.src.quantizers import mode_registry
+from keras.src.quantizers import strategy_registry
 
 
-class ModeRegistryTest(testing.TestCase):
+class StrategyRegistryTest(testing.TestCase):
     def test_builtin_modes_match_public_tuple(self):
         # The registration order is observable (validation error messages
         # render the registered-names tuple), so it must stay identical to
         # the public QUANTIZATION_MODES constant.
         self.assertEqual(
-            mode_registry.registered_mode_names(), QUANTIZATION_MODES
+            strategy_registry.registered_modes(), QUANTIZATION_MODES
         )
         for name in QUANTIZATION_MODES:
-            self.assertIsNotNone(mode_registry.get_mode(name))
+            self.assertIsNotNone(strategy_registry.get_strategy(name))
 
     def test_unknown_mode(self):
-        self.assertIsNone(mode_registry.get_mode("bogus"))
-        self.assertFalse(mode_registry.is_registered("bogus"))
+        self.assertIsNone(strategy_registry.get_strategy("bogus"))
+        self.assertFalse(strategy_registry.is_registered("bogus"))
 
     def test_register_requires_name(self):
-        class Nameless(mode_registry.QuantizationMode):
+        class Nameless(strategy_registry.QuantizationStrategy):
             requires_config = True
 
         with self.assertRaisesRegex(ValueError, "non-empty string `name`"):
-            mode_registry.register_quantization_mode(Nameless)
+            strategy_registry.register_quantization_strategy(Nameless)
 
     def test_register_rejects_duplicates(self):
-        class Duplicate(mode_registry.QuantizationMode):
+        class Duplicate(strategy_registry.QuantizationStrategy):
             name = "int8"
             requires_config = True
 
         with self.assertRaisesRegex(ValueError, "already registered"):
-            mode_registry.register_quantization_mode(Duplicate)
+            strategy_registry.register_quantization_strategy(Duplicate)
 
     @parameterized.named_parameters(
         ("existing_builtin_is_prefix", "int42"),
@@ -45,33 +45,33 @@ class ModeRegistryTest(testing.TestCase):
         # strings, so no mode name may share a prefix with a built-in.
         colliding_name = name
 
-        class Colliding(mode_registry.QuantizationMode):
+        class Colliding(strategy_registry.QuantizationStrategy):
             name = colliding_name
             requires_config = True
 
         with self.assertRaisesRegex(ValueError, "collides"):
-            mode_registry.register_quantization_mode(Colliding)
+            strategy_registry.register_quantization_strategy(Colliding)
 
     def test_register_allows_custom_prefix_overlap(self):
         # Externally registered modes match only their exact grammar
         # (name, name + "/", name + "_from_"), so two custom modes may
         # share a prefix without ambiguity.
-        class Custom(mode_registry.QuantizationMode):
+        class Custom(strategy_registry.QuantizationStrategy):
             name = "custom"
             requires_config = True
 
-        class CustomTwo(mode_registry.QuantizationMode):
+        class CustomTwo(strategy_registry.QuantizationStrategy):
             name = "custom2"
             requires_config = True
 
-        mode_registry.register_quantization_mode(Custom)
+        strategy_registry.register_quantization_strategy(Custom)
         try:
-            mode_registry.register_quantization_mode(CustomTwo)
+            strategy_registry.register_quantization_strategy(CustomTwo)
             policy = dtype_policies.get("custom2_from_float32")
             self.assertEqual(policy.quantization_mode, "custom2")
         finally:
-            mode_registry.unregister_quantization_mode("custom")
-            mode_registry.unregister_quantization_mode("custom2")
+            strategy_registry.unregister_quantization_strategy("custom")
+            strategy_registry.unregister_quantization_strategy("custom2")
 
     @parameterized.named_parameters(
         ("slash", "my/mode", "must not contain"),
@@ -85,58 +85,58 @@ class ModeRegistryTest(testing.TestCase):
         # policy-string parsing.
         reserved_name = name
 
-        class Reserved(mode_registry.QuantizationMode):
+        class Reserved(strategy_registry.QuantizationStrategy):
             name = reserved_name
             requires_config = True
 
         with self.assertRaisesRegex(ValueError, error):
-            mode_registry.register_quantization_mode(Reserved)
+            strategy_registry.register_quantization_strategy(Reserved)
 
     def test_registered_name_does_not_capture_ordinary_policies(self):
         # Policy strings are routed by mode name, but only through the
         # quantized grammar (bare name, name + "/", name + "_from_"). A
         # registered mode whose name prefixes ordinary policy strings (like
         # "mixed" prefixing "mixed_bfloat16") must not hijack them.
-        class MixedMode(mode_registry.QuantizationMode):
+        class MixedMode(strategy_registry.QuantizationStrategy):
             name = "mixed"
             requires_config = True
 
-        mode_registry.register_quantization_mode(MixedMode)
+        strategy_registry.register_quantization_strategy(MixedMode)
         try:
             policy = dtype_policies.get("mixed_bfloat16")
             self.assertIsNone(policy.quantization_mode)
             self.assertEqual(policy.compute_dtype, "bfloat16")
         finally:
-            mode_registry.unregister_quantization_mode("mixed")
+            strategy_registry.unregister_quantization_strategy("mixed")
 
     def test_register_as_decorator_keeps_the_class(self):
-        # Registering returns its argument, so a decorated descriptor stays
+        # Registering returns its argument, so a decorated strategy stays
         # a class and can still be subclassed.
-        @mode_registry.register_quantization_mode
-        class Decorated(mode_registry.QuantizationMode):
+        @strategy_registry.register_quantization_strategy
+        class Decorated(strategy_registry.QuantizationStrategy):
             name = "decorated"
             requires_config = True
 
         try:
             self.assertIsInstance(Decorated, type)
-            self.assertIsNotNone(mode_registry.get_mode("decorated"))
+            self.assertIsNotNone(strategy_registry.get_strategy("decorated"))
 
             class Sub(Decorated):
                 name = "decorated_sub"
 
             self.assertIsInstance(Sub, type)
         finally:
-            mode_registry.unregister_quantization_mode("decorated")
+            strategy_registry.unregister_quantization_strategy("decorated")
 
     def test_register_requires_config_source(self):
         # A mode must be able to produce a config: via config_cls, via
         # requires_config (explicit config mandatory), or by overriding
         # default_config. Registration fails otherwise, not first use.
-        class NoConfig(mode_registry.QuantizationMode):
+        class NoConfig(strategy_registry.QuantizationStrategy):
             name = "noconfig"
 
         with self.assertRaisesRegex(ValueError, "must define `config_cls`"):
-            mode_registry.register_quantization_mode(NoConfig)
+            strategy_registry.register_quantization_strategy(NoConfig)
 
 
 class PolicyCodecCorpusTest(testing.TestCase):

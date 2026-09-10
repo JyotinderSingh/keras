@@ -7,11 +7,11 @@ hooks below.
 """
 
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
-from keras.src.quantizers.mode_registry import QuantizationMode
+from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
 
-class CalibrationMode(QuantizationMode):
-    """A post-training mode whose values arrive from a calibration pass."""
+class CalibrationStrategy(QuantizationStrategy):
+    """A post-training strategy whose values arrive from a calibration pass."""
 
     requires_config = True
     requires_layer_structure = True

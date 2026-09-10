@@ -1,8 +1,8 @@
-from keras.src.quantizers.mode_registry import QuantizationMode
 from keras.src.quantizers.quantization_config import TernaryQuantizationConfig
+from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
 
-class TernaryMode(QuantizationMode):
+class TernaryStrategy(QuantizationStrategy):
     """Ternary (BitNet b1.58) quantization: weights in `{-1, 0, +1}`.
 
     The quantization rule (threshold and scale) is owned by the layer, so

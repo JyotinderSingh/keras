@@ -1,8 +1,8 @@
-"""Registry of quantization modes.
+"""Registry of quantization strategies, one per mode.
 
 This module is the single dispatch point for quantization behavior. Each
 quantization mode (`"int8"`, `"int4"`, `"float8"`, `"ternary"`,
-`"gptq"`, `"awq"`) is described by one `QuantizationMode` descriptor that
+`"gptq"`, `"awq"`) is implemented by one `QuantizationStrategy` that
 owns:
 
 - the mode's config class and default-config resolution,
@@ -16,14 +16,16 @@ The registry is internal API (`keras.src.quantizers`). Adding a mode is a
 registration rather than an edit of every resolution helper:
 
 ```python
-from keras.src.quantizers.mode_registry import QuantizationMode
-from keras.src.quantizers.mode_registry import register_quantization_mode
+from keras.src.quantizers.strategy_registry import QuantizationStrategy
+from keras.src.quantizers.strategy_registry import (
+    register_quantization_strategy,
+)
 
-class MyMode(QuantizationMode):
+class MyStrategy(QuantizationStrategy):
     name = "my_mode"
     ...
 
-register_quantization_mode(MyMode())
+register_quantization_strategy(MyStrategy())
 ```
 
 This module must stay import-light: it is consulted lazily from
@@ -31,11 +33,11 @@ This module must stay import-light: it is consulted lazily from
 not pull in layers or policies at module level.
 """
 
-_MODES = {}  # name -> QuantizationMode, in registration order.
+_MODE_TO_STRATEGY = {}  # mode -> QuantizationStrategy, in registration order.
 
 
-class QuantizationMode:
-    """Descriptor for one quantization mode.
+class QuantizationStrategy:
+    """Implementation of one quantization mode.
 
     Subclasses set `name` and `config_cls` and override the hooks whose
     behavior differs from the defaults derived from those attributes.
@@ -104,8 +106,8 @@ class QuantizationMode:
 
     # --- Per-layer hyperparameter resolution ------------------------------
 
-    # Mode-specific `resolve_*` helpers live on the concrete descriptors
-    # (e.g. `Int4Mode.resolve_block_size`). They all share the precedence:
+    # Mode-specific `resolve_*` helpers live on the concrete strategies
+    # (e.g. `Int4Strategy.resolve_block_size`). They all share the precedence:
     # explicit config > layer's quantized dtype policy > DTypePolicyMap
     # entry > mode-specific fallback.
 
@@ -154,8 +156,8 @@ class QuantizationMode:
         del model, config, structure, filters
 
 
-def register_quantization_mode(mode):
-    """Registers a `QuantizationMode` descriptor.
+def register_quantization_strategy(strategy):
+    """Registers a `QuantizationStrategy`.
 
     Accepts an instance or a class (instantiated with no arguments), and
     returns its argument unchanged so it can also be used as a class
@@ -164,7 +166,7 @@ def register_quantization_mode(mode):
     `keras.src.quantizers.modes` instead, where the order is written down
     rather than left to the import order.
 
-    The descriptor is validated at registration time, not at first use:
+    The strategy is validated at registration time, not at first use:
     the name must be a non-empty string, must not be registered already,
     must not contain the policy-grammar separators ("/" and "_from_"),
     must not shadow a standard dtype or mixed-precision policy name, and
@@ -176,14 +178,14 @@ def register_quantization_mode(mode):
     from keras.src import backend
     from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
 
-    descriptor = mode() if isinstance(mode, type) else mode
-    name = descriptor.name
+    instance = strategy() if isinstance(strategy, type) else strategy
+    name = instance.name
     if not isinstance(name, str) or not name:
         raise ValueError(
-            "A quantization mode must define a non-empty string `name`. "
+            "A quantization strategy must define a non-empty string `name`. "
             f"Received: name={name!r}"
         )
-    if name in _MODES:
+    if name in _MODE_TO_STRATEGY:
         raise ValueError(
             f"A quantization mode named '{name}' is already registered."
         )
@@ -205,7 +207,7 @@ def register_quantization_mode(mode):
                 "conflicts with a standard dtype or mixed-precision "
                 "policy name."
             )
-    for existing in _MODES:
+    for existing in _MODE_TO_STRATEGY:
         builtin_involved = (
             existing in QUANTIZATION_MODES or name in QUANTIZATION_MODES
         )
@@ -219,36 +221,37 @@ def register_quantization_mode(mode):
                 "no mode name may share a prefix with a built-in mode."
             )
     has_config_source = (
-        descriptor.config_cls is not None
-        or descriptor.requires_config
-        or type(descriptor).default_config
-        is not QuantizationMode.default_config
+        instance.config_cls is not None
+        or instance.requires_config
+        or type(instance).default_config
+        is not QuantizationStrategy.default_config
     )
     if not has_config_source:
         raise ValueError(
-            f"Quantization mode '{name}' must define `config_cls`, set "
+            f"Quantization strategy '{name}' must define `config_cls`, set "
             "`requires_config = True`, or override `default_config()`."
         )
-    _MODES[name] = descriptor
-    # Return the argument, not the descriptor: as a class decorator this
+    _MODE_TO_STRATEGY[name] = instance
+    # Return the argument, not the strategy: as a class decorator this
     # must leave the class bound to its name, still subclassable.
-    return mode
+    return strategy
 
 
-def unregister_quantization_mode(name):
-    """Removes a registered mode (intended for tests)."""
-    _MODES.pop(name, None)
+def unregister_quantization_strategy(mode):
+    """Removes the strategy registered for `mode` (intended for tests)."""
+    _MODE_TO_STRATEGY.pop(mode, None)
 
 
-def get_mode(name):
-    """Returns the descriptor registered under `name`, or `None`."""
-    return _MODES.get(name)
+def get_strategy(mode):
+    """Returns the strategy registered for `mode`, or `None`."""
+    return _MODE_TO_STRATEGY.get(mode)
 
 
-def is_registered(name):
-    return name in _MODES
+def is_registered(mode):
+    """Whether a strategy is registered for `mode`."""
+    return mode in _MODE_TO_STRATEGY
 
 
-def registered_mode_names():
-    """All registered mode names, as a tuple, in registration order."""
-    return tuple(_MODES)
+def registered_modes():
+    """All registered modes, as a tuple, in registration order."""
+    return tuple(_MODE_TO_STRATEGY)

@@ -1,9 +1,9 @@
 from keras.src.dtype_policies.dtype_policy import QuantizedFloat8DTypePolicy
-from keras.src.quantizers.mode_registry import QuantizationMode
 from keras.src.quantizers.quantization_config import Float8QuantizationConfig
+from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
 
-class Float8Mode(QuantizationMode):
+class Float8Strategy(QuantizationStrategy):
     """Float8 QDQ mixed-precision training.
 
     Quantizing only allocates the scale/amax-history variables; the float
