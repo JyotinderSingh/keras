@@ -9,11 +9,16 @@ owns:
 - the policy-string codec: routing a `"int4/128"`-style string to its
   dtype-policy class, and naming policies after quantization (each policy
   class parses its own grammar),
+- the mode's math: the `build`/`call`/`quantize` methods create the mode's
+  variables, run its forward pass, and compute its quantized values against
+  the layer's quantization geometry (`keras.src.quantizers.geometry`),
 - per-layer hyperparameter resolution (block size, weight bits, group size),
 - model-level orchestration hooks (calibration for structure-aware modes).
 
-The registry is internal API (`keras.src.quantizers`). Adding a mode is a
-registration rather than an edit of every resolution helper:
+The registry is internal API (`keras.src.quantizers`). Layers do not branch
+on mode strings and hold no per-mode methods; they expose their structure
+through `Layer._quantization_geometry()` and the strategies do the rest.
+Adding a mode is a registration, not an edit of every dispatch chain:
 
 ```python
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
@@ -39,8 +44,10 @@ _MODE_TO_STRATEGY = {}  # mode -> QuantizationStrategy, in registration order.
 class QuantizationStrategy:
     """Implementation of one quantization mode.
 
-    Subclasses set `name` and `config_cls` and override the hooks whose
-    behavior differs from the defaults derived from those attributes.
+    Subclasses set `name` and `config_cls` and implement the
+    `build`/`call`/`quantize` adapters against the layer's quantization
+    geometry (`Layer._quantization_geometry()`), which describes the layer's
+    quantizable structure without the layer knowing about any mode.
     """
 
     # The mode identifier, e.g. `"int8"`. Also the root of the policy-string
@@ -54,6 +61,12 @@ class QuantizationStrategy:
     # Whether `quantize(mode)` without a config is an error (calibration
     # modes need datasets that only an explicit config can carry).
     requires_config = False
+
+    # Whether `build` creates the layer's weight storage itself, replacing
+    # the float weight. Modes that keep the float weight and only add
+    # auxiliary variables (float8) set this to False, so the layer's `build`
+    # still creates the float weight.
+    owns_weight_storage = True
 
     # Whether `Model.quantize` must resolve a quantization layer structure
     # (pre-block layers + sequential blocks) before mutating any layer.
@@ -135,6 +148,30 @@ class QuantizationStrategy:
 
     # --- Layer capability -------------------------------------------------
 
+    def require_geometry(self, layer):
+        """Returns `layer`'s quantization geometry, raising if it has none.
+
+        The built-in strategies read the layer through its geometry, so a layer
+        that does not define one (a layer still on its own per-mode
+        methods, or a custom layer that a registered mode claims through
+        `supports_layer`) is refused here with a clear error rather than
+        failing deeper inside the mode.
+
+        Args:
+            layer: The layer being quantized.
+
+        Returns:
+            The layer's `QuantizationGeometry`.
+        """
+        geometry = layer._quantization_geometry()
+        if geometry is None:
+            raise NotImplementedError(
+                f"Layer {layer.__class__.__name__} does not define a "
+                f"quantization geometry, so mode '{self.name}' cannot be "
+                "applied to it."
+            )
+        return geometry
+
     def supports_layer(self, layer):
         """Whether this mode claims support for `layer`.
 
@@ -145,6 +182,30 @@ class QuantizationStrategy:
         """
         del layer
         return False
+
+    # --- Mode math --------------------------------------------------------
+
+    def build(self, layer, input_shape, config):
+        """Creates the mode's variables on `layer`."""
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `build`."
+        )
+
+    def call(self, layer, *args, **kwargs):
+        """Runs the mode's forward pass on `layer`."""
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `call`."
+        )
+
+    def quantize(self, layer, config):
+        """Computes quantized values and swaps `layer`'s variables.
+
+        A mode whose values arrive later (from calibration, or from
+        training) instead just builds its variables here.
+        """
+        raise NotImplementedError(
+            f"Quantization mode '{self.name}' does not implement `quantize`."
+        )
 
     # --- Model-level orchestration ----------------------------------------
 
