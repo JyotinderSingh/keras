@@ -13,7 +13,8 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
+from keras.src.quantizers.quantizers import dequantize_grouped
+from keras.src.quantizers.quantizers import divisor_scale
 from keras.src.quantizers.quantizers import pack_int4
 from keras.src.quantizers.quantizers import unpack_int4
 
@@ -156,7 +157,7 @@ class Int4LookupHandlers:
             embeddings_zero = ops.take(layer.embeddings_zero, inputs, axis=0)
 
             # Scale/zero are [batch..., n_groups], g_idx is [output_dim]
-            outputs = dequantize_with_sz_map(
+            outputs = dequantize_grouped(
                 ops.cast(outputs, dtype=layer.compute_dtype),
                 embeddings_scale,
                 embeddings_zero,
@@ -210,7 +211,7 @@ class Int4LookupHandlers:
                 scale_t = ops.transpose(scale)
                 zero_t = ops.transpose(layer.embeddings_zero)
 
-                float_embeddings = dequantize_with_sz_map(
+                float_embeddings = dequantize_grouped(
                     ops.cast(unpacked_embeddings, layer.compute_dtype),
                     scale_t,
                     zero_t,
@@ -230,7 +231,7 @@ class Int4LookupHandlers:
                 # reverse_embeddings_zero shape: (n_groups, input_dim)
                 # g_idx shape: (output_dim,) - reuse from forward pass
 
-                float_embeddings = dequantize_with_sz_map(
+                float_embeddings = dequantize_grouped(
                     ops.cast(unpacked_embeddings, layer.compute_dtype),
                     scale,
                     layer.reverse_embeddings_zero,
@@ -283,7 +284,9 @@ class Int4LookupHandlers:
             )
             # Transpose back to (input_dim, output_dim) layout
             embeddings_value = ops.transpose(embeddings_value_t)
-            embeddings_scale = ops.transpose(scale_t)
+            embeddings_scale = divisor_scale(
+                ops.transpose(scale_t), layer.variable_dtype
+            )
             embeddings_zero = ops.transpose(zero_t)
 
         packed_embeddings_value, _, _ = pack_int4(embeddings_value, axis=-1)
@@ -320,7 +323,9 @@ class Int4LookupHandlers:
                     )
                 )
                 reverse_embeddings_value = reverse_value
-                reverse_embeddings_scale = reverse_scale
+                reverse_embeddings_scale = divisor_scale(
+                    reverse_scale, layer.variable_dtype
+                )
                 reverse_embeddings_zero = reverse_zero
 
             packed_reverse_embeddings_value, _, _ = pack_int4(

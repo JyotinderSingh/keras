@@ -9,6 +9,7 @@ from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import GPTQQuantizer
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
+from keras.src.quantizers.quantizers import divisor_scale
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 
 
@@ -488,16 +489,23 @@ class GPTQ:
             quantized, self.original_layer.quantized_kernel.dtype
         )
 
+        # The algorithm works on `[out, in]`; the layer stores the kernel's
+        # own `[in, out]` orientation with the group parameters as
+        # `[n_groups, out]`, so the forward pass never transposes.
+        quantized = ops.transpose(quantized)
+        scale = ops.transpose(scale)
+        zero = ops.transpose(zero)
+
         if self.config.weight_bits == 4:
             # For 4-bit weights, we pack two values per byte.
             quantized, _, _ = quantizers.pack_int4(
-                quantized, axis=0, dtype="uint8"
+                quantized, axis=-1, dtype="uint8"
             )
         elif self.config.weight_bits == 2:
             # For 2-bit weights, we pack four values per byte (4x storage
             # reduction over the one-value-per-byte representation).
             quantized, _, _ = quantizers.pack_int2(
-                quantized, axis=0, dtype="uint8"
+                quantized, axis=-1, dtype="uint8"
             )
         # 3-bit weights are intentionally left unpacked: packing them densely
         # requires an irregular bitstream (3 does not divide 8), which would
@@ -506,7 +514,9 @@ class GPTQ:
 
         del self.original_layer._kernel
         self.original_layer.quantized_kernel.assign(quantized)
-        self.original_layer.kernel_scale.assign(scale)
+        self.original_layer.kernel_scale.assign(
+            divisor_scale(scale, self.original_layer.kernel_scale.dtype)
+        )
         self.original_layer.kernel_zero.assign(zero)
         self.original_layer.g_idx.assign(g_idx)
         self.original_layer.is_gptq_calibrated = True

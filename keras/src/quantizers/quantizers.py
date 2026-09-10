@@ -1639,6 +1639,32 @@ def quantize_with_sz_map(
     return quantize_with_zero_point(weights_matrix, scale_cols, zero_cols, maxq)
 
 
+def divisor_scale(scale, dtype):
+    """Returns the stored form of a multiplier `scale`: its reciprocal.
+
+    Every quantization mode stores the scale it divides by, the form the
+    abs-max quantizer produces (`qmax / amax`). The grouped and calibration
+    quantizers compute the multiplier form, `real = (code - zero) * scale`;
+    this returns `1 / scale`, floored at the smallest normal value of
+    `dtype` (the variable the result is stored in) so it is always finite.
+    """
+    tiny = float(ml_dtypes.finfo(backend.standardize_dtype(dtype)).tiny)
+    return ops.reciprocal(ops.maximum(ops.cast(scale, "float32"), tiny))
+
+
+def dequantize_grouped(codes, scale, zero, g_idx, group_axis=-1):
+    """Dequantizes grouped codes with their stored divisor scale.
+
+    The divisor counterpart of `dequantize_with_sz_map`: `g_idx` maps each
+    position along `group_axis` to its group, and the real value is
+    `(code - zero) / scale`.
+    """
+    groups = ops.cast(g_idx, "int32")
+    scales = ops.take(scale, groups, axis=group_axis)
+    zeros = ops.cast(ops.take(zero, groups, axis=group_axis), scales.dtype)
+    return ops.divide(ops.subtract(codes, zeros), scales)
+
+
 def dequantize_with_sz_map(weights_matrix, scale, zero, g_idx, group_axis=-1):
     """Rebuild a dequantized weight matrix from group params.
 

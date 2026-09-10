@@ -11,7 +11,8 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
+from keras.src.quantizers.quantizers import dequantize_grouped
+from keras.src.quantizers.quantizers import divisor_scale
 from keras.src.quantizers.quantizers import pack_int4
 from keras.src.quantizers.quantizers import unpack_int4
 
@@ -109,7 +110,7 @@ class Int4ProjectionHandlers:
                     kernel_zero, g_idx = group_params
                     # Scale and zero point are `[n_groups, columns]`; the
                     # group index expands them over the rows.
-                    float_kernel = dequantize_with_sz_map(
+                    float_kernel = dequantize_grouped(
                         unpacked, kernel_scale, kernel_zero, g_idx, group_axis=0
                     )
                     float_kernel = ops.cast(float_kernel, layer.compute_dtype)
@@ -187,6 +188,7 @@ class Int4ProjectionHandlers:
                     flat_kernel, block_size=block_size, to_numpy=True
                 )
             )
+            kernel_scale = divisor_scale(kernel_scale, layer.variable_dtype)
 
         # Pack two int4 values per int8 byte along the columns.
         packed_kernel_value, _, _ = pack_int4(kernel_value_int4, axis=-1)

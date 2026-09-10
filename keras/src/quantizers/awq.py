@@ -14,6 +14,7 @@ from keras.src.layers import EinsumDense
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
+from keras.src.quantizers.quantizers import divisor_scale
 from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 
@@ -545,19 +546,25 @@ class AWQ:
             activation_sample=activation_sample,
         )
 
-        # Cast to uint8 for storage
-        # quantized is already [out_features, in_features]
-        quantized = ops.cast(quantized, "uint8")
+        # Cast to uint8 for storage. The algorithm works on `[out, in]`; the
+        # layer stores the kernel's own `[in, out]` orientation with the
+        # group parameters as `[n_groups, out]`, so the forward pass never
+        # transposes.
+        quantized = ops.transpose(ops.cast(quantized, "uint8"))
+        scale = ops.transpose(scale)
+        zero = ops.transpose(zero)
 
-        # Pack to 4-bit along axis 0 (output features)
+        # Pack to 4-bit along the output axis.
         quantized_packed, _, _ = quantizers.pack_int4(
-            quantized, axis=0, dtype="uint8"
+            quantized, axis=-1, dtype="uint8"
         )
 
         # Assign to layer variables
         del self.original_layer._kernel
         self.original_layer.quantized_kernel.assign(quantized_packed)
-        self.original_layer.kernel_scale.assign(scale)
+        self.original_layer.kernel_scale.assign(
+            divisor_scale(scale, self.original_layer.kernel_scale.dtype)
+        )
         self.original_layer.kernel_zero.assign(zero)
         self.original_layer.awq_scales.assign(awq_scales)
         self.original_layer.g_idx.assign(g_idx)
