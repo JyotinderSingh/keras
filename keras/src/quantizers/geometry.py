@@ -72,6 +72,8 @@ change at all: declare its `family` and implement the strategy's
 `_build_<family>`, `_call_<family>` and `_quantize_<family>` methods.
 """
 
+import string
+
 import numpy as np
 
 from keras.src import ops
@@ -205,6 +207,43 @@ class ProjectionGeometry(QuantizationGeometry):
         return kernel_ternary, beta
 
 
+def _lora_equations(equation):
+    """The two einsums that apply a LoRA update to `equation` in low-rank
+    form, contracting the rank axis by name.
+
+    `lora_kernel_a` carries the rank on the kernel's last axis and
+    `lora_kernel_b` maps it to that axis's size. Contracting the rank with
+    a matmul would only work when the kernel's last axis is also the last
+    axis of the output; naming it works for every equation (an ellipsis in
+    the output, a permuted output, or a kernel whose last axis is
+    contracted away).
+
+    Returns:
+        `(first, second, a_first)`: `first` contracts the inputs against
+        the factor that shares their subscripts, `second` contracts the
+        rank axis against the other factor; `a_first` is whether that
+        order is `(lora_kernel_a, lora_kernel_b)`, which holds when the
+        kernel's last axis survives in the output.
+    """
+    inputs_spec, rest = equation.split(",")
+    kernel_spec, output_spec = rest.split("->")
+    last = kernel_spec[-1]
+    rank = next(c for c in string.ascii_letters if c not in equation)
+    if last in output_spec:
+        mid = output_spec.replace(last, rank)
+        return (
+            f"{inputs_spec},{kernel_spec[:-1]}{rank}->{mid}",
+            f"{mid},{rank}{last}->{output_spec}",
+            True,
+        )
+    mid = inputs_spec.replace(last, rank)
+    return (
+        f"{inputs_spec},{rank}{last}->{mid}",
+        f"{mid},{kernel_spec[:-1]}{rank}->{output_spec}",
+        False,
+    )
+
+
 class EinsumProjectionGeometry(ProjectionGeometry):
     """Geometry of an N-D einsum kernel (`EinsumDense`).
 
@@ -286,8 +325,12 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     def add_lora_delta(self, inputs, x):
         layer = self.layer
         if layer.lora_enabled:
-            lora_x = ops.einsum(layer.equation, inputs, layer.lora_kernel_a)
-            lora_x = ops.matmul(lora_x, layer.lora_kernel_b)
+            first, second, a_first = _lora_equations(layer.equation)
+            factors = (layer.lora_kernel_a, layer.lora_kernel_b)
+            if not a_first:
+                factors = factors[::-1]
+            lora_x = ops.einsum(first, inputs, factors[0])
+            lora_x = ops.einsum(second, lora_x, factors[1])
             x = ops.add(x, (layer.lora_alpha / layer.lora_rank) * lora_x)
             x = ops.cast(x, dtype=layer.compute_dtype)
         return x

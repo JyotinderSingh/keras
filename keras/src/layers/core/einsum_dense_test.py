@@ -2163,3 +2163,51 @@ class EinsumDenseTest(testing.TestCase):
             atol=1e-6,
             rtol=1e-6,
         )
+
+
+class EinsumDenseLoRAEquationsTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("precast_int8", "...b,bc->...c", (4, 3, 8), (8,), "int8"),
+        ("postcast_int8", "bc...,cd->bd...", (2, 8, 2, 3), (4,), "int8"),
+        ("permuted_int8", "abc,cde->abed", (4, 3, 8), (3, 5, 4), "int8"),
+        ("reduced_last_int8", "ibnd,hnd->ibh", (2, 3, 4, 8), (3, 6), "int8"),
+        ("postcast_int4", "bc...,cd->bd...", (2, 8, 2, 3), (4,), "int4"),
+        ("permuted_int4", "abc,cde->abed", (4, 3, 8), (3, 5, 4), "int4"),
+    )
+    def test_quantized_lora_delta_matches_float(
+        self, equation, input_shape, output_shape, mode
+    ):
+        # The LoRA update is applied on top of the quantized contraction in
+        # low-rank form. Its contribution must match the float layer's for
+        # every equation, including the ones where the kernel's last axis
+        # is not the output's last axis.
+        x = np.random.random(input_shape).astype("float32")
+        config = (
+            Int4QuantizationConfig(block_size=-1) if mode == "int4" else None
+        )
+
+        def lora_delta(quantize):
+            layer = layers.EinsumDense(equation, output_shape=output_shape)
+            layer.build(input_shape)
+            layer.kernel.assign(
+                np.random.default_rng(0).random(layer.kernel.shape) - 0.5
+            )
+            if quantize:
+                layer.quantize(mode, config=config)
+            before = layer(x)
+            layer.enable_lora(2)
+            rng = np.random.default_rng(1)
+            layer.lora_kernel_a.assign(
+                rng.random(layer.lora_kernel_a.shape) - 0.5
+            )
+            layer.lora_kernel_b.assign(
+                rng.random(layer.lora_kernel_b.shape) - 0.5
+            )
+            return ops.convert_to_numpy(layer(x)) - ops.convert_to_numpy(before)
+
+        self.assertAllClose(
+            lora_delta(quantize=True),
+            lora_delta(quantize=False),
+            atol=1e-5,
+            rtol=1e-5,
+        )

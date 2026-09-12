@@ -857,7 +857,9 @@ class EinsumDense(Layer):
             self._kernel_squeeze_axes,
             self._custom_gradient_equation,
             self._kernel_reverse_transpose_axes,
-        ) = _analyze_quantization_info(self.equation, self.input_spec.ndim)
+        ) = _analyze_quantization_info(
+            self.equation, [None] * self.input_spec.ndim
+        )
 
 
 def _analyze_einsum_string(equation, bias_axes, input_shape, output_shape):
