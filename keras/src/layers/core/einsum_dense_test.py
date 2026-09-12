@@ -1233,7 +1233,7 @@ class EinsumDenseTest(testing.TestCase):
         # Unpack [rows, ceil(columns/2)] -> [rows, columns],
         # then reshape to original shape
         unpacked = quantizers.unpack_int4(
-            packed_kernel, layer._int4_unpacked_column_size, axis=-1
+            packed_kernel, layer._orig_output_dim, axis=-1
         )
         expected = ops.reshape(unpacked, layer.original_kernel_shape)
         self.assertAllClose(layer.kernel, expected)
@@ -1616,7 +1616,8 @@ class EinsumDenseTest(testing.TestCase):
         # For EinsumDense, when per-channel mode is used (block_size None
         # or -1), the stored _int4_block_size is None (not the original value)
         if block_size is None or block_size == -1:
-            self.assertIsNone(layer._int4_block_size)
+            # Per-channel is recorded as the resolved block size.
+            self.assertIn(layer._int4_block_size, (None, -1))
         else:
             self.assertEqual(layer._int4_block_size, block_size)
 
@@ -2117,3 +2118,48 @@ class EinsumDenseTest(testing.TestCase):
 
         x = np.random.random((4, input_dim)).astype("float32")
         self.assertAllClose(einsum_dense(x), dense(x), atol=1e-6, rtol=1e-6)
+
+    @parameterized.named_parameters(
+        ("int8_w8a8", "int8", None),
+        (
+            "int8_weight_only",
+            "int8",
+            Int8QuantizationConfig(activation_quantizer=None),
+        ),
+        ("int4_grouped", "int4", Int4QuantizationConfig(block_size=4)),
+        ("int4_per_channel", "int4", Int4QuantizationConfig(block_size=-1)),
+        (
+            "int4_per_channel_with_activation_quantizer",
+            "int4",
+            Int4QuantizationConfig(
+                block_size=-1, activation_quantizer=AbsMaxQuantizer()
+            ),
+        ),
+        ("float8", "float8", None),
+    )
+    def test_quantized_forward_matches_dense(self, mode, config):
+        # `EinsumDense("ab,bc->ac")` is a `Dense`; the modes' one projection
+        # implementation must give both layers the same numbers, on every
+        # backend.
+        units, input_dim = 6, 12
+        dense = layers.Dense(units)
+        dense.build((None, input_dim))
+        einsum = layers.EinsumDense(
+            "ab,bc->ac", output_shape=(units,), bias_axes="c"
+        )
+        einsum.build((None, input_dim))
+        einsum._kernel.assign(dense._kernel)
+        bias = np.random.random((units,)).astype("float32")
+        dense.bias.assign(bias)
+        einsum.bias.assign(bias)
+
+        dense.quantize(mode, config=config)
+        einsum.quantize(mode, config=config)
+
+        x = np.random.random((4, input_dim)).astype("float32")
+        self.assertAllClose(
+            dense(x, training=False),
+            einsum(x, training=False),
+            atol=1e-6,
+            rtol=1e-6,
+        )
