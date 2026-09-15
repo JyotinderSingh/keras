@@ -240,6 +240,16 @@ class QuantizationStrategy:
         qvariable = self.qvariable(layer)
         return () if qvariable is None else (qvariable,)
 
+    # --- Serialization ----------------------------------------------------
+
+    def check_saveable(self, layer):
+        """Raises if `layer`'s variables are not in a persistable state."""
+        del layer
+
+    def variables_loaded(self, layer):
+        """Called after `layer`'s variables were assigned from a store."""
+        del layer
+
     # --- Model-level orchestration ----------------------------------------
 
     def finalize_model_quantization(self, model, config, structure, filters):

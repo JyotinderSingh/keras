@@ -1493,6 +1493,8 @@ class Layer(BackendLayer, Operation):
         `None` when the layer is not quantized, or when its mode holds no
         integer codes for it (see `QuantizationStrategy.qvariable`).
         """
+        if not self.built:
+            return None
         strategy = strategy_registry.get_strategy(self.quantization_mode)
         if strategy is None:
             return None

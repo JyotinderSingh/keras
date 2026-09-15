@@ -36,7 +36,6 @@ class Int8Strategy(GeometryDispatchStrategy):
     # --- Projection (Dense, EinsumDense) ----------------------------------
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
-        geometry.prepare()
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(
                 config, AbsMaxQuantizer()
@@ -106,7 +105,6 @@ class Int8Strategy(GeometryDispatchStrategy):
         return apply_bias_activation(layer, x)
 
     def _encode_projection(self, layer, geometry, weight, config):
-        geometry.prepare()
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config, AbsMaxQuantizer(axis=geometry.kernel_reduced_axes)
         )

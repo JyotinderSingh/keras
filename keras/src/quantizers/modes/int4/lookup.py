@@ -41,7 +41,6 @@ class Int4LookupHandlers:
         """
         input_dim, output_dim = embeddings_shape
         block_size = self.resolve_block_size(layer, config)
-        layer._int4_block_size = block_size
 
         # The table is packed two int4 values per byte along `output_dim`;
         # the scale runs per row (per channel) or per row and group.
@@ -87,8 +86,9 @@ class Int4LookupHandlers:
                 dtype="float32",
                 trainable=False,
             )
-
-        layer._orig_output_dim = output_dim
+        else:
+            layer.embeddings_zero = None
+            layer.g_idx = None
 
         if geometry.reversible:
             # Weight-only by default, like an int4 projection; a config may
@@ -122,6 +122,8 @@ class Int4LookupHandlers:
                         dtype="int8",
                         trainable=False,
                     )
+                else:
+                    layer.reverse_embeddings_zero = None
 
     def _call_lookup(self, layer, inputs, reverse=False):
         """Forward pass for an int4 quantized embeddings lookup."""
@@ -131,9 +133,9 @@ class Int4LookupHandlers:
 
         # Gather the packed rows first, then unpack only those.
         rows = ops.take(layer._embeddings, inputs, axis=0)
-        outputs = unpack_int4(rows, layer._orig_output_dim, axis=-1)
+        outputs = unpack_int4(rows, layer.output_dim, axis=-1)
 
-        block_size = getattr(layer, "_int4_block_size", None)
+        block_size = self.block_size(layer)
 
         if is_per_channel(block_size):
             embeddings_scale = ops.take(layer.embeddings_scale, inputs, axis=0)
@@ -160,7 +162,7 @@ class Int4LookupHandlers:
 
     def _reverse_lookup(self, layer, inputs):
         """Reverse projection through an int4 quantized table."""
-        per_channel = is_per_channel(getattr(layer, "_int4_block_size", None))
+        per_channel = is_per_channel(self.block_size(layer))
         dtype = reverse_lookup_dtype(layer)
         inputs = ops.cast(inputs, dtype)
         embeddings, scale, zero = reverse_lookup_params(
@@ -242,28 +244,25 @@ class Int4LookupHandlers:
         return packed_embeddings_value, embeddings_scale, embeddings_zero
 
     def _qvariable_lookup(self, layer, geometry):
-        grouped = is_grouped(layer._int4_block_size)
+        block_size = self.block_size(layer)
         return QVariable(
             codes=layer._embeddings,
             scale=layer.embeddings_scale,
-            zero_point=layer.embeddings_zero if grouped else None,
-            g_idx=layer.g_idx if grouped else None,
-            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
-            scheme=int4_scheme(
-                layer._int4_block_size, channel_axis=0, group_axis=-1
-            ),
+            zero_point=layer.embeddings_zero,
+            g_idx=layer.g_idx,
+            layout=Int4Pairs(axis=-1, orig_len=layer.output_dim),
+            scheme=int4_scheme(block_size, channel_axis=0, group_axis=-1),
             shape=(layer.input_dim, layer.output_dim),
             compute_dtype=layer.compute_dtype,
         )
 
     def _reverse_qvariable_lookup(self, layer, geometry):
-        block_size = getattr(layer, "_int4_block_size", None)
-        grouped = is_grouped(block_size)
+        block_size = self.block_size(layer)
         return QVariable(
             codes=layer.reverse_embeddings,
             scale=layer.reverse_embeddings_scale,
-            zero_point=layer.reverse_embeddings_zero if grouped else None,
-            g_idx=layer.g_idx if grouped else None,
+            zero_point=layer.reverse_embeddings_zero,
+            g_idx=layer.g_idx,
             layout=Int4Pairs(axis=0, orig_len=layer.output_dim),
             scheme=int4_scheme(block_size, channel_axis=-1, group_axis=0),
             shape=(layer.output_dim, layer.input_dim),
