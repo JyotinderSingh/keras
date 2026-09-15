@@ -1,4 +1,7 @@
+import contextlib
+
 from keras.src import activations
+from keras.src import backend
 from keras.src import constraints
 from keras.src import initializers
 from keras.src import ops
@@ -44,17 +47,11 @@ class TernaryDense(Layer):
     **Checkpoint size.** `quantize("ternary")` stores weights at ~1.58
     bits/value (~5× smaller than float32, ~2.5× smaller than int4).
 
-    **Inference note.** The current inference path unpacks
-    the packed kernel to a full `{-1, 0, +1}` matrix on every forward pass
-    and feeds it to a standard matmul. Standard BLAS does not skip zero
-    multiplications, so there is no compute speedup in this path and
-    inference is slightly slower than a plain `Dense` call (due to the
-    per-call unpack). The *design* of the inference path is sparseskip —
-    weights are split into two boolean masks (+1 and -1) so the matmul is
-    structurally multiply-free (only additions, subtractions, and zero-skips
-    on kernel values). Realizing that speedup end-to-end requires a native
-    ternary kernel that reads the packed format directly rather than going
-    through a generic float matmul.
+    **Inference note.** `quantize("ternary")` is a storage format, not a
+    compute win: the packed kernel is unpacked to a full `{-1, 0, +1}` matrix
+    on every forward pass and fed to a standard matmul, so inference is
+    slightly slower than a plain `Dense` call. A native ternary kernel that
+    reads the packed format directly would be needed for a speedup.
 
     Args:
         units: Positive integer, dimensionality of the output space.
@@ -151,10 +148,14 @@ class TernaryDense(Layer):
         self.bias_constraint = constraints.get(bias_constraint)
         self.input_spec = InputSpec(min_ndim=2)
         self.supports_masking = True
+        # No LoRA path; the projection helpers shared with `Dense` read it.
+        self.lora_enabled = False
 
     def build(self, input_shape):
         input_dim = input_shape[-1]
         kernel_shape = (input_dim, self.units)
+        # The float kernel's shape, whatever a quantization mode stores.
+        self.kernel_shape = kernel_shape
         if self.quantization_mode:
             # Packed kernel + scale are created here; the float `kernel` is not.
             self.quantized_build(kernel_shape, mode=self.quantization_mode)
@@ -235,13 +236,11 @@ class TernaryDense(Layer):
         }
 
     def _serialization_targets(self, mode):
-        return {
-            "kernel": (
-                self._packed_kernel if mode == "ternary" else self._kernel
-            ),
-            "bias": self.bias,
-            "kernel_scale": getattr(self, "kernel_scale", None),
-        }
+        """The variables behind `variable_serialization_spec[mode]`."""
+        targets = {"kernel": self._kernel, "bias": self.bias}
+        if mode == "ternary":
+            targets["kernel_scale"] = self.kernel_scale
+        return targets
 
     def save_own_variables(self, store):
         if not self.built:
@@ -301,6 +300,13 @@ class TernaryDense(Layer):
         return {**base_config, **config}
 
 
+def _autocast_scope(layer):
+    """The autocast scope `Layer.__call__` opens for `layer`, or none."""
+    if layer.autocast and layer.compute_dtype != layer.variable_dtype:
+        return backend.AutocastScope(layer.compute_dtype)
+    return contextlib.nullcontext()
+
+
 class _TernaryDenseGeometry(ProjectionGeometry):
     """TernaryDense's quantization geometry.
 
@@ -311,11 +317,15 @@ class _TernaryDenseGeometry(ProjectionGeometry):
 
     def ternary_values(self):
         layer = self.layer
-        # Hard ternary values in {-1, 0, +1}. This is exactly the forward
-        # value of the straight-through kernel used in training.
-        kernel_ternary = ops.convert_to_numpy(layer._ternary_kernel())
-        if layer.threshold is None:
-            beta = float(ops.convert_to_numpy(ops.mean(ops.abs(layer._kernel))))
-        else:
-            beta = 1.0
-        return kernel_ternary, beta
+        # Hard ternary values in {-1, 0, +1}: exactly the forward value of
+        # the straight-through kernel, evaluated under the layer's autocast
+        # scope so a mixed-precision forward pass and its freeze agree.
+        with _autocast_scope(layer):
+            kernel_ternary = layer._ternary_kernel()
+            if layer.threshold is None:
+                beta = ops.mean(ops.abs(layer._kernel))
+            else:
+                beta = 1.0
+        codes = ops.convert_to_numpy(ops.cast(kernel_ternary, "int8"))
+        beta = float(ops.convert_to_numpy(ops.cast(beta, "float32")))
+        return codes, beta

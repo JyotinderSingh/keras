@@ -359,6 +359,21 @@ class AbsMaxQuantizer(Quantizer):
         return config
 
 
+def bitnet_ternary_values(weight):
+    """Ternarizes a float weight with the BitNet b1.58 rule.
+
+    Returns `(codes, scale)`: `codes` is a NumPy array in the weight's dtype
+    holding `sign(w)` where `|w| > 0.5 * mean(|w|)` and `0` elsewhere, and
+    `scale` is the Python float `mean(|w|)`.
+    """
+    abs_w = ops.abs(weight)
+    threshold = 0.5 * float(ops.convert_to_numpy(ops.mean(abs_w)))
+    weight_np = ops.convert_to_numpy(weight)
+    abs_np = ops.convert_to_numpy(abs_w)
+    codes = np.sign(weight_np) * (abs_np > threshold).astype(weight_np.dtype)
+    return codes, float(np.mean(abs_np))
+
+
 def compute_quantization_parameters(
     x,
     *,
