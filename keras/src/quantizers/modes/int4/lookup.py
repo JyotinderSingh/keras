@@ -10,6 +10,7 @@ from keras.src.quantizers.modes.common import cast_lookup_inputs
 from keras.src.quantizers.modes.common import encode_reverse_lookup
 from keras.src.quantizers.modes.common import reverse_lookup_dtype
 from keras.src.quantizers.modes.common import reverse_lookup_params
+from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_grouped
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
@@ -20,13 +21,14 @@ from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
 from keras.src.quantizers.quantizers import dequantize_grouped
+from keras.src.quantizers.qvariable import Int4Pairs
+from keras.src.quantizers.qvariable import QVariable
 
 
 class Int4LookupHandlers:
     """`_build_lookup` / `_call_lookup` / `_reverse_lookup` /
-    `_encode_lookup` / `_quantize_lookup`."""
-
-    # --- Embeddings lookup (Embedding, ReversibleEmbedding) ---------------
+    `_encode_lookup` / `_qvariable_lookup` / `_reverse_qvariable_lookup` /
+    `_quantize_lookup`."""
 
     def _build_lookup(self, layer, geometry, embeddings_shape, config):
         """Build variables for int4 quantization of an embeddings table.
@@ -238,6 +240,35 @@ class Int4LookupHandlers:
 
         packed_embeddings_value, _, _ = pack_int4(embeddings_value, axis=-1)
         return packed_embeddings_value, embeddings_scale, embeddings_zero
+
+    def _qvariable_lookup(self, layer, geometry):
+        grouped = is_grouped(layer._int4_block_size)
+        return QVariable(
+            codes=layer._embeddings,
+            scale=layer.embeddings_scale,
+            zero_point=layer.embeddings_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            scheme=int4_scheme(
+                layer._int4_block_size, channel_axis=0, group_axis=-1
+            ),
+            shape=(layer.input_dim, layer.output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _reverse_qvariable_lookup(self, layer, geometry):
+        block_size = getattr(layer, "_int4_block_size", None)
+        grouped = is_grouped(block_size)
+        return QVariable(
+            codes=layer.reverse_embeddings,
+            scale=layer.reverse_embeddings_scale,
+            zero_point=layer.reverse_embeddings_zero if grouped else None,
+            g_idx=layer.g_idx if grouped else None,
+            layout=Int4Pairs(axis=0, orig_len=layer.output_dim),
+            scheme=int4_scheme(block_size, channel_axis=-1, group_axis=0),
+            shape=(layer.output_dim, layer.input_dim),
+            compute_dtype=layer.compute_dtype,
+        )
 
     def _quantize_lookup(self, layer, geometry, config):
         embeddings_shape = geometry.weight_shape

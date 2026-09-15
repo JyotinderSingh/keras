@@ -11,6 +11,14 @@ from keras.src.quantizers.modes.common import reverse_lookup_params
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
+from keras.src.quantizers.qvariable import NoPack
+from keras.src.quantizers.qvariable import QVariable
+from keras.src.quantizers.qvariable import WeightScheme
+
+
+def _int8_scheme(channel_axis):
+    """Symmetric int8 codes with a per-channel divisor scale."""
+    return WeightScheme(code_range=(-127, 127), channel_axis=channel_axis)
 
 
 class Int8Strategy(GeometryDispatchStrategy):
@@ -24,6 +32,8 @@ class Int8Strategy(GeometryDispatchStrategy):
 
     name = "int8"
     config_cls = Int8QuantizationConfig
+
+    # --- Projection (Dense, EinsumDense) ----------------------------------
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
         geometry.prepare()
@@ -95,16 +105,40 @@ class Int8Strategy(GeometryDispatchStrategy):
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 
-    def _quantize_projection(self, layer, geometry, config):
-        kernel_shape = layer._kernel.shape
+    def _encode_projection(self, layer, geometry, weight, config):
         geometry.prepare()
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
             config, AbsMaxQuantizer(axis=geometry.kernel_reduced_axes)
         )
-        kernel_value, kernel_scale = weight_quantizer(
-            layer._kernel, to_numpy=True
+        kernel_value, kernel_scale = weight_quantizer(weight, to_numpy=True)
+        return (
+            kernel_value,
+            geometry.kernel_scale_for_storage(kernel_scale),
+            None,
         )
-        kernel_scale = geometry.kernel_scale_for_storage(kernel_scale)
+
+    def _qvariable_projection(self, layer, geometry):
+        # A matmul kernel's scale is a vector along its output axis. An
+        # einsum kernel's is stored in the outputs' layout, and the geometry,
+        # not the scheme, lays it back out against the kernel.
+        axis = geometry.kernel_scale_axis
+        return QVariable(
+            codes=layer._kernel,
+            scale=layer.kernel_scale,
+            layout=NoPack(),
+            scheme=_int8_scheme(channel_axis=axis),
+            shape=geometry.weight_shape,
+            align_scale=(
+                None if axis is not None else geometry.kernel_scale_for_dequant
+            ),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _quantize_projection(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        kernel_value, kernel_scale, _ = self._encode_projection(
+            layer, geometry, layer._kernel, config
+        )
         del layer._kernel
         layer.quantized_build(kernel_shape, "int8", config)
         layer._kernel.assign(kernel_value)
@@ -192,6 +226,26 @@ class Int8Strategy(GeometryDispatchStrategy):
             weight, to_numpy=True
         )
         return embeddings_value, ops.squeeze(embeddings_scale, axis=-1), None
+
+    def _qvariable_lookup(self, layer, geometry):
+        return QVariable(
+            codes=layer._embeddings,
+            scale=layer.embeddings_scale,
+            layout=NoPack(),
+            scheme=_int8_scheme(channel_axis=0),
+            shape=(layer.input_dim, layer.output_dim),
+            compute_dtype=layer.compute_dtype,
+        )
+
+    def _reverse_qvariable_lookup(self, layer, geometry):
+        return QVariable(
+            codes=layer.reverse_embeddings,
+            scale=layer.reverse_embeddings_scale,
+            layout=NoPack(),
+            scheme=_int8_scheme(channel_axis=-1),
+            shape=(layer.output_dim, layer.input_dim),
+            compute_dtype=layer.compute_dtype,
+        )
 
     def _quantize_lookup(self, layer, geometry, config):
         embeddings_shape = geometry.weight_shape

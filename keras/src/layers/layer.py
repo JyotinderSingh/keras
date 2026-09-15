@@ -257,6 +257,13 @@ class Layer(BackendLayer, Operation):
         self._lock = False
         Operation.__init__(self, name=name)
         self._dtype_policy = dtype_policies.get(dtype)
+        # Quantization bookkeeping, always initialized so the quantization
+        # paths read it directly: whether `quantized_build` has created the
+        # mode's variables, and the `QuantizationConfig` recorded by
+        # `quantize()` (subclasses with a `quantization_config` constructor
+        # argument overwrite the latter).
+        self._is_quantized = False
+        self.quantization_config = None
         self.activity_regularizer = regularizers.get(activity_regularizer)
         input_dim_arg = kwargs.pop("input_dim", None)
         if input_dim_arg is not None:
@@ -785,7 +792,7 @@ class Layer(BackendLayer, Operation):
         else:
             self._dtype_policy = policy
         if policy.quantization_mode is not None:
-            if self.built and not getattr(self, "_is_quantized", False):
+            if self.built and not self._is_quantized:
                 if policy.quantization_mode == "gptq":
                     raise ValueError(
                         "Implicitly enabling GPTQ quantization by setting "
@@ -1415,6 +1422,10 @@ class Layer(BackendLayer, Operation):
                 # The layer has no quantization support at all.
                 raise self._not_implemented_error(self.quantized_build)
             raise self._quantization_mode_error(mode)
+        if config is not None:
+            # The config the variables are built from is the one the layer
+            # reports afterwards, whichever path called this.
+            self.quantization_config = config
         strategy.build(self, input_shape, config)
         self._is_quantized = True
 
@@ -1476,6 +1487,17 @@ class Layer(BackendLayer, Operation):
         """
         return None
 
+    def _qvariable(self):
+        """Returns the `QVariable` view of this layer's quantized weight.
+
+        `None` when the layer is not quantized, or when its mode holds no
+        integer codes for it (see `QuantizationStrategy.qvariable`).
+        """
+        strategy = strategy_registry.get_strategy(self.quantization_mode)
+        if strategy is None:
+            return None
+        return strategy.qvariable(self)
+
     def _quantization_type_owner(self):
         """The class whose `_quantization_geometry` definition applies."""
         for cls in type(self).__mro__:
@@ -1498,7 +1520,7 @@ class Layer(BackendLayer, Operation):
                 f"Layer '{self.name}' (of type '{self.__class__.__name__}') "
                 "is not built yet."
             )
-        if getattr(self, "_is_quantized", False):
+        if self._is_quantized:
             raise ValueError(
                 f"Layer '{self.name}' is already quantized with "
                 f"dtype_policy='{self.dtype_policy.name}'. "

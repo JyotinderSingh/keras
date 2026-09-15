@@ -659,7 +659,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 report.add_skipped(path, QuantizationReport.SKIP_FILTERED)
                 continue
             # 3. Already quantized (e.g. a previously quantized layer).
-            if getattr(layer, "_is_quantized", False):
+            if layer._is_quantized:
                 report.add_skipped(
                     path, QuantizationReport.SKIP_ALREADY_QUANTIZED
                 )
