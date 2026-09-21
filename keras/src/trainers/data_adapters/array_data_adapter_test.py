@@ -288,6 +288,54 @@ class TestArrayDataAdapter(data_adapter_test_base.DataAdapterTest):
         self.assertEqual(tuple(batches[-1][0].shape), (2, 2))
         self.assertEqual(tuple(batches[-1][1].shape), (2, 1))
 
+    @parameterized.named_parameters(
+        named_product(variant=["bfloat16", "requires_grad"])
+    )
+    def test_torch_tensor_not_convertible_by_numpy(self, variant):
+        # `np.asarray` raises on these Torch tensors, so they must be handled
+        # as Torch tensors and not through `__array__`.
+        x = self.make_array("torch", (34, 4), "float32")
+        if variant == "bfloat16":
+            x = x.to(torch.bfloat16)
+        elif backend.backend() in ("jax", "tensorflow"):
+            self.skipTest(
+                "Torch tensors that require grad are only supported with the "
+                "NumPy and Torch backends."
+            )
+        else:
+            x = x.requires_grad_(True)
+        y = self.make_array("torch", (34, 2), "int32")
+
+        adapter = array_data_adapter.ArrayDataAdapter(
+            x, y=y, batch_size=16, shuffle=False
+        )
+        if backend.backend() == "tensorflow":
+            it = adapter.get_tf_dataset()
+        elif backend.backend() == "jax":
+            it = adapter.get_jax_iterator()
+        elif backend.backend() == "torch":
+            it = adapter.get_torch_dataloader()
+        else:
+            it = adapter.get_numpy_iterator()
+
+        expected_x = self.make_array("np", (34, 4), backend.floatx())
+        expected_y = self.make_array("np", (34, 2), "int32")
+        num_batches = 0
+        for i, batch in enumerate(it):
+            self.assertEqual(len(batch), 2)
+            bx, by = batch
+            self.assertEqual(
+                backend.standardize_dtype(bx.dtype), backend.floatx()
+            )
+            self.assertEqual(backend.standardize_dtype(by.dtype), "int32")
+            batch_size = 16 if i < 2 else 2
+            self.assertEqual(bx.shape, (batch_size, 4))
+            self.assertEqual(by.shape, (batch_size, 2))
+            self.assertAllClose(bx, expected_x[i * 16 : i * 16 + batch_size])
+            self.assertAllClose(by, expected_y[i * 16 : i * 16 + batch_size])
+            num_batches += 1
+        self.assertEqual(num_batches, 3)
+
     def test_errors(self):
         x = np.random.random((34, 1))
         y = np.random.random((34, 3))
