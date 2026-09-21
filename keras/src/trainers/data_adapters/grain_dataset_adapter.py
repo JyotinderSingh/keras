@@ -1,7 +1,5 @@
 import itertools
 
-import numpy as np
-
 from keras.src import tree
 from keras.src.trainers.data_adapters import data_adapter_utils
 from keras.src.trainers.data_adapters.data_adapter import DataAdapter
@@ -70,17 +68,9 @@ class GrainDatasetAdapter(DataAdapter):
             )
 
         def convert_to_numpy(x):
-            if isinstance(x, (np.ndarray, SharedMemoryArrayMetadata)):
+            if isinstance(x, SharedMemoryArrayMetadata):
                 return x
-            else:
-                # Using `__array__` should handle `tf.Tensor`, `jax.np.ndarray`,
-                # `torch.Tensor`, as well as any other tensor-like object that
-                # has added numpy support.
-                if hasattr(x, "__array__"):
-                    if data_adapter_utils.is_torch_tensor(x):
-                        x = x.cpu()
-                    x = np.asarray(x)
-                return x
+            return data_adapter_utils.convert_to_numpy(x)
 
         class ConvertToNumpy(grain.transforms.Map):
             def map(self, x):

@@ -5,6 +5,7 @@ import pytest
 from absl.testing import parameterized
 
 from keras.src import backend
+from keras.src import ops
 from keras.src import testing
 from keras.src.trainers.data_adapters.data_adapter_utils import (
     DistributedBatchSampler,
@@ -12,6 +13,7 @@ from keras.src.trainers.data_adapters.data_adapter_utils import (
 from keras.src.trainers.data_adapters.data_adapter_utils import (
     class_weight_to_sample_weights,
 )
+from keras.src.trainers.data_adapters.data_adapter_utils import convert_to_numpy
 
 
 class TestDistributedBatchSampler(testing.TestCase):
@@ -215,6 +217,51 @@ class TestClassWeightToSampleWeights(testing.TestCase):
             class_weight_to_sample_weights(y_one_hot, {0: 1.0, 1: 2.0, 2: 3.0}),
             np.array([1.0, 2.0, 1.0, 3.0]),
         )
+
+
+class TestConvertToNumpy(testing.TestCase):
+    def test_numpy_array(self):
+        x = np.ones((2, 3), dtype="float32")
+        self.assertIs(convert_to_numpy(x), x)
+
+    @parameterized.named_parameters(
+        ("float32", "float32"), ("bfloat16", "bfloat16")
+    )
+    def test_backend_tensor(self, dtype):
+        expected = np.arange(6, dtype="float32").reshape((2, 3))
+        x = ops.cast(expected, dtype)
+
+        result = convert_to_numpy(x)
+        self.assertIsInstance(result, np.ndarray)
+        self.assertEqual(backend.standardize_dtype(result.dtype), dtype)
+        self.assertAllClose(result.astype("float32"), expected)
+
+    def test_torch_tensor(self):
+        import torch
+
+        # On non-torch backends this is not a backend tensor and goes through
+        # `__array__`.
+        expected = np.arange(6, dtype="float32").reshape((2, 3))
+        x = torch.arange(6, dtype=torch.float32).reshape((2, 3))
+
+        result = convert_to_numpy(x)
+        self.assertIsInstance(result, np.ndarray)
+        self.assertAllClose(result, expected)
+
+    def test_array_like(self):
+        class ArrayLike:
+            def __array__(self, dtype=None, copy=None):
+                return np.arange(6, dtype="float32").reshape((2, 3))
+
+        result = convert_to_numpy(ArrayLike())
+        self.assertIsInstance(result, np.ndarray)
+        self.assertAllClose(
+            result, np.arange(6, dtype="float32").reshape((2, 3))
+        )
+
+    def test_no_numpy_support(self):
+        x = object()
+        self.assertIs(convert_to_numpy(x), x)
 
 
 class TestMultiWorkerValidation(testing.TestCase):

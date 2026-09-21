@@ -11,6 +11,7 @@ from absl.testing import parameterized
 from jax import numpy as jnp
 
 from keras.src import backend
+from keras.src import ops
 from keras.src import testing
 from keras.src.testing.test_utils import named_product
 from keras.src.trainers.data_adapters import generator_data_adapter
@@ -169,6 +170,28 @@ class GeneratorDataAdapterTest(testing.TestCase):
             ".*first two batches",
         ):
             next(it)
+
+    def test_numpy_iterator_with_bfloat16_backend_tensors(self):
+        x = np.arange(64, dtype="float32").reshape((16, 4))
+        y = np.arange(32, dtype="float32").reshape((16, 2))
+
+        def generator():
+            for _ in range(3):
+                yield ops.cast(x, "bfloat16"), ops.cast(y, "bfloat16")
+
+        adapter = generator_data_adapter.GeneratorDataAdapter(generator())
+
+        batches = list(adapter.get_numpy_iterator())
+        self.assertLen(batches, 3)
+        for batch in batches:
+            self.assertEqual(len(batch), 2)
+            bx, by = batch
+            self.assertIsInstance(bx, np.ndarray)
+            self.assertIsInstance(by, np.ndarray)
+            self.assertEqual(backend.standardize_dtype(bx.dtype), "bfloat16")
+            self.assertEqual(backend.standardize_dtype(by.dtype), "bfloat16")
+            self.assertAllClose(bx.astype("float32"), x)
+            self.assertAllClose(by.astype("float32"), y)
 
     @parameterized.named_parameters(
         named_product(generator_type=["tf", "jax", "scipy"])

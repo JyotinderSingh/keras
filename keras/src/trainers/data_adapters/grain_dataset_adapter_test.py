@@ -5,6 +5,7 @@ import torch
 from absl.testing import parameterized
 
 from keras.src import backend
+from keras.src import ops
 from keras.src import testing
 from keras.src.testing.test_utils import named_product
 from keras.src.trainers.data_adapters import grain_dataset_adapter
@@ -102,6 +103,70 @@ class GrainDatasetAdapterTest(testing.TestCase):
             else:
                 self.assertEqual(bx.shape, (2, 4))
                 self.assertEqual(by.shape, (2, 2))
+
+    @parameterized.named_parameters(
+        named_product(
+            dataset_type=["map_dataset", "iter_dataset", "data_loader"]
+        )
+    )
+    def test_numpy_iterator_with_bfloat16_backend_tensors(self, dataset_type):
+        x = np.arange(64, dtype="float32").reshape((16, 4))
+        y = np.arange(32, dtype="float32").reshape((16, 2))
+
+        class MySource(grain.sources.RandomAccessDataSource):
+            def __getitem__(self, idx):
+                return x[idx], y[idx]
+
+            def __len__(self):
+                return len(x)
+
+        # Grain batches with NumPy, so the backend tensors are created after
+        # batching.
+        class CastToBfloat16(grain.transforms.Map):
+            def map(self, batch):
+                bx, by = batch
+                return ops.cast(bx, "bfloat16"), ops.cast(by, "bfloat16")
+
+        if dataset_type == "map_dataset":
+            dataset = (
+                grain.MapDataset.source(MySource())
+                .batch(batch_size=8)
+                .map(CastToBfloat16())
+            )
+        elif dataset_type == "iter_dataset":
+            dataset = (
+                grain.MapDataset.source(MySource())
+                .to_iter_dataset()
+                .batch(batch_size=8)
+                .map(CastToBfloat16())
+            )
+        else:
+            source = MySource()
+            dataset = grain.DataLoader(
+                data_source=source,
+                operations=[
+                    grain.transforms.Batch(batch_size=8),
+                    CastToBfloat16(),
+                ],
+                shard_options=grain.sharding.NoSharding(),
+                sampler=grain.samplers.IndexSampler(
+                    num_records=len(source), num_epochs=1
+                ),
+                worker_count=0,
+            )
+        adapter = grain_dataset_adapter.GrainDatasetAdapter(dataset)
+
+        batches = list(adapter.get_numpy_iterator())
+        self.assertLen(batches, 2)
+        for i, batch in enumerate(batches):
+            self.assertEqual(len(batch), 2)
+            bx, by = batch
+            self.assertIsInstance(bx, np.ndarray)
+            self.assertIsInstance(by, np.ndarray)
+            self.assertEqual(backend.standardize_dtype(bx.dtype), "bfloat16")
+            self.assertEqual(backend.standardize_dtype(by.dtype), "bfloat16")
+            self.assertAllClose(bx.astype("float32"), x[i * 8 : (i + 1) * 8])
+            self.assertAllClose(by.astype("float32"), y[i * 8 : (i + 1) * 8])
 
     @parameterized.named_parameters(
         named_product(data_type=["list", "dict", "nested_list", "nested_dict"])

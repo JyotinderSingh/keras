@@ -286,22 +286,27 @@ def get_jax_iterator(iterable):
         )
 
 
-def get_numpy_iterator(iterable):
-    def convert_to_numpy(x):
-        if not isinstance(x, np.ndarray):
-            if backend.ops.is_tensor(x):
-                # The backend knows how to convert its own tensors, including
-                # the ones `__array__` cannot, e.g. a bfloat16 MLX array.
-                x = ops.convert_to_numpy(x)
-            elif hasattr(x, "__array__"):
-                # Using `__array__` should handle `tf.Tensor`,
-                # `jax.np.ndarray`, `torch.Tensor`, as well as any other
-                # tensor-like object that has added numpy support.
-                if is_torch_tensor(x):
-                    x = x.cpu()
-                x = np.asarray(x)
-        return x
+def convert_to_numpy(x):
+    """Converts a tensor or tensor-like object to a NumPy array.
 
+    NumPy arrays and objects without NumPy support are returned as is.
+    """
+    if not isinstance(x, np.ndarray):
+        if backend.ops.is_tensor(x):
+            # The backend knows how to convert its own tensors, including
+            # the ones `__array__` cannot, e.g. a bfloat16 MLX array.
+            x = ops.convert_to_numpy(x)
+        elif hasattr(x, "__array__"):
+            # Using `__array__` should handle `tf.Tensor`,
+            # `jax.np.ndarray`, `torch.Tensor`, as well as any other
+            # tensor-like object that has added numpy support.
+            if is_torch_tensor(x):
+                x = x.cpu()
+            x = np.asarray(x)
+    return x
+
+
+def get_numpy_iterator(iterable):
     for batch in iterable:
         yield tree.map_structure(convert_to_numpy, batch, none_is_leaf=False)
 
