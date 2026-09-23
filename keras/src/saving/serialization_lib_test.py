@@ -222,6 +222,70 @@ class SerializationLibTest(testing.TestCase):
         ):
             serialization_lib.deserialize_keras_object(bad_config)
 
+    def test_deserialize_function_config_naming_a_class_raises(self):
+        # Keras only writes `class_name: "function"` for function objects.
+        # A config that names a class must not hand the class back, because
+        # a `Lambda` layer would then call its constructor.
+        class_configs = [
+            # Public API name.
+            {
+                "module": "keras.layers",
+                "class_name": "function",
+                "config": "Dense",
+                "registered_name": "Dense",
+            },
+            # Registered custom object.
+            {
+                "module": "keras.src.saving.serialization_lib_test",
+                "class_name": "function",
+                "config": "Custom>MyDense",
+                "registered_name": "Custom>MyDense",
+            },
+            # Internal module import.
+            {
+                "module": "keras.src.layers.core.dense",
+                "class_name": "function",
+                "config": "Dense",
+                "registered_name": None,
+            },
+        ]
+        for config in class_configs:
+            for safe_mode in (True, False):
+                with self.assertRaisesRegex(
+                    ValueError, "resolved to the class"
+                ):
+                    serialization_lib.deserialize_keras_object(
+                        config, safe_mode=safe_mode
+                    )
+        # Same for a class passed through `custom_objects`.
+        with self.assertRaisesRegex(ValueError, "resolved to the class"):
+            serialization_lib.deserialize_keras_object(
+                {
+                    "module": "builtins",
+                    "class_name": "function",
+                    "config": "my_class",
+                    "registered_name": "my_class",
+                },
+                custom_objects={"my_class": CustomLayer},
+            )
+
+    def test_deserialize_non_modeling_api_raises(self):
+        for api_name in (
+            "keras.config.set_floatx",
+            "keras.utils.set_random_seed",
+            "keras.datasets.mnist.load_data",
+        ):
+            module, name = api_name.rsplit(".", 1)
+            with self.assertRaisesRegex(ValueError, "not a modeling function"):
+                serialization_lib.deserialize_keras_object(
+                    {
+                        "module": module,
+                        "class_name": "function",
+                        "config": name,
+                        "registered_name": name,
+                    }
+                )
+
     def test_safe_mode_scope(self):
         lmbda = keras.layers.Lambda(lambda x: x**2)
         with serialization_lib.SafeModeScope(safe_mode=True):

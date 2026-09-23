@@ -1,4 +1,3 @@
-import copy
 import os
 from unittest import mock
 
@@ -7,7 +6,6 @@ import pytest
 import tensorflow as tf
 from absl.testing import parameterized
 
-from keras.src import activations
 from keras.src import backend
 from keras.src import layers
 from keras.src import models
@@ -231,106 +229,6 @@ class TestTFSMLayer(testing.TestCase):
                     load.assert_called_once_with(temp_filepath)
                     self.assertAllClose(layer(ref_input), ref_output)
             self.assertIs(serialization_lib.in_safe_mode(), outer_mode)
-
-    def _make_constructor_archive(self, temp_dir, saved_model_filepath):
-        """Crafts a `.keras` file whose `Lambda` layer calls `TFSMLayer()`.
-
-        The `Lambda` function resolves to the `TFSMLayer` constructor itself,
-        so reloading the archive reaches the constructor without ever going
-        through `TFSMLayer.from_config()`.
-
-        Returns the archive path, its model config, and a reference
-        input/output pair for the one legitimate (`Dense`) output.
-        """
-        inputs = layers.Input((10,))
-        outputs = layers.Dense(1, name="dense")(inputs)
-        lambda_outputs = layers.Lambda(activations.relu, name="lambda")(inputs)
-        model = models.Model(inputs, [outputs, lambda_outputs])
-        ref_input = tf.random.normal((3, 10))
-        ref_output = model(ref_input)[0]
-
-        config = model.get_config()
-        lambda_config = next(
-            layer for layer in config["layers"] if layer["name"] == "lambda"
-        )
-        # Resolve the constructor as a callable, bypassing from_config().
-        lambda_config["config"]["function"] = {
-            "module": "keras.layers",
-            "class_name": "function",
-            "config": "TFSMLayer",
-            "registered_name": "TFSMLayer",
-        }
-        lambda_config["inbound_nodes"][0] = {
-            "args": [],
-            "kwargs": {"inputs": saved_model_filepath},
-        }
-        config["output_layers"] = config["output_layers"][0]
-
-        model_path = os.path.join(temp_dir, "constructor.keras")
-        # `save()` reads the config once, so patching it is enough to write
-        # the crafted archive.
-        with mock.patch.object(model, "get_config", return_value=config):
-            model.save(model_path)
-        return model_path, config, ref_input, ref_output
-
-    def test_safe_mode_blocks_constructor_during_model_loading(self):
-        temp_dir = self.get_temp_dir()
-        temp_filepath = os.path.join(temp_dir, "exported_model")
-        exported_model = get_model()
-        exported_model(tf.zeros((1, 10)))
-        saved_model.export_saved_model(exported_model, temp_filepath)
-
-        model_path, _, ref_input, ref_output = self._make_constructor_archive(
-            temp_dir, temp_filepath
-        )
-
-        with mock.patch.object(
-            tf.saved_model, "load", wraps=tf.saved_model.load
-        ) as load:
-            with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
-                saving_api.load_model(model_path)
-            load.assert_not_called()
-
-            # `safe_mode=None` reaches the scope unchanged; only an explicit
-            # `False` may opt out.
-            with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
-                saving_api.load_model(model_path, safe_mode=None)
-            load.assert_not_called()
-
-            loaded_model = saving_api.load_model(model_path, safe_mode=False)
-            load.assert_called_once_with(temp_filepath)
-            self.assertAllClose(loaded_model(ref_input), ref_output)
-
-    def test_safe_mode_blocks_constructor_in_model_from_config(self):
-        temp_dir = self.get_temp_dir()
-        temp_filepath = os.path.join(temp_dir, "exported_model")
-        exported_model = get_model()
-        exported_model(tf.zeros((1, 10)))
-        saved_model.export_saved_model(exported_model, temp_filepath)
-
-        _, config, ref_input, ref_output = self._make_constructor_archive(
-            temp_dir, temp_filepath
-        )
-
-        with mock.patch.object(
-            tf.saved_model, "load", wraps=tf.saved_model.load
-        ) as load:
-            # `Model.from_config()` opens no deserialization scope of its own,
-            # and the layers are called after the scope opened for each of
-            # them has closed.
-            with self.assertRaisesRegex(ValueError, "arbitrary code execution"):
-                models.Model.from_config(copy.deepcopy(config))
-            load.assert_not_called()
-
-            # The opt-out still loads. `from_config()` restores the
-            # architecture only, so the reference output cannot be compared
-            # here; the recorded load call is what identifies the SavedModel.
-            with serialization_lib.SafeModeScope(False):
-                loaded_model = models.Model.from_config(copy.deepcopy(config))
-            load.assert_called_once_with(temp_filepath)
-            self.assertEqual(
-                loaded_model(ref_input).shape, tuple(ref_output.shape)
-            )
 
     def test_safe_mode_blocks_wrapper_layer_during_model_loading(self):
         temp_dir = self.get_temp_dir()

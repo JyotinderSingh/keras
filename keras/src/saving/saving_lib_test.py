@@ -890,6 +890,33 @@ class SavingAPITest(testing.TestCase):
             model = saving_lib.load_model(temp_filepath)
         model = saving_lib.load_model(temp_filepath, safe_mode=False)
 
+    def test_load_model_rejects_function_config_naming_a_class(self):
+        # A hand-written `Lambda` config whose `function` names a class must
+        # be rejected before the class constructor can run, in both safe
+        # modes.
+        inputs = keras.Input((3,))
+        outputs = keras.layers.Lambda(keras.activations.relu, name="lambda")(
+            inputs
+        )
+        model = keras.Model(inputs, outputs)
+        config = model.get_config()
+        lambda_config = next(
+            layer for layer in config["layers"] if layer["name"] == "lambda"
+        )
+        lambda_config["config"]["function"] = {
+            "module": "keras.layers",
+            "class_name": "function",
+            "config": "Dense",
+            "registered_name": "Dense",
+        }
+        temp_filepath = os.path.join(self.get_temp_dir(), "crafted.keras")
+        with mock.patch.object(model, "get_config", return_value=config):
+            model.save(temp_filepath)
+
+        for safe_mode in (True, False):
+            with self.assertRaisesRegex(ValueError, "resolved to the class"):
+                saving_lib.load_model(temp_filepath, safe_mode=safe_mode)
+
     def test_normalization_kpl(self):
         # With adapt
         temp_filepath = os.path.join(self.get_temp_dir(), "norm_model.keras")

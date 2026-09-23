@@ -19,6 +19,7 @@ from keras.src.models import Functional
 from keras.src.models import Model
 from keras.src.models import Sequential
 from keras.src.models.model import model_from_json
+from keras.src.saving import serialization_lib
 
 
 class FunctionalTest(testing.TestCase):
@@ -929,6 +930,33 @@ class FunctionalTest(testing.TestCase):
             self.assertIsInstance(model.operations[1], layers.Dense)
         finally:
             dtype_policy.set_dtype_policy(original_dtype_policy)
+
+    def test_from_config_opens_safe_mode_scope(self):
+        # Layers are called during the graph rebuild, after the scope of each
+        # per-layer deserialization has closed. `from_config()` opens its own
+        # scope for those calls, and a direct call with no ambient scope runs
+        # in safe mode.
+        seen = []
+
+        def record_safe_mode(x):
+            seen.append(serialization_lib.in_safe_mode())
+            return x
+
+        custom_objects = {"record_safe_mode": record_safe_mode}
+        inputs = Input(shape=(3,))
+        outputs = layers.Lambda(record_safe_mode)(inputs)
+        model = Model(inputs, outputs)
+
+        seen.clear()
+        Model.from_config(model.get_config(), custom_objects=custom_objects)
+        self.assertTrue(seen)
+        self.assertTrue(all(value is True for value in seen))
+
+        seen.clear()
+        with serialization_lib.SafeModeScope(False):
+            Model.from_config(model.get_config(), custom_objects=custom_objects)
+        self.assertTrue(seen)
+        self.assertTrue(all(value is False for value in seen))
 
     def test_invalid_config_deserialization_loop(self):
         config = {

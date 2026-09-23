@@ -35,12 +35,30 @@ NON_MODELING_APIS = frozenset(
     {
         "keras.backend.clear_session",
         "keras.config.enable_unsafe_deserialization",
+        "keras.config.set_backend",
+        "keras.config.set_dtype_policy",
+        "keras.config.set_epsilon",
+        "keras.config.set_floatx",
+        "keras.config.set_image_data_format",
+        "keras.config.set_max_epochs",
+        "keras.config.set_max_steps_per_epoch",
+        "keras.datasets.boston_housing.load_data",
+        "keras.datasets.california_housing.load_data",
+        "keras.datasets.cifar10.load_data",
+        "keras.datasets.cifar100.load_data",
+        "keras.datasets.fashion_mnist.load_data",
+        "keras.datasets.imdb.get_word_index",
+        "keras.datasets.imdb.load_data",
+        "keras.datasets.mnist.load_data",
+        "keras.datasets.reuters.get_word_index",
+        "keras.datasets.reuters.load_data",
+        "keras.distribution.set_distribution",
         "keras.models.load_model",
         "keras.models.model_from_json",
         "keras.models.save_model",
-        "keras.preprocessing.image_dataset_from_directory",
         "keras.preprocessing.image.load_img",
         "keras.preprocessing.image.save_img",
+        "keras.preprocessing.image_dataset_from_directory",
         "keras.preprocessing.text_dataset_from_directory",
         "keras.saving.deserialize_keras_object",
         "keras.saving.load_model",
@@ -55,10 +73,15 @@ NON_MODELING_APIS = frozenset(
         "keras.utils.get_file",
         "keras.utils.image_dataset_from_directory",
         "keras.utils.load_img",
+        "keras.utils.plot_model",
         "keras.utils.register_keras_serializable",
         "keras.utils.save_img",
         "keras.utils.serialize_keras_object",
+        "keras.utils.set_random_seed",
         "keras.utils.text_dataset_from_directory",
+        "keras.visualization.plot_bounding_box_gallery",
+        "keras.visualization.plot_image_gallery",
+        "keras.visualization.plot_segmentation_mask_gallery",
     }
 )
 
@@ -732,7 +755,7 @@ def deserialize_keras_object(
                 f"instead got {type(fn_name)}\n"
                 f"Full config: {config}"
             )
-        return _retrieve_class_or_fn(
+        fn = _retrieve_class_or_fn(
             fn_name,
             registered_name,
             module,
@@ -740,6 +763,18 @@ def deserialize_keras_object(
             full_config=config,
             custom_objects=custom_objects,
         )
+        # Keras only serializes function objects with `class_name:
+        # "function"`, so a class here can only come from a hand-written
+        # config. Returning it would let a layer such as `Lambda` call the
+        # class constructor with config-controlled arguments.
+        if inspect.isclass(fn):
+            raise ValueError(
+                f"Cannot deserialize function `{fn_name}` because it "
+                f"resolved to the class {fn}. Classes cannot be "
+                "deserialized as functions. Full object config: "
+                f"{config}"
+            )
+        return fn
     # Below, handling of all classes.
     if not isinstance(inner_config, dict):
         raise TypeError(
