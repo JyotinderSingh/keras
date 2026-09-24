@@ -218,9 +218,7 @@ class Dense(Layer):
                 "quantization."
             )
         self._tracker.unlock()
-        # `kernel` is the unpacked kernel in its own shape whatever the
-        # quantization mode, so its first dimension is the input dimension.
-        input_dim_for_lora = self.kernel.shape[0]
+        input_dim_for_lora = self.kernel_shape[0]
 
         # LoRA weights should be float32 to avoid the risk of underflow or
         # overflow during fine-tuning.
@@ -235,12 +233,16 @@ class Dense(Layer):
         )
         self.lora_kernel_b = self.add_weight(
             name="lora_kernel_b",
-            shape=(rank, self.kernel.shape[1]),
+            shape=(rank, self.kernel_shape[1]),
             initializer=initializers.get(b_initializer),
             dtype="float32",
             regularizer=self.kernel_regularizer,
         )
-        self._kernel.trainable = False
+        if self._qvariable() is None:
+            # The float kernel is the weight only while the layer holds one
+            # (unquantized, or a calibration mode before its pass); a
+            # quantized weight's codes were built non-trainable.
+            self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
         self.lora_rank = rank
@@ -270,7 +272,7 @@ class Dense(Layer):
         # index of per-channel int4) is skipped.
         idx = 0
         for name in self.variable_serialization_spec[mode]:
-            if name == "kernel":
+            if name in ("kernel", "quantized_kernel"):
                 value = kernel_value
             elif name == "kernel_scale" and merged_kernel_scale is not None:
                 value = merged_kernel_scale
@@ -422,12 +424,12 @@ class Dense(Layer):
         for deploying the model or for continuing training after permanently
         applying the LoRA update.
 
-        If the layer is quantized, the process is:
-        1. Dequantize the base kernel to float (`QVariable.dequantize`).
-        2. Compute the LoRA delta (`lora_kernel_a @ lora_kernel_b`) and add
-            it to the dequantized kernel.
-        3. Re-quantize the merged result into the mode's stored form
-            (`QuantizationStrategy.encode`), calculating a new scale factor.
+        If the layer is quantized, the LoRA delta (`lora_kernel_a @
+        lora_kernel_b`, scaled) is folded into the stored weight by the
+        mode (`QuantizationStrategy.merge_lora_delta`): int8, int4 and
+        ternary dequantize, add the delta and encode the sum with a fresh
+        scale; GPTQ and AWQ keep their calibrated scale, zero point, group
+        index and AWQ scales and round the merged weight onto that grid.
 
         If the layer is not quantized (or its mode holds no integer codes
         for it), this method returns the result of the `kernel` property
@@ -442,8 +444,8 @@ class Dense(Layer):
                     quantization is active, otherwise a high precision tensor.
                 `kernel_scale`: The quantization scale for the merged kernel.
                     This is `None` if the layer is not quantized.
-                `kernel_zero`: The zero point for sub-channel int4 quantization.
-                    This is `None` for per-channel or non-int4 modes.
+                `kernel_zero`: The zero point of the merged kernel. This is
+                    `None` for a scheme without one.
         """
         qvariable = self._qvariable()
         if qvariable is None:
@@ -451,14 +453,8 @@ class Dense(Layer):
         if not self.lora_enabled:
             return qvariable.codes, qvariable.scale, qvariable.zero_point
 
-        # Merge the LoRA update in the float domain, then re-quantize.
         lora_delta = (self.lora_alpha / self.lora_rank) * ops.matmul(
             self.lora_kernel_a, self.lora_kernel_b
         )
-        merged_float_kernel = ops.add(qvariable.dequantize(), lora_delta)
         strategy = strategy_registry.get_strategy(self.quantization_mode)
-        return strategy.encode(
-            self,
-            merged_float_kernel,
-            self.quantization_config,
-        )
+        return strategy.merge_lora_delta(self, lora_delta)

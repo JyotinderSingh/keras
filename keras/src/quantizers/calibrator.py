@@ -71,8 +71,12 @@ class Calibrator:
             raise ValueError("Input tensor cannot be empty.")
 
     def _kernel_view(self):
-        """The layer's kernel laid out through the calibration view."""
-        return self.view.kernel_to_view(self.original_layer.kernel)
+        """The layer's base kernel laid out through the calibration view.
+
+        The `kernel` property folds a LoRA update in; the update stays a
+        separate term, added in the forward pass, as for int8 and int4.
+        """
+        return self.view.kernel_to_view(self.original_layer._kernel)
 
     def quantize(self):
         """Solves for the layer's codes and writes them back."""

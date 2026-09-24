@@ -36,10 +36,14 @@ class MyStrategy(QuantizationStrategy):
 register_quantization_strategy(MyStrategy())
 ```
 
-This module must stay import-light: it is consulted lazily from
-`keras.src.dtype_policies` and `keras.src.layers.layer`, so importing it must
-not pull in layers or policies at module level.
+This module must stay import-light: `keras.src.dtype_policies` and
+`keras.src.layers` reach it through `keras.src.quantizers.modes`, so it
+must not import either package at module level. The two `dtype_policy`
+imports below are deferred for that reason.
 """
+
+from keras.src import backend
+from keras.src import ops
 
 _MODE_TO_STRATEGY = {}  # mode -> QuantizationStrategy, in registration order.
 
@@ -215,12 +219,27 @@ class QuantizationStrategy:
         Returns `(codes, scale, zero_point)` exactly as the mode's variables
         hold them (packed and oriented for storage), ready to assign.
         `quantize` uses it to convert the layer's float weight, and the
-        LoRA-merged save path uses it to re-quantize a merged weight.
+        default `merge_lora_delta` uses it to re-quantize a merged weight.
         `zero_point` is `None` for a symmetric scheme.
         """
         raise NotImplementedError(
             f"Quantization mode '{self.name}' does not implement `encode`."
         )
+
+    def merge_lora_delta(self, layer, delta):
+        """Folds a LoRA update into `layer`'s stored weight, for saving.
+
+        `delta` is the float update (the scaled product of the LoRA
+        factors) in the weight's own shape and orientation. Returns
+        `(codes, scale, zero_point)` as `encode` does. The default
+        dequantizes the stored weight, adds the delta and encodes the sum,
+        so the scale is derived afresh from the merged weight; a mode
+        whose parameters come from a calibration pass overrides this to
+        keep them and solve only for the codes.
+        """
+        qvariable = self.qvariable(layer)
+        merged = ops.add(qvariable.dequantize(), delta)
+        return self.encode(layer, merged, layer.quantization_config)
 
     # --- Quantized weight view --------------------------------------------
 
@@ -282,7 +301,6 @@ def register_quantization_strategy(strategy):
     modes match only their exact grammar, so collisions between them are
     unambiguous).
     """
-    from keras.src import backend
     from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
 
     instance = strategy() if isinstance(strategy, type) else strategy

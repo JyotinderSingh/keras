@@ -409,12 +409,10 @@ class Embedding(Layer):
         useful for deploying the model or for continuing training after
         permanently applying the LoRA update.
 
-        If the layer is quantized, the process is:
-        1. Dequantize the base embeddings to float (`QVariable.dequantize`).
-        2. Compute the LoRA delta (`lora_embeddings_a @ lora_embeddings_b`) and
-            add it to the dequantized embeddings.
-        3. Re-quantize the merged result into the mode's stored form
-            (`QuantizationStrategy.encode`), calculating a new scale factor.
+        If the layer is quantized, the LoRA delta (`lora_embeddings_a @
+        lora_embeddings_b`, scaled) is folded into the stored weight by the
+        mode (`QuantizationStrategy.merge_lora_delta`), which dequantizes,
+        adds the delta and encodes the sum with a fresh scale.
 
         If the layer is not quantized (or its mode holds no integer codes
         for it), this method returns the result of the `embeddings` property
@@ -438,14 +436,8 @@ class Embedding(Layer):
         if not self.lora_enabled:
             return qvariable.codes, qvariable.scale, qvariable.zero_point
 
-        # Merge the LoRA update in the float domain, then re-quantize.
         lora_delta = (self.lora_alpha / self.lora_rank) * ops.matmul(
             self.lora_embeddings_a, self.lora_embeddings_b
         )
-        merged_float_embeddings = ops.add(qvariable.dequantize(), lora_delta)
         strategy = strategy_registry.get_strategy(self.quantization_mode)
-        return strategy.encode(
-            self,
-            merged_float_embeddings,
-            self.quantization_config,
-        )
+        return strategy.merge_lora_delta(self, lora_delta)

@@ -954,23 +954,59 @@ class DenseTest(testing.TestCase):
         expected = quantizers.unpack_int4(packed_kernel, layer.units, axis=-1)
         self.assertAllClose(layer.kernel, expected)
 
-    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
-    def test_calibration_modes_refuse_lora(self, mode):
-        # Not supported yet: the calibration forward has no term for a
-        # LoRA update and a merged save cannot re-quantize onto the
-        # calibrated grid; both modes say so.
+    @parameterized.named_parameters(
+        test_utils.named_product(mode=["gptq", "awq"], calibrated=[False, True])
+    )
+    def test_calibration_modes_enable_lora(self, mode, calibrated):
+        # LoRA trains against the dequantized codes once calibrated, and
+        # against the frozen float kernel while the calibration is pending.
         if mode == "gptq":
-            config = GPTQConfig(dataset=None, tokenizer=None)
+            config = GPTQConfig(dataset=None, tokenizer=None, group_size=4)
         else:
-            config = AWQConfig(dataset=None, tokenizer=None)
+            config = AWQConfig(
+                dataset=None, tokenizer=None, group_size=4, num_grid_points=5
+            )
+        layer = layers.Dense(4)
+        layer.build((None, 8))
+        layer.quantize(mode, config=config)
+        if calibrated:
+            calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
+                layer, config
+            )
+            calibrator.observe(np.random.random((16, 8)).astype("float32"))
+            calibrator.quantize()
+            calibrator.release()
+        layer.enable_lora(2)
+        self.assertTrue(layer.lora_enabled)
+        # bias + the two LoRA factors.
+        self.assertLen(layer.trainable_weights, 3)
+        num_stored = 4 if mode == "gptq" else 5
+        if calibrated:
+            self.assertFalse(hasattr(layer, "_kernel"))
+            self.assertLen(layer.non_trainable_weights, num_stored)
+            self.assertEqual(tuple(layer.kernel.shape), (8, 4))
+        else:
+            # The float kernel is frozen until `write_back` retires it.
+            self.assertFalse(layer._kernel.trainable)
+            self.assertLen(layer.non_trainable_weights, num_stored + 1)
+            with self.assertRaisesRegex(ValueError, "never been calibrated"):
+                layer.save_own_variables({})
+
+    def test_float8_refuses_lora(self):
         layer = layers.Dense(4)
         layer.build((None, 3))
-        layer.quantize(mode, config=config)
+        layer.quantize("float8")
         with self.assertRaisesRegex(
-            NotImplementedError,
-            f"lora is not currently supported with {mode.upper()}",
+            NotImplementedError, "lora is not currently supported with FLOAT8"
         ):
             layer.enable_lora(2)
+        # The other order is refused by the forward pass.
+        layer = layers.Dense(4)
+        layer.build((None, 3))
+        layer.enable_lora(2)
+        layer.quantize("float8")
+        with self.assertRaisesRegex(NotImplementedError, "support LoRA"):
+            layer(np.ones((2, 3), "float32"))
 
     def test_legacy_load_own_variables(self):
         # In previous versions, `load_own_variables` accepted a store with

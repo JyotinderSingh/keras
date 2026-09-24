@@ -7,10 +7,19 @@ kernel is packed), in one extra AWQ variable and its inverse scaling, in
 a handful of message fragments and, for the calibration run, in the
 calibrator class and the forward batch size. Those differences are the
 hooks below.
+
+A LoRA update trains against the dequantized weight, as it does for int8
+and int4: the forward adds it to the contraction, the calibrators
+quantize the base kernel so the update stays a separate term, and a
+merged save rounds the merged weight onto the calibrated grid
+(`merge_lora_delta`) instead of encoding it afresh. The modes have no
+`encode`: their parameters come from the calibration pass.
 """
 
 import math
+import warnings
 
+from keras.src import ops
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantizers import divisor_scale
@@ -21,16 +30,16 @@ from keras.src.quantizers.qvariable import QVariable
 from keras.src.quantizers.qvariable import WeightScheme
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
+# Fraction of the codes a merged LoRA save may clip to the calibrated range
+# before it warns.
+LORA_MERGE_CLIP_WARNING_FRACTION = 0.01
+
 
 class CalibrationStrategy(QuantizationStrategy):
     """A post-training strategy whose values arrive from a calibration pass."""
 
     requires_config = True
     requires_layer_structure = True
-    # Not supported yet: the calibration forward has no term for a LoRA
-    # update, and a merged save needs a re-quantization onto the
-    # calibrated grid, which these modes do not have (`encode`).
-    supports_lora = False
 
     def quantize(self, layer, config):
         # The quantized values arrive later, so this only allocates the
@@ -284,6 +293,54 @@ class CalibrationStrategy(QuantizationStrategy):
             del layer._kernel
             layer.calibration_pending = False
 
+    # --- LoRA merge -------------------------------------------------------
+
+    def merge_lora_delta(self, layer, delta):
+        """Rounds the merged weight onto the calibrated grid.
+
+        The stored scale, zero point, group index and input scales (AWQ's
+        `awq_scales`) are the calibration's result and stay as they are;
+        only the codes are solved for, by round-to-nearest under those
+        parameters in `float32`: `QVariable.code_image` lays the merged
+        weight out on the grid and `pack_image` rounds, clips and packs
+        it, the two steps of `QVariable.quantize`, run apart so the
+        clipped fraction is measured on the image. A zero delta leaves
+        every code as it is. A weight the delta pushes past the range its
+        group's parameters cover clips to that range; a merge that clips
+        more than `LORA_MERGE_CLIP_WARNING_FRACTION` of the codes warns,
+        since calibrating again with the update applied to the float
+        model is the faithful answer to a large update.
+        """
+        # `check_saveable` ran first: the layer holds calibrated codes.
+        qvariable = self.qvariable(layer)
+        merged = ops.add(
+            qvariable.dequantize(dtype="float32"), ops.cast(delta, "float32")
+        )
+        image = qvariable.code_image(merged)
+        low, high = qvariable.scheme.code_range
+        rounded = ops.round(image)
+        outside = ops.logical_or(
+            ops.less(rounded, low), ops.greater(rounded, high)
+        )
+        clipped = float(
+            ops.convert_to_numpy(ops.mean(ops.cast(outside, "float32")))
+        )
+        if clipped > LORA_MERGE_CLIP_WARNING_FRACTION:
+            warnings.warn(
+                f"Merging the LoRA update into layer '{layer.name}' clipped "
+                f"{clipped:.1%} of its {self.name.upper()} codes to the "
+                "range its calibrated scale and zero point cover. The saved "
+                "weights keep the calibration but lose that part of the "
+                "update; for a large update, apply the update to the float "
+                "model and calibrate it again.",
+                stacklevel=2,
+            )
+        return (
+            qvariable.pack_image(image),
+            qvariable.scale,
+            qvariable.zero_point,
+        )
+
     @staticmethod
     def _pack_layout(bits, columns):
         """How `columns` codes of `bits` bits pack along the output axis."""
@@ -334,4 +391,5 @@ class CalibrationStrategy(QuantizationStrategy):
         qvariable = self.qvariable(layer)
         W = layer._kernel if qvariable is None else qvariable.dequantize()
         y = geometry.contract(inputs, W)
+        y = geometry.add_lora_delta(inputs, y)
         return apply_bias_activation(layer, y)

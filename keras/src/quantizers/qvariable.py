@@ -14,12 +14,16 @@ of how to read them:
   a zero point, and how groups run. It is one flat record, because every
   consumer reads the fields as a unit.
 
-The view has two surfaces, split by what they return. `unpack()` returns
-the integer codes in the weight's own shape and orientation, which is
-what a layer's `kernel` or `embeddings` property exposes for a quantized
-layer. `dequantize()` returns the real-valued weight, which is what the
-LoRA-merged save path, the calibration forward pass, and any exporter
-need. Neither surface caches: a view is built on demand by
+The view has three surfaces. `unpack()` returns the integer codes in
+the weight's own shape and orientation, which is what a layer's `kernel`
+or `embeddings` property exposes for a quantized layer. `dequantize()`
+returns the real-valued weight, which is what the LoRA-merged save path,
+the calibration forward pass, and any exporter need. `quantize()` is the
+inverse of `dequantize()` under the stored parameters: `code_image()`
+lays a real-valued weight out on the view's grid and `pack_image()`
+rounds, clips and packs it. A calibration mode runs the two steps itself
+when it folds a LoRA update into its codes, to measure how much of the
+update the grid clips. No surface caches: a view is built on demand by
 `QuantizationStrategy.qvariable(layer)` and holds references to the
 layer's variables, so it always reflects their current values.
 
@@ -40,9 +44,13 @@ import math
 
 from keras.src import backend
 from keras.src import ops
+from keras.src.quantizers.packing import pack_int2
+from keras.src.quantizers.packing import pack_int4
+from keras.src.quantizers.packing import pack_ternary
 from keras.src.quantizers.packing import unpack_int2
 from keras.src.quantizers.packing import unpack_int4
 from keras.src.quantizers.packing import unpack_ternary
+from keras.src.quantizers.quantizers import _take_group_params
 from keras.src.quantizers.quantizers import dequantize_grouped
 
 
@@ -117,8 +125,9 @@ class PackLayout:
     Each subclass owns one storage format: the number of codes per byte
     (`values_per_byte`, from which `packed_length` derives the stored
     length of an axis when a mode builds its code variable), the axis the
-    codes are packed along, and the unpack op. A mode's `encode` packs
-    through the `quantizers` functions directly.
+    codes are packed along, the pack and unpack ops, and the shape and
+    dtype the codes have once unpacked (`unpacked_shape`,
+    `unpacked_dtype`).
     """
 
     values_per_byte = 1
@@ -127,9 +136,21 @@ class PackLayout:
         """Returns the unpacked codes, one per element."""
         raise NotImplementedError
 
+    def pack(self, codes):
+        """Returns `codes` (one per element) in their stored form."""
+        raise NotImplementedError
+
     def packed_length(self, length):
         """Stored length of an axis holding `length` codes."""
         return length
+
+    def unpacked_shape(self, packed_shape):
+        """Shape of the codes a stored tensor of `packed_shape` holds."""
+        return tuple(packed_shape)
+
+    def unpacked_dtype(self, packed_dtype):
+        """Dtype of the codes a stored tensor of `packed_dtype` holds."""
+        return packed_dtype
 
     def __repr__(self):
         return f"{type(self).__name__}()"
@@ -139,6 +160,9 @@ class NoPack(PackLayout):
     """One code per stored element."""
 
     def unpack(self, codes):
+        return codes
+
+    def pack(self, codes):
         return codes
 
 
@@ -151,6 +175,11 @@ class _AxisPack(PackLayout):
 
     def packed_length(self, length):
         return math.ceil(length / self.values_per_byte)
+
+    def unpacked_shape(self, packed_shape):
+        shape = list(packed_shape)
+        shape[self.axis] = self.orig_len
+        return tuple(shape)
 
     def __repr__(self):
         return (
@@ -171,6 +200,11 @@ class Int4Pairs(_AxisPack):
         dtype = backend.standardize_dtype(codes.dtype)
         return unpack_int4(codes, self.orig_len, axis=self.axis, dtype=dtype)
 
+    def pack(self, codes):
+        dtype = backend.standardize_dtype(codes.dtype)
+        packed, _, _ = pack_int4(codes, axis=self.axis, dtype=dtype)
+        return packed
+
 
 class Int2Quads(_AxisPack):
     """Four 2-bit codes per byte along `axis`, as `pack_int2` writes them."""
@@ -180,6 +214,11 @@ class Int2Quads(_AxisPack):
     def unpack(self, codes):
         dtype = backend.standardize_dtype(codes.dtype)
         return unpack_int2(codes, self.orig_len, axis=self.axis, dtype=dtype)
+
+    def pack(self, codes):
+        dtype = backend.standardize_dtype(codes.dtype)
+        packed, _, _ = pack_int2(codes, axis=self.axis, dtype=dtype)
+        return packed
 
 
 class TernaryTrits(_AxisPack):
@@ -194,6 +233,15 @@ class TernaryTrits(_AxisPack):
 
     def unpack(self, codes):
         return unpack_ternary(codes, self.orig_len, axis=self.axis)
+
+    def pack(self, codes):
+        packed, _, _ = pack_ternary(codes, axis=self.axis)
+        return packed
+
+    def unpacked_dtype(self, packed_dtype):
+        # The trits are signed; the base-3 bytes are not.
+        del packed_dtype
+        return "int8"
 
 
 class QVariable:
@@ -313,12 +361,16 @@ class QVariable:
         """Returns the integer codes in `shape`."""
         return self._restore_shape(self.layout.unpack(self.codes))
 
-    def dequantize(self):
+    def dequantize(self, dtype=None):
         """Returns the real-valued weight in `shape`.
 
-        See `compute_dtype` for the result dtype.
+        Args:
+            dtype: Dtype the codes are cast to before the arithmetic, and
+                of a grouped scheme's result. Defaults to `compute_dtype`;
+                see there for the result dtype.
         """
-        codes = ops.cast(self.layout.unpack(self.codes), self.compute_dtype)
+        dtype = self.compute_dtype if dtype is None else dtype
+        codes = ops.cast(self.layout.unpack(self.codes), dtype)
         if self.g_idx is not None:
             weight = dequantize_grouped(
                 codes,
@@ -327,18 +379,73 @@ class QVariable:
                 self.g_idx,
                 group_axis=self.scheme.group_axis,
             )
-            weight = ops.cast(weight, self.compute_dtype)
+            weight = ops.cast(weight, dtype)
         else:
             if self.zero_point is not None:
-                codes = ops.subtract(
-                    codes, ops.cast(self.zero_point, self.compute_dtype)
-                )
+                codes = ops.subtract(codes, ops.cast(self.zero_point, dtype))
             weight = ops.divide(codes, self._broadcast_scale(self.scale, codes))
         if self.input_scales is not None:
             # Per-input-row scales apply to the 2-D `[in, out]` codes, before
             # an einsum kernel is folded back to N-D.
             weight = ops.divide(weight, ops.expand_dims(self.input_scales, -1))
         return self._restore_shape(weight)
+
+    def quantize(self, weight):
+        """Returns the stored codes of a real-valued `weight` in `shape`.
+
+        The inverse of `dequantize` under the stored parameters: the weight
+        is rounded to the nearest code of its group's scale and zero point
+        (and its input scale), clipped to `scheme.code_range` and packed.
+        The parameters themselves are not derived from `weight`; a mode's
+        `encode` does that.
+        """
+        return self.pack_image(self.code_image(weight))
+
+    def code_image(self, weight):
+        """Returns the unrounded image of `weight` on the view's grid.
+
+        `weight` is real-valued, in `shape`. The image is `float32`, laid
+        out as the unpacked codes (the stored axis order, before packing);
+        rounding it gives the codes `quantize` packs, and an entry outside
+        `scheme.code_range` is a weight the stored parameters do not cover.
+        """
+        image = self._as_stored(ops.cast(weight, "float32"))
+        if self.input_scales is not None:
+            input_scales = ops.cast(self.input_scales, "float32")
+            image = ops.multiply(image, ops.expand_dims(input_scales, -1))
+        if self.g_idx is not None:
+            scales, zeros = _take_group_params(
+                self.scale,
+                self.zero_point,
+                self.g_idx,
+                self.scheme.group_axis,
+            )
+            image = ops.multiply(image, ops.cast(scales, "float32"))
+            image = ops.add(image, ops.cast(zeros, "float32"))
+        else:
+            scale = self._broadcast_scale(self.scale, image)
+            image = ops.multiply(image, ops.cast(scale, "float32"))
+            if self.zero_point is not None:
+                image = ops.add(image, ops.cast(self.zero_point, "float32"))
+        return image
+
+    def pack_image(self, image):
+        """Rounds a code image, clips it to `scheme.code_range`, packs it."""
+        low, high = self.scheme.code_range
+        codes = ops.clip(ops.round(image), low, high)
+        dtype = self.layout.unpacked_dtype(
+            backend.standardize_dtype(self.codes.dtype)
+        )
+        return self.layout.pack(ops.cast(codes, dtype))
+
+    def _as_stored(self, weight):
+        """Lays `weight` (in `shape`) out as the unpacked codes are."""
+        if self.permutation is not None:
+            weight = ops.transpose(weight, self.permutation)
+        stored = self.layout.unpacked_shape(tuple(self.codes.shape))
+        if tuple(weight.shape) != stored:
+            weight = ops.reshape(weight, stored)
+        return weight
 
     def _broadcast_scale(self, scale, codes):
         """Aligns the stored scale with the codes it applies to."""

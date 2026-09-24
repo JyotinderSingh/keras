@@ -112,6 +112,37 @@ class PackLayoutTest(testing.TestCase):
         self.assertEqual(Int2Quads(0, 4).values_per_byte, 4)
         self.assertEqual(TernaryTrits(0, 5).values_per_byte, 5)
 
+    @parameterized.named_parameters(
+        ("none", NoPack(), None, (0, 255), "uint8"),
+        ("int4_axis0", Int4Pairs(axis=0, orig_len=5), 0, (-8, 7), "int8"),
+        (
+            "int4_uint8_axis1",
+            Int4Pairs(axis=1, orig_len=7),
+            1,
+            (0, 15),
+            "uint8",
+        ),
+        ("int2_axis0", Int2Quads(axis=0, orig_len=5), 0, (-2, 1), "int8"),
+        ("int2_uint8_axis1", Int2Quads(axis=1, orig_len=7), 1, (0, 3), "uint8"),
+        ("ternary_axis0", TernaryTrits(axis=0, orig_len=5), 0, (-1, 1), "int8"),
+    )
+    def test_pack_inverts_unpack(self, layout, axis, value_range, dtype):
+        rng = np.random.default_rng(0)
+        # Odd lengths exercise the padding on every axis.
+        codes = rng.integers(value_range[0], value_range[1] + 1, (5, 7))
+        codes = codes.astype(dtype)
+        packed = layout.pack(codes)
+        expected_shape = list(codes.shape)
+        if axis is not None:
+            expected_shape[axis] = layout.packed_length(codes.shape[axis])
+        self.assertEqual(tuple(packed.shape), tuple(expected_shape))
+        self.assertEqual(layout.unpacked_shape(packed.shape), codes.shape)
+        self.assertEqual(
+            layout.unpacked_dtype(backend.standardize_dtype(packed.dtype)),
+            dtype,
+        )
+        self.assertAllEqual(layout.unpack(packed), codes)
+
 
 class QVariableTest(testing.TestCase):
     def test_validates_variables_against_scheme(self):
@@ -313,6 +344,116 @@ class QVariableTest(testing.TestCase):
         self.assertEqual(view.num_values, 12)
         self.assertIn("shape=(2, 2, 3)", repr(view))
 
+    def test_quantize_inverts_dequantize_on_a_grouped_permuted_view(self):
+        # The calibration modes' view at its most involved: packed 4-bit
+        # codes, an activation-order group index, AWQ input scales and an
+        # einsum permutation. Rounding the dequantized weight back onto
+        # the grid reproduces the stored codes bit for bit.
+        rng = np.random.default_rng(0)
+        codes = rng.integers(0, 16, (3, 8)).astype("uint8")
+        packed, _, _ = packing.pack_int4(codes, axis=-1, dtype="uint8")
+        scale = rng.uniform(4.0, 40.0, (2, 8)).astype("float32")
+        zero = rng.integers(0, 16, (2, 8)).astype("uint8")
+        g_idx = np.array([1, 0, 1], "float32")
+        input_scales = np.array([0.5, 1.0, 2.0], "float32")
+        view = QVariable(
+            codes=packed,
+            scale=scale,
+            layout=Int4Pairs(axis=-1, orig_len=8),
+            scheme=WeightScheme(
+                code_range=(0, 15),
+                has_zero_point=True,
+                group_size=2,
+                group_axis=0,
+            ),
+            shape=(2, 3, 4),
+            zero_point=zero,
+            g_idx=g_idx,
+            input_scales=input_scales,
+            permutation=(1, 0, 2),
+        )
+        weight = view.dequantize(dtype="float32")
+        self.assertEqual(tuple(weight.shape), (2, 3, 4))
+        self.assertAllEqual(view.quantize(weight), packed)
+        self.assertAllEqual(
+            ops.round(view.code_image(weight)), codes.astype("float32")
+        )
+
+    @parameterized.named_parameters(
+        ("int8_per_channel", NoPack(), _int8_scheme(), "int8", None),
+        (
+            "int2_per_tensor",
+            Int2Quads(axis=0, orig_len=6),
+            WeightScheme(code_range=(0, 3), has_zero_point=True),
+            "uint8",
+            np.uint8(1),
+        ),
+        (
+            "ternary",
+            TernaryTrits(axis=0, orig_len=6),
+            WeightScheme(code_range=(-1, 1)),
+            "int8",
+            None,
+        ),
+    )
+    def test_quantize_inverts_dequantize(self, layout, scheme, dtype, zero):
+        rng = np.random.default_rng(1)
+        low, high = scheme.code_range
+        codes = rng.integers(low, high + 1, (6, 4)).astype(dtype)
+        scale = (
+            rng.uniform(2.0, 9.0, (4,)).astype("float32")
+            if scheme.channel_axis is not None
+            else np.float32(3.5)
+        )
+        view = QVariable(
+            codes=layout.pack(codes),
+            scale=scale,
+            layout=layout,
+            scheme=scheme,
+            shape=(6, 4),
+            zero_point=zero,
+        )
+        self.assertAllEqual(
+            view.quantize(view.dequantize()), layout.pack(codes)
+        )
+
+    def test_quantize_clips_to_the_code_range(self):
+        view = QVariable(
+            codes=np.zeros((2, 3), "uint8"),
+            scale=np.float32(1.0),
+            layout=NoPack(),
+            scheme=WeightScheme(code_range=(0, 15)),
+            shape=(2, 3),
+        )
+        weight = np.array([[-3.0, 0.4, 15.6], [7.0, 99.0, 14.5]], "float32")
+        self.assertAllEqual(
+            view.quantize(weight), np.array([[0, 0, 15], [7, 15, 14]], "uint8")
+        )
+
+    def test_dequantize_dtype_override(self):
+        view = QVariable(
+            codes=np.array([[1, 2], [3, 4]], "int8"),
+            scale=np.array([2.0, 4.0], "float32"),
+            layout=NoPack(),
+            scheme=_int8_scheme(),
+            shape=(2, 2),
+            compute_dtype="bfloat16",
+        )
+        self.assertEqual(
+            backend.standardize_dtype(view.dequantize(dtype="float32").dtype),
+            "float32",
+        )
+        self.assertAllClose(
+            view.dequantize(dtype="float32"), [[0.5, 0.5], [1.5, 1.0]]
+        )
+        # The default keeps the compute-dtype rule.
+        self.assertEqual(
+            backend.standardize_dtype(view.dequantize().dtype),
+            backend.standardize_dtype(
+                ops.divide(ops.cast(view.codes, "bfloat16"), view.scale).dtype
+            ),
+        )
+
 
 class LayerViewTest(testing.TestCase):
     """The view built by each mode matches what the layers exposed before."""
@@ -443,6 +584,40 @@ class LayerViewTest(testing.TestCase):
         self.assertTrue(np.isin(codes, [-1, 0, 1]).all())
         self.assertAllClose(
             view.dequantize(), codes / ops.convert_to_numpy(layer.kernel_scale)
+        )
+
+    @parameterized.named_parameters(
+        ("dense_int8", "int8", None),
+        (
+            "dense_int4_per_channel",
+            "int4",
+            Int4QuantizationConfig(block_size=-1),
+        ),
+        ("dense_int4_grouped", "int4", Int4QuantizationConfig(block_size=4)),
+        ("dense_ternary", "ternary", None),
+    )
+    def test_quantize_reproduces_the_stored_codes(self, mode, config):
+        # Every shipped layout and scheme round-trips through the view's
+        # own quantize: the stored codes are the nearest codes of the
+        # weight they dequantize to.
+        layer = layers.Dense(6)
+        layer.build((None, 8))
+        layer.kernel.assign(np.random.default_rng(0).random((8, 6)) - 0.5)
+        layer.quantize(mode, config=config)
+        view = layer._qvariable()
+        self.assertAllEqual(
+            view.quantize(view.dequantize(dtype="float32")), view.codes
+        )
+
+    def test_quantize_reproduces_an_einsum_dense_int8_scale_layout(self):
+        layer = layers.EinsumDense("abc,cde->abde", output_shape=(2, 3, 4))
+        layer.build((None, 2, 6))
+        layer.kernel.assign(np.random.default_rng(0).random((6, 3, 4)) - 0.5)
+        layer.quantize("int8")
+        view = layer._qvariable()
+        self.assertIsNotNone(view.align_scale)
+        self.assertAllEqual(
+            view.quantize(view.dequantize(dtype="float32")), view.codes
         )
 
     def test_modes_without_codes_have_no_view(self):
