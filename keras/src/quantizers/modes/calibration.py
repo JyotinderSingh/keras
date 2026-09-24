@@ -3,8 +3,10 @@
 GPTQ and AWQ allocate the same family of variables, run the same
 dequantize-and-contract forward pass, and speak the same three-part policy
 grammar; they differ only in the code bit-width (which fixes how the
-kernel is packed), in one extra AWQ variable and its inverse scaling, and
-in a handful of message fragments. Those differences are the hooks below.
+kernel is packed), in one extra AWQ variable and its inverse scaling, in
+a handful of message fragments and, for the calibration run, in the
+calibrator class and the forward batch size. Those differences are the
+hooks below.
 """
 
 import math
@@ -25,6 +27,10 @@ class CalibrationStrategy(QuantizationStrategy):
 
     requires_config = True
     requires_layer_structure = True
+    # Not supported yet: the calibration forward has no term for a LoRA
+    # update, and a merged save needs a re-quantization onto the
+    # calibrated grid, which these modes do not have (`encode`).
+    supports_lora = False
 
     def quantize(self, layer, config):
         # The quantized values arrive later, so this only allocates the
@@ -36,6 +42,23 @@ class CalibrationStrategy(QuantizationStrategy):
         layer.calibration_pending = True
 
     # --- Config and policy-string surface ---------------------------------
+
+    # The mode's dedicated dtype policy class.
+    policy_cls = None
+
+    def policy_from_string(self, mode_str, source_name):
+        return self.policy_cls(mode_str, source_name)
+
+    def config_from_policy(self, policy):
+        name = self.name.upper()
+        raise ValueError(
+            f"Implicitly enabling {name} quantization by setting "
+            f"`dtype_policy` to '{policy.name}' is not supported. "
+            f"{name} requires a calibration dataset and a "
+            f"`{self.config_cls.__name__}` object.\n\n"
+            f"Please use the `.quantize('{self.name}', config=...)` method "
+            "on the layer or model instead."
+        )
 
     def _missing_config_error(self):
         return (
@@ -67,21 +90,75 @@ class CalibrationStrategy(QuantizationStrategy):
         policy = layer.dtype_policy
         if isinstance(policy, DTypePolicyMap):
             policy = policy[layer.path]
-            if policy.quantization_mode != self.name:
-                self._on_policy_map_mismatch(policy)
         if policy.quantization_mode == self.name:
             return getattr(policy, attr)
-        raise ValueError(self._resolution_error(attr))
+        raise ValueError(
+            f"For {self.name.upper()} quantization, the {attr} must be "
+            "specified either through a `dtype_policy` of type "
+            f"`{self.policy_cls.__name__}` or the `config` argument. "
+            f"Received: dtype_policy={policy!r}"
+        )
 
-    def _on_policy_map_mismatch(self, policy):
-        """Hook for modes that reject a mismatched `DTypePolicyMap` entry.
+    # --- Calibration run --------------------------------------------------
 
-        Returning lets resolution fall through to `_resolution_error`.
+    # The `Calibrator` class that solves this mode for one layer.
+    calibrator_cls = None
+
+    def calibration_batch_size(self, config):
+        """Samples per forward pass during a calibration run.
+
+        Batching only reduces the number of (expensive) forward passes
+        through each block: the statistics accumulate over the observed
+        input rows either way, up to floating-point order.
         """
+        return max(1, int(config.calibration_batch_size))
 
-    def _resolution_error(self, attr):
-        """The error raised when a hyperparameter cannot be resolved."""
-        raise NotImplementedError
+    def calibrate(self, config, structure, filters=None):
+        """Runs this mode's calibration over `structure` and writes back.
+
+        Args:
+            config: The mode's config, with its dataset and tokenizer.
+            structure: Dict with keys `"pre_block_layers"` and
+                `"sequential_blocks"`, as `Model.quantize` resolved it.
+            filters: Optional filters that exclude layers from quantization.
+        """
+        from keras.src.quantizers.calibration_run import CalibrationRun
+        from keras.src.quantizers.calibration_run import (
+            calibration_no_grad_scope,
+        )
+        from keras.src.quantizers.calibration_run import get_dataloader
+
+        if config.dataset is None or config.tokenizer is None:
+            raise ValueError(
+                f"{self.name.upper()} quantization requires a dataset and a "
+                "tokenizer. Please provide them in the "
+                f"`{self.config_cls.__name__}`."
+            )
+        if structure is None:
+            raise ValueError(
+                f"For '{self.name}' mode, a valid quantization structure "
+                "must be provided either via "
+                "`config.quantization_layer_structure` or by overriding "
+                "`model.get_quantization_layer_structure(mode)`. The "
+                "structure should be a dictionary with keys "
+                "'pre_block_layers' and 'sequential_blocks'."
+            )
+        # Load all data needed from the generator/source in a single call;
+        # the materialized array can be sliced and reused.
+        dataloader = get_dataloader(
+            config.tokenizer,
+            config.sequence_length,
+            config.dataset,
+            num_samples=config.num_samples,
+        )
+        with calibration_no_grad_scope():
+            CalibrationRun(self, config, structure, filters).run(
+                dataloader[: config.num_samples]
+            )
+
+    def finalize_model_quantization(self, model, config, structure, filters):
+        del model
+        self.calibrate(config, structure, filters)
 
     # --- Variables --------------------------------------------------------
 
@@ -97,11 +174,6 @@ class CalibrationStrategy(QuantizationStrategy):
         # marks a live float layer pending after this returns.
         layer.calibration_pending = False
 
-        if len(input_shape) not in (2, 3):
-            raise ValueError(
-                f"{self.name.upper()} quantization only supports 2D or 3D "
-                "kernels."
-            )
         rows, columns = geometry.calibration_rows_columns(input_shape)
 
         bits = self.resolve_weight_bits(layer, config)
@@ -132,7 +204,6 @@ class CalibrationStrategy(QuantizationStrategy):
             dtype="uint8",
             trainable=False,
         )
-        self._build_extra_variables(layer, rows)
         # `g_idx` is stored as `float32` because TF has no GPU kernel for
         # int32 resource variables (would pin the variable to CPU and break
         # jit_compile on GPU); consumers cast to int32 on-device.
@@ -143,9 +214,12 @@ class CalibrationStrategy(QuantizationStrategy):
             dtype="float32",
             trainable=False,
         )
+        # The layout the modes share comes first; a mode's own variables
+        # follow it.
+        self._build_extra_variables(layer, rows)
 
     def _build_extra_variables(self, layer, rows):
-        """Creates any mode-specific variables, after the zero point."""
+        """Creates any mode-specific variables, after the shared ones."""
 
     def _input_scales(self, layer):
         """Per-input-row scales divided out of the dequantized kernel."""

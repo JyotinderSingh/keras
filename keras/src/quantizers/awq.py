@@ -6,12 +6,13 @@ activation magnitudes, then applies those scales before quantization.
 Reference: https://arxiv.org/abs/2306.00978
 """
 
-import types
+import functools
 
 from keras.src import ops
-from keras.src.layers import Dense
-from keras.src.layers import EinsumDense
+from keras.src import quantizers
 from keras.src.quantizers import strategy_registry
+from keras.src.quantizers.awq_config import AWQConfig
+from keras.src.quantizers.calibrator import Calibrator
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
@@ -55,7 +56,23 @@ def _get_weight_scale(weights, group_size):
     return ops.mean(w_norm, axis=0)
 
 
-def _fake_quantize_weights(weights_scaled, in_features, group_size):
+# The scale/zero rule of AWQ's 4-bit asymmetric codes; `group_size` is
+# passed per call because the clipping search narrows it to one group.
+compute_awq_scale_zero = functools.partial(
+    compute_quantization_parameters,
+    bits=4,
+    symmetric=False,
+    per_channel=True,
+    compute_dtype="float32",
+)
+
+
+def _fake_quantize_weights(
+    weights_scaled,
+    in_features,
+    group_size,
+    compute_scale_zero=compute_awq_scale_zero,
+):
     """Quantize then dequantize a weight matrix (4-bit asymmetric).
 
     Shared by the scale search and the clipping search so both evaluate the
@@ -65,37 +82,23 @@ def _fake_quantize_weights(weights_scaled, in_features, group_size):
         weights_scaled: Weight matrix ``[out_features, in_features]``.
         in_features: Number of input features (columns).
         group_size: Quantization group size (``-1`` for per-channel).
+        compute_scale_zero: Function to compute scale and zero for
+            quantization.
 
     Returns:
         The dequantized weight matrix, same shape as ``weights_scaled``.
     """
     if group_size == -1:
-        scale_q, zero_q, maxq = compute_quantization_parameters(
-            weights_scaled,
-            bits=4,
-            symmetric=False,
-            per_channel=True,
-            group_size=-1,
-            compute_dtype="float32",
-        )
-        quantized = quantize_with_zero_point(
-            weights_scaled, scale_q, zero_q, maxq
-        )
-        return dequantize_with_zero_point(quantized, scale_q, zero_q)
+        scale, zero, maxq = compute_scale_zero(weights_scaled, group_size=-1)
+        quantized = quantize_with_zero_point(weights_scaled, scale, zero, maxq)
+        return dequantize_with_zero_point(quantized, scale, zero)
 
-    scale_q, zero_q, maxq = compute_quantization_parameters(
-        weights_scaled,
-        bits=4,
-        symmetric=False,
-        per_channel=True,
-        group_size=group_size,
-        compute_dtype="float32",
+    scale, zero, maxq = compute_scale_zero(
+        weights_scaled, group_size=group_size
     )
     g_idx = ops.cast(ops.arange(0, in_features) // group_size, "int32")
-    quantized = quantize_with_sz_map(
-        weights_scaled, scale_q, zero_q, g_idx, maxq
-    )
-    return dequantize_with_sz_map(quantized, scale_q, zero_q, g_idx)
+    quantized = quantize_with_sz_map(weights_scaled, scale, zero, g_idx, maxq)
+    return dequantize_with_sz_map(quantized, scale, zero, g_idx)
 
 
 def awq_search_optimal_scales(
@@ -104,6 +107,7 @@ def awq_search_optimal_scales(
     *,
     num_grid_points=20,
     group_size=-1,
+    compute_scale_zero=compute_awq_scale_zero,
 ):
     """Search for optimal AWQ scales using grid search.
 
@@ -128,6 +132,8 @@ def awq_search_optimal_scales(
         activation_magnitudes: Per-channel activation magnitudes [in_features].
         num_grid_points: Number of grid search points. Defaults to 20.
         group_size: Group size for quantization (-1 for per-channel).
+        compute_scale_zero: Function to compute scale and zero for
+            quantization.
 
     Returns:
         best_scales: Optimal per-channel scales [in_features].
@@ -167,7 +173,7 @@ def awq_search_optimal_scales(
         weights_scaled = ops.multiply(weights, scales)
 
         dequantized = _fake_quantize_weights(
-            weights_scaled, in_features, group_size
+            weights_scaled, in_features, group_size, compute_scale_zero
         )
 
         # Scale back down by DIVIDING to restore original magnitude
@@ -200,9 +206,10 @@ def awq_search_best_clip(
     awq_scales,
     *,
     group_size=-1,
-    n_grid=20,
+    num_grid_points=20,
     max_shrink=0.5,
-    oc_batch_size=64,
+    output_channel_batch_size=64,
+    compute_scale_zero=compute_awq_scale_zero,
 ):
     """Search per-group weight clipping bounds (AutoAWQ ``best_clip``).
 
@@ -221,19 +228,21 @@ def awq_search_best_clip(
         activation_sample: Raw activation sample ``[rows, in_features]``.
         awq_scales: Per-in-channel AWQ scales ``[in_features]``.
         group_size: Quantization group size (``-1`` for per-channel).
-        n_grid: Number of shrink factors to try. Defaults to 20.
+        num_grid_points: Number of shrink factors to try. Defaults to 20.
         max_shrink: Maximum fractional shrink of the per-group max (the search
             spans ``[1, 1 - max_shrink]``). Defaults to 0.5.
-        oc_batch_size: Output-channel batch size, to bound peak memory.
+        output_channel_batch_size: Output-channel batch size, to bound peak
+            memory.
+        compute_scale_zero: Function to compute scale and zero for
+            quantization.
 
     Returns:
-        best_max: Per-group clipping bound ``[out_features, n_group, 1]``.
-        gs: Effective group size used for reshaping.
-        n_group: Number of groups.
+        clip_bound: Per-group clipping bound ``[out_features, n_groups, 1]``.
+        effective_group_size: Group size used for reshaping.
+        n_groups: Number of groups.
     """
     out_features, in_features = ops.shape(weights_scaled)
     awq_scales = ops.cast(awq_scales, "float32")
-
     x = ops.cast(activation_sample, "float32")
     if ops.ndim(x) > 2:
         x = ops.reshape(x, (-1, in_features))
@@ -241,62 +250,76 @@ def awq_search_best_clip(
     x_scaled = ops.divide(x, awq_scales)
 
     if group_size and group_size > 0 and in_features % group_size == 0:
-        gs = group_size
+        effective_group_size = group_size
     else:
         # Per-channel, or a group size that does not evenly divide the input:
         # fall back to a single group per output channel for the clip search.
-        gs = in_features
-    n_group = in_features // gs
-
-    x_grouped = ops.reshape(x_scaled, (-1, n_group, gs))  # [rows, n_group, gs]
-    w_grouped = ops.reshape(weights_scaled, (out_features, n_group, gs))
-    org_max = ops.max(
+        effective_group_size = in_features
+    n_groups = in_features // effective_group_size
+    # [rows, n_groups, effective_group_size]
+    x_grouped = ops.reshape(x_scaled, (-1, n_groups, effective_group_size))
+    w_grouped = ops.reshape(
+        weights_scaled, (out_features, n_groups, effective_group_size)
+    )
+    group_max = ops.max(
         ops.abs(w_grouped), axis=-1, keepdims=True
-    )  # [oc, n_group, 1]
+    )  # [out_features, n_groups, 1]
 
-    n_shrink = max(1, int(n_grid))
-    step = max_shrink / n_grid
-    fq_group_size = gs if n_group > 1 else -1
+    num_shrinks = max(1, int(num_grid_points))
+    step = max_shrink / num_grid_points
+    quantizer_group_size = effective_group_size if n_groups > 1 else -1
 
-    best_max_parts = []
-    n_batches = (out_features + oc_batch_size - 1) // oc_batch_size
-    for b in range(n_batches):
-        start = b * oc_batch_size
-        end = min(start + oc_batch_size, out_features)
-        ocb = end - start
-        w = w_grouped[start:end]  # [ocb, n_group, gs]
-        omax = org_max[start:end]  # [ocb, n_group, 1]
+    clip_bound_parts = []
+    num_batches = (
+        out_features + output_channel_batch_size - 1
+    ) // output_channel_batch_size
+    for batch_idx in range(num_batches):
+        batch_start = batch_idx * output_channel_batch_size
+        batch_end = min(batch_start + output_channel_batch_size, out_features)
+        batch_size = batch_end - batch_start
+        # [batch_size, n_groups, effective_group_size]
+        batch_weights = w_grouped[batch_start:batch_end]
+        batch_group_max = group_max[batch_start:batch_end]
+        # Reference output for this output-channel batch:
+        # [batch_size, rows, n_groups].
+        reference_output = ops.einsum("rng,ong->orn", x_grouped, batch_weights)
 
-        # Reference output for this output-channel batch: [ocb, rows, n_group].
-        org_out = ops.einsum("rng,ong->orn", x_grouped, w)
-
-        best_max = omax
-        min_err = None
-        for i_s in range(n_shrink):
-            max_val = ops.multiply(omax, 1.0 - i_s * step)  # [ocb, n_group, 1]
-            w_clamped = ops.clip(w, ops.negative(max_val), max_val)
-            w_deq = _fake_quantize_weights(
-                ops.reshape(w_clamped, (ocb, in_features)),
-                in_features,
-                fq_group_size,
+        clip_bound = batch_group_max
+        best_error = None
+        for shrink_idx in range(num_shrinks):
+            bound = ops.multiply(batch_group_max, 1.0 - shrink_idx * step)
+            weights_clipped = ops.clip(
+                batch_weights, ops.negative(bound), bound
             )
-            w_deq = ops.reshape(w_deq, (ocb, n_group, gs))
-            cur_out = ops.einsum("rng,ong->orn", x_grouped, w_deq)
-            err = ops.mean(
-                ops.square(ops.subtract(cur_out, org_out)), axis=1
-            )  # [ocb, n_group]
-            err = ops.expand_dims(err, axis=-1)  # [ocb, n_group, 1]
-            if min_err is None:
-                min_err = err
-                best_max = max_val
+            weights_dequantized = _fake_quantize_weights(
+                ops.reshape(weights_clipped, (batch_size, in_features)),
+                in_features,
+                quantizer_group_size,
+                compute_scale_zero,
+            )
+            weights_dequantized = ops.reshape(
+                weights_dequantized,
+                (batch_size, n_groups, effective_group_size),
+            )
+            clipped_output = ops.einsum(
+                "rng,ong->orn", x_grouped, weights_dequantized
+            )
+            error = ops.mean(
+                ops.square(ops.subtract(clipped_output, reference_output)),
+                axis=1,
+            )  # [batch_size, n_groups]
+            error = ops.expand_dims(error, axis=-1)  # [batch_size, n_groups, 1]
+            if best_error is None:
+                best_error = error
+                clip_bound = bound
             else:
-                better = ops.less(err, min_err)
-                min_err = ops.where(better, err, min_err)
-                best_max = ops.where(better, max_val, best_max)
-        best_max_parts.append(best_max)
+                better = ops.less(error, best_error)
+                best_error = ops.where(better, error, best_error)
+                clip_bound = ops.where(better, bound, clip_bound)
+        clip_bound_parts.append(clip_bound)
 
-    best_max = ops.concatenate(best_max_parts, axis=0)  # [oc, n_group, 1]
-    return best_max, gs, n_group
+    clip_bound = ops.concatenate(clip_bound_parts, axis=0)
+    return clip_bound, effective_group_size, n_groups
 
 
 def awq_quantize_matrix(
@@ -307,8 +330,9 @@ def awq_quantize_matrix(
     group_size=-1,
     apply_clip=False,
     activation_sample=None,
-    clip_n_grid=20,
+    clip_num_grid_points=20,
     clip_max_shrink=0.5,
+    compute_scale_zero=compute_awq_scale_zero,
 ):
     """Quantize a weight matrix using AWQ.
 
@@ -328,13 +352,16 @@ def awq_quantize_matrix(
             ``activation_sample`` to be provided.
         activation_sample: Optional raw activation sample [rows, in_features]
             used only for the clipping search.
-        clip_n_grid: Number of shrink factors for the clipping search.
+        clip_num_grid_points: Number of shrink factors for the clipping
+            search.
         clip_max_shrink: Maximum fractional shrink for the clipping search.
+        compute_scale_zero: Function to compute scale and zero for
+            quantization.
 
     Returns:
-        quantized_weights: Quantized weights [out_features, in_features].
-        scales: Quantization scales [out_features, num_groups].
-        zeros: Zero points [out_features, num_groups].
+        quantized: Quantized weights [out_features, in_features].
+        scale: Quantization scales [out_features, n_groups].
+        zero: Zero points [out_features, n_groups].
         awq_scales: AWQ per-channel scales [in_features].
         g_idx: Group indices [in_features].
     """
@@ -346,6 +373,7 @@ def awq_quantize_matrix(
         activation_magnitudes,
         num_grid_points=num_grid_points,
         group_size=group_size,
+        compute_scale_zero=compute_scale_zero,
     )
 
     # Step 2: Apply AWQ scales by MULTIPLYING (expand salient weights)
@@ -354,46 +382,35 @@ def awq_quantize_matrix(
 
     # Step 3: (Optional) Search and apply per-group clipping bounds.
     if apply_clip and activation_sample is not None:
-        best_max, gs, n_group = awq_search_best_clip(
+        clip_bound, effective_group_size, n_groups = awq_search_best_clip(
             weights_scaled,
             activation_sample,
             awq_scales,
             group_size=group_size,
-            n_grid=clip_n_grid,
+            num_grid_points=clip_num_grid_points,
             max_shrink=clip_max_shrink,
+            compute_scale_zero=compute_scale_zero,
         )
-        w_grouped = ops.reshape(weights_scaled, (out_features, n_group, gs))
-        w_grouped = ops.clip(w_grouped, ops.negative(best_max), best_max)
+        w_grouped = ops.reshape(
+            weights_scaled, (out_features, n_groups, effective_group_size)
+        )
+        w_grouped = ops.clip(w_grouped, ops.negative(clip_bound), clip_bound)
         weights_scaled = ops.reshape(w_grouped, (out_features, in_features))
 
     if group_size == -1:
         # Per-channel quantization (no grouping)
-        scale_q, zero_q, maxq = compute_quantization_parameters(
-            weights_scaled,
-            bits=4,
-            symmetric=False,
-            per_channel=True,
-            group_size=-1,
-            compute_dtype="float32",
-        )
+        scale, zero, maxq = compute_scale_zero(weights_scaled, group_size=-1)
 
         # Quantize
-        quantized = quantize_with_zero_point(
-            weights_scaled, scale_q, zero_q, maxq
-        )
+        quantized = quantize_with_zero_point(weights_scaled, scale, zero, maxq)
 
         # Build group indices (all 0s for per-channel). Integer group
         # metadata, kept as int32.
         g_idx = ops.zeros((in_features,), dtype="int32")
     else:
         # Grouped quantization - use proper per-row grouping
-        scale_q, zero_q, maxq = compute_quantization_parameters(
-            weights_scaled,
-            bits=4,
-            symmetric=False,
-            per_channel=True,
-            group_size=group_size,
-            compute_dtype="float32",
+        scale, zero, maxq = compute_scale_zero(
+            weights_scaled, group_size=group_size
         )
 
         # Compute group indices: maps each input feature to its group
@@ -401,14 +418,14 @@ def awq_quantize_matrix(
 
         # Quantize using group index mapping
         quantized = quantize_with_sz_map(
-            weights_scaled, scale_q, zero_q, g_idx, maxq
+            weights_scaled, scale, zero, g_idx, maxq
         )
 
-    return quantized, scale_q, zero_q, awq_scales, g_idx
+    return quantized, scale, zero, awq_scales, g_idx
 
 
-class AWQ:
-    """AWQ quantizer for a single layer.
+class AWQCalibrator(Calibrator):
+    """AWQ calibrator for a single layer.
 
     This class accumulates activation statistics during calibration and
     performs AWQ quantization on layer weights.
@@ -421,51 +438,17 @@ class AWQ:
     5. Applying scales before quantization to protect salient weights
 
     Args:
-        layer: The layer to quantize (Dense or EinsumDense).
-        config: AWQConfig instance with quantization parameters.
+        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
+            that supports the `awq` mode.
+        config: `AWQConfig` instance with quantization parameters.
     """
 
+    mode = "awq"
+
     def __init__(self, layer, config=None):
-        from keras.src.quantizers.awq_config import AWQConfig
-
-        self.original_layer = layer
-        self.config = config or AWQConfig(dataset=None, tokenizer=None)
-        self.num_samples = 0
-
-        # Handle Dense and EinsumDense layers
-        if isinstance(layer, Dense) or (
-            isinstance(layer, EinsumDense) and layer.kernel.ndim == 2
-        ):
-            self.kernel_shape = layer.kernel.shape
-            self.rows = self.kernel_shape[0]  # in_features
-            self.columns = self.kernel_shape[1]  # out_features
-            self.layer = layer
-        elif isinstance(layer, EinsumDense) and layer.kernel.ndim == 3:
-            # Handle 3D EinsumDense layers (typically from attention blocks)
-            self.kernel_shape = layer.kernel.shape
-            shape = list(self.kernel_shape)
-            d_model_dim_index = shape.index(max(shape))
-
-            if d_model_dim_index == 0:  # QKV projection case
-                in_features, heads, head_dim = shape
-                self.rows = in_features
-                self.columns = heads * head_dim
-            elif d_model_dim_index in [1, 2]:  # Attention Output case
-                heads, head_dim, out_features = shape
-                self.rows = heads * head_dim
-                self.columns = out_features
-            else:
-                raise ValueError(
-                    f"Cannot determine dimensions for EinsumDense kernel "
-                    f"shape {shape}"
-                )
-
-            # Create a temporary object that holds a reshaped 2D version
-            self.layer = types.SimpleNamespace(
-                kernel=ops.reshape(layer.kernel, (self.rows, self.columns)),
-            )
-        else:
-            raise TypeError(f"Unsupported layer type for AWQ: {type(layer)}")
+        config = config or AWQConfig(dataset=None, tokenizer=None)
+        super().__init__(layer, config)
+        self.compute_scale_zero = compute_awq_scale_zero
 
         # Initialize activation magnitude accumulator (running per-channel
         # MEAN of |x|, as in the reference AWQ implementations).
@@ -475,8 +458,8 @@ class AWQ:
         self._clip_samples = []
         self._clip_sample_rows = 0
 
-    def update_activation_magnitudes(self, input_batch):
-        """Update per-channel activation magnitude statistics.
+    def observe(self, inputs):
+        """Updates the per-channel activation magnitudes with a new batch.
 
         This tracks the running per-channel MEAN of the absolute activation
         value across all calibration batches (matching llm-awq / AutoAWQ),
@@ -485,40 +468,45 @@ class AWQ:
         search reuses.
 
         Args:
-            input_batch: Input activations tensor [batch, ..., in_features].
+            inputs: A 2D or higher-dimensional tensor of input activations
+                from a calibration batch.
+
+        Raises:
+            ValueError: If the feature dimension of `inputs` does not match
+                the per-channel statistics `self.activation_magnitudes`.
         """
-        if input_batch is None:
-            raise ValueError("Input tensor cannot be None.")
-        if ops.size(input_batch) == 0:
-            raise ValueError("Input tensor cannot be empty.")
-
-        # Flatten to [batch_samples, in_features]
-        if len(input_batch.shape) > 2:
-            input_batch = ops.reshape(input_batch, (-1, input_batch.shape[-1]))
-
-        x = ops.cast(input_batch, "float32")
-        n = int(ops.shape(x)[0])
+        x = self._flatten_inputs(inputs)
+        if ops.shape(self.activation_magnitudes)[0] != ops.shape(x)[-1]:
+            raise ValueError(
+                "Activation statistics "
+                f"({ops.shape(self.activation_magnitudes)[0]}) do not match "
+                f"input features ({ops.shape(x)[-1]})."
+            )
+        num_new_samples = int(ops.shape(x)[0])
+        total_samples = self.num_samples + num_new_samples
 
         # Running per-channel mean of |x| via a stable weighted update:
         #   mean <- mean + (batch_mean - mean) * n / (count + n)
         batch_mean = ops.mean(ops.abs(x), axis=0)
-        new_count = self.num_samples + n
         delta = ops.subtract(batch_mean, self.activation_magnitudes)
         self.activation_magnitudes = ops.add(
-            self.activation_magnitudes, ops.multiply(delta, n / new_count)
+            self.activation_magnitudes,
+            ops.multiply(delta, num_new_samples / total_samples),
         )
-        self.num_samples = new_count
+        self.num_samples = total_samples
 
         # Stash a bounded sample of raw activations for the clipping search.
         if (
-            getattr(self.config, "apply_clip", False)
+            self.config.apply_clip
             and self._clip_sample_rows < MAX_CLIP_SAMPLE_ROWS
         ):
-            take = min(n, MAX_CLIP_SAMPLE_ROWS - self._clip_sample_rows)
+            take = min(
+                num_new_samples, MAX_CLIP_SAMPLE_ROWS - self._clip_sample_rows
+            )
             self._clip_samples.append(x[:take])
             self._clip_sample_rows += take
 
-    def quantize_layer(self):
+    def quantize(self):
         """Perform AWQ quantization on the layer.
 
         This method:
@@ -526,24 +514,23 @@ class AWQ:
         2. Quantizes the layer weights
         3. Updates the layer's quantized variables
         """
-        from keras.src import quantizers
-
-        weights_matrix = ops.transpose(self.layer.kernel)
+        weights_transpose = ops.transpose(self._kernel_view())
 
         # Assemble the stashed activation sample for the clipping search.
-        apply_clip = bool(getattr(self.config, "apply_clip", False))
+        apply_clip = self.config.apply_clip
         activation_sample = None
         if apply_clip and self._clip_samples:
             activation_sample = ops.concatenate(self._clip_samples, axis=0)
 
         # Perform AWQ quantization
         quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
-            weights_matrix,
+            weights_transpose,
             self.activation_magnitudes,
             num_grid_points=self.config.num_grid_points,
             group_size=self.config.group_size,
             apply_clip=apply_clip and activation_sample is not None,
             activation_sample=activation_sample,
+            compute_scale_zero=self.compute_scale_zero,
         )
 
         # Cast to uint8 for storage. The algorithm works on `[out, in]`; the
@@ -555,22 +542,21 @@ class AWQ:
         zero = ops.transpose(zero)
 
         # Pack to 4-bit along the output axis.
-        quantized_packed, _, _ = quantizers.pack_int4(
+        quantized, _, _ = quantizers.pack_int4(
             quantized, axis=-1, dtype="uint8"
         )
 
         strategy_registry.get_strategy("awq").write_back(
             self.original_layer,
-            quantized_packed,
+            quantized,
             scale,
             zero,
             g_idx,
             awq_scales=awq_scales,
         )
 
-    def free(self):
-        """Free memory used by the quantizer."""
+    def release(self):
+        """Drops the statistics and the stashed rows."""
         del self.activation_magnitudes
-        del self.layer
         self._clip_samples = []
         self._clip_sample_rows = 0

@@ -6,13 +6,16 @@ from keras.src import layers
 from keras.src import models
 from keras.src import ops
 from keras.src import testing
-from keras.src.quantizers.gptq import GPTQ
+from keras.src.quantizers import strategy_registry
+from keras.src.quantizers.awq import AWQCalibrator
+from keras.src.quantizers.awq_config import AWQConfig
+from keras.src.quantizers.calibration_run import CalibrationRun
+from keras.src.quantizers.calibration_run import _stack_calibration_batch
+from keras.src.quantizers.calibration_run import find_layers_in_block
+from keras.src.quantizers.calibration_run import get_dataloader
+from keras.src.quantizers.calibration_run import stream_inputs
+from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.gptq_core import _stack_calibration_batch
-from keras.src.quantizers.gptq_core import find_layers_in_block
-from keras.src.quantizers.gptq_core import get_dataloader
-from keras.src.quantizers.gptq_core import gptq_quantize
-from keras.src.quantizers.gptq_core import stream_hessians
 
 VOCAB_SIZE = 100
 
@@ -36,6 +39,18 @@ class EmptyBlock(layers.Layer):
 
     def call(self, inputs):
         return self.ln(inputs)
+
+
+class TupleBlock(layers.Layer):
+    """A block that returns its hidden states and a second output."""
+
+    def __init__(self, units, **kwargs):
+        super().__init__(**kwargs)
+        self.dense = layers.Dense(units)
+
+    def call(self, inputs):
+        hidden = self.dense(inputs)
+        return hidden, ops.sum(hidden)
 
 
 class TransformerBlock(layers.Layer):
@@ -110,18 +125,18 @@ def sliding_windows(x, L):
 
 
 @pytest.mark.requires_trainable_backend
-class TestGPTQCore(testing.TestCase):
+class TestCalibrationCore(testing.TestCase):
     @parameterized.named_parameters(
         [("strided", "strided"), ("linspace", "linspace"), ("random", "random")]
     )
-    def test_shape_and_dtype_strings(self, strategy):
+    def test_shape_and_dtype_strings(self, sampling):
         """Test the shape and dtype of the output for string inputs."""
         tok = MockTokenizer()
         dataset = ["a b c d e f g", "h i j k"]
         seq_len, n = 5, 7
 
         out = get_dataloader(
-            tok, seq_len, dataset, num_samples=n, strategy=strategy, seed=123
+            tok, seq_len, dataset, num_samples=n, sampling=sampling, seed=123
         )
         self.assertEqual(out.shape, (n, 1, seq_len))
         self.assertEqual(out.dtype, np.int32)
@@ -129,7 +144,7 @@ class TestGPTQCore(testing.TestCase):
     @parameterized.named_parameters(
         [("strided", "strided"), ("linspace", "linspace"), ("random", "random")]
     )
-    def test_shape_and_dtype_pretokenized(self, strategy):
+    def test_shape_and_dtype_pretokenized(self, sampling):
         """Test the shape and dtype of the output for pre-tokenized inputs."""
         tok = MockTokenizer()
         # Pre-tokenized inputs; mixed shapes (1, L) and (L,)
@@ -141,7 +156,7 @@ class TestGPTQCore(testing.TestCase):
         seq_len, n = 3, 4
 
         out = get_dataloader(
-            tok, seq_len, seqs, num_samples=n, strategy=strategy, seed=7
+            tok, seq_len, seqs, num_samples=n, sampling=sampling, seed=7
         )
         self.assertEqual(out.shape, (n, 1, seq_len))
         self.assertEqual(out.dtype, np.int32)
@@ -150,10 +165,10 @@ class TestGPTQCore(testing.TestCase):
         tok = MockTokenizer()
         dataset = ["a b c d e", "f g h i j k"]
         out1 = get_dataloader(
-            tok, 4, dataset, num_samples=6, strategy="strided", seed=99
+            tok, 4, dataset, num_samples=6, sampling="strided", seed=99
         )
         out2 = get_dataloader(
-            tok, 4, dataset, num_samples=6, strategy="strided", seed=99
+            tok, 4, dataset, num_samples=6, sampling="strided", seed=99
         )
         self.assertTrue(ops.all(ops.equal(out1, out2)))
 
@@ -161,13 +176,13 @@ class TestGPTQCore(testing.TestCase):
         tok = MockTokenizer()
         dataset = ["a b c d e", "f g h i j k"]
         a = get_dataloader(
-            tok, 4, dataset, num_samples=6, strategy="random", seed=123
+            tok, 4, dataset, num_samples=6, sampling="random", seed=123
         )
         b = get_dataloader(
-            tok, 4, dataset, num_samples=6, strategy="random", seed=123
+            tok, 4, dataset, num_samples=6, sampling="random", seed=123
         )
         c = get_dataloader(
-            tok, 4, dataset, num_samples=6, strategy="random", seed=124
+            tok, 4, dataset, num_samples=6, sampling="random", seed=124
         )
         self.assertTrue(ops.all(ops.equal(a, b)))
         self.assertFalse(ops.all(ops.equal(a, c)))
@@ -184,7 +199,7 @@ class TestGPTQCore(testing.TestCase):
 
         expected = sliding_windows(all_tokens, seq_len)[expected_starts]
         got = get_dataloader(
-            tok, seq_len, dataset, num_samples=n, strategy="linspace"
+            tok, seq_len, dataset, num_samples=n, sampling="linspace"
         )
         self.assertTrue(
             ops.all(ops.equal(got[:, 0, :], expected.astype(np.int32)))
@@ -204,7 +219,7 @@ class TestGPTQCore(testing.TestCase):
             seq_len,
             dataset,
             num_samples=n,
-            strategy="strided",
+            sampling="strided",
             stride=stride,
             seed=0,
         )
@@ -230,7 +245,7 @@ class TestGPTQCore(testing.TestCase):
             seq_len,
             dataset,
             num_samples=n,
-            strategy="linspace",
+            sampling="linspace",
             eos_id=eos,
         )
 
@@ -267,7 +282,7 @@ class TestGPTQCore(testing.TestCase):
     def test_calibration_batching_produces_identical_hessian(self):
         """The Hessian accumulated during calibration must be identical
         whether calibration samples are streamed one at a time or in
-        batches. `update_hessian_with_batch` flattens activations to
+        batches. `observe` flattens activations to
         `[-1, features]`, so batching only changes the number of forward
         passes, not the math."""
         d_model = 16
@@ -288,16 +303,20 @@ class TestGPTQCore(testing.TestCase):
 
         def accumulate(batch_size):
             layers_map = find_layers_in_block(block)
-            gptq_objects = {
-                name: GPTQ(layer) for name, layer in layers_map.items()
+            calibrators = {
+                name: GPTQCalibrator(layer)
+                for name, layer in layers_map.items()
             }
-            with stream_hessians(layers_map, gptq_objects):
+            with stream_inputs(layers_map, calibrators):
                 for start in range(0, num_samples, batch_size):
                     batch = _stack_calibration_batch(
                         samples[start : start + batch_size]
                     )
                     _ = block(batch)
-            return {name: obj.hessian for name, obj in gptq_objects.items()}
+            return {
+                name: calibrator.hessian
+                for name, calibrator in calibrators.items()
+            }
 
         unbatched = accumulate(batch_size=1)
         batched = accumulate(batch_size=4)
@@ -308,6 +327,52 @@ class TestGPTQCore(testing.TestCase):
             self.assertAllClose(
                 unbatched[name], batched[name], rtol=1e-5, atol=1e-5
             )
+
+    def test_calibration_batching_produces_identical_magnitudes(self):
+        """AWQ's per-channel mean of `|x|` is the same whether the
+        calibration samples are streamed one at a time or in batches: the
+        running mean is weighted by the rows each update carries."""
+        d_model = 16
+        seq_len = 8
+        num_samples = 8
+
+        block = TransformerBlock()
+        _ = block(ops.zeros((1, seq_len, d_model)))
+
+        rng = np.random.default_rng(0)
+        samples = [
+            ops.convert_to_tensor(
+                rng.standard_normal((1, seq_len, d_model)).astype("float32")
+            )
+            for _ in range(num_samples)
+        ]
+
+        def accumulate(batch_size):
+            layers_map = find_layers_in_block(block)
+            calibrators = {
+                name: AWQCalibrator(layer) for name, layer in layers_map.items()
+            }
+            with stream_inputs(layers_map, calibrators):
+                for start in range(0, num_samples, batch_size):
+                    batch = _stack_calibration_batch(
+                        samples[start : start + batch_size]
+                    )
+                    _ = block(batch)
+            return {
+                name: (calibrator.activation_magnitudes, calibrator.num_samples)
+                for name, calibrator in calibrators.items()
+            }
+
+        unbatched = accumulate(batch_size=1)
+        batched = accumulate(batch_size=4)
+
+        self.assertEqual(set(unbatched.keys()), set(batched.keys()))
+        self.assertGreater(len(unbatched), 0)
+        for name in unbatched:
+            self.assertAllClose(
+                unbatched[name][0], batched[name][0], rtol=1e-5, atol=1e-6
+            )
+            self.assertEqual(unbatched[name][1], batched[name][1])
 
     def test_apply_gptq_on_multi_block_model(self):
         """Tests quantization on a model with multiple blocks."""
@@ -368,12 +433,12 @@ class TestGPTQCore(testing.TestCase):
         config = GPTQConfig(dataset=["test"], tokenizer=MockTokenizer())
         with self.assertRaisesRegex(ValueError, error_message):
             # We pass None as structure to trigger the error
-            gptq_quantize(config, quantization_layer_structure=None)
+            strategy_registry.get_strategy("gptq").calibrate(config, None)
 
 
 class TestExecutionStages(testing.TestCase):
     def test_stages_group_by_shared_input_and_order(self):
-        from keras.src.quantizers.gptq_core import _execution_stages
+        from keras.src.quantizers.calibration_run import _execution_stages
 
         x_attn, x_out, x_mlp, x_down = (
             object(),
@@ -402,7 +467,7 @@ class TestExecutionStages(testing.TestCase):
         )
 
     def test_untraced_layers_join_first_stage(self):
-        from keras.src.quantizers.gptq_core import _execution_stages
+        from keras.src.quantizers.calibration_run import _execution_stages
 
         x = object()
         trace = {"a": (0, x)}
@@ -410,7 +475,7 @@ class TestExecutionStages(testing.TestCase):
         self.assertEqual(stages, [["ghost", "a"]])
 
     def test_no_trace_single_stage(self):
-        from keras.src.quantizers.gptq_core import _execution_stages
+        from keras.src.quantizers.calibration_run import _execution_stages
 
         stages = _execution_stages(["a", "b"], {})
         self.assertEqual(stages, [["a", "b"]])
@@ -442,3 +507,177 @@ class TestDataloaderReproducibility(testing.TestCase):
         self.assertEqual(out.shape, (4, 1, 8))
         self.assertAllClose(out[:, 0, 0], np.array([88, 336, 584, 832]))
         self.assertAllClose(out[0, 0], np.arange(88, 96))
+
+
+def _config(mode, **kwargs):
+    if mode == "gptq":
+        return GPTQConfig(dataset=None, tokenizer=None, **kwargs)
+    return AWQConfig(dataset=None, tokenizer=None, **kwargs)
+
+
+class CalibrationRunTest(testing.TestCase):
+    """One driver for the calibration modes, parameterized by declared
+    settings."""
+
+    def test_declared_settings(self):
+        gptq = strategy_registry.get_strategy("gptq")
+        awq = strategy_registry.get_strategy("awq")
+        self.assertIs(gptq.calibrator_cls, GPTQCalibrator)
+        self.assertIs(awq.calibrator_cls, AWQCalibrator)
+        # Both modes batch their calibration forwards as their config says.
+        for strategy, mode in ((gptq, "gptq"), (awq, "awq")):
+            self.assertEqual(strategy.calibration_batch_size(_config(mode)), 8)
+            self.assertEqual(
+                strategy.calibration_batch_size(
+                    _config(mode, calibration_batch_size=3)
+                ),
+                3,
+            )
+        dense = layers.Dense(4)
+        dense.build((None, 3))
+        self.assertIsInstance(
+            gptq.calibrator_cls(dense, _config("gptq")), GPTQCalibrator
+        )
+        self.assertIsInstance(
+            awq.calibrator_cls(dense, _config("awq")), AWQCalibrator
+        )
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_resolution_error_names_the_received_policy(self, mode):
+        layer = layers.Dense(4)
+        layer.build((None, 3))
+        strategy = strategy_registry.get_strategy(mode)
+        with self.assertRaisesRegex(
+            ValueError,
+            f"{mode.upper()} quantization.*Received: dtype_policy=<.*float32",
+        ):
+            strategy.resolve_group_size(layer, None)
+
+    def test_requires_sequential_blocks(self):
+        strategy = strategy_registry.get_strategy("gptq")
+        with self.assertRaisesRegex(ValueError, "No sequential blocks"):
+            CalibrationRun(strategy, _config("gptq"), {"pre_block_layers": []})
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_calibrate_validates_its_inputs(self, mode):
+        strategy = strategy_registry.get_strategy(mode)
+        name = mode.upper()
+        with self.assertRaisesRegex(
+            ValueError, f"{name} quantization requires a dataset"
+        ):
+            strategy.calibrate(_config(mode), {"sequential_blocks": [1]})
+        config = _config(mode)
+        config.dataset = ["text"]
+        config.tokenizer = lambda text: text
+        with self.assertRaisesRegex(
+            ValueError,
+            f"For '{mode}' mode, a valid quantization structure must be "
+            "provided",
+        ):
+            strategy.calibrate(config, None)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_run_calibrates_every_block_in_order(self, mode):
+        vocab_size, seq_len, embed_dim = 32, 8, 4
+        embedding = layers.Embedding(vocab_size, embed_dim)
+        blocks = [
+            models.Sequential(
+                [layers.Dense(embed_dim, activation="relu"), layers.Dense(4)]
+            )
+            for _ in range(2)
+        ]
+        inputs = layers.Input((seq_len,), dtype="int32")
+        x = embedding(inputs)
+        for block in blocks:
+            x = block(x)
+        model = models.Model(inputs, x)
+        structure = {
+            "pre_block_layers": [embedding],
+            "sequential_blocks": blocks,
+        }
+        kwargs = dict(
+            num_samples=3,
+            sequence_length=seq_len,
+            group_size=-1,
+            calibration_batch_size=2,
+        )
+        if mode == "awq":
+            kwargs["num_grid_points"] = 3
+        config = _config(mode, **kwargs)
+        config.quantization_layer_structure = structure
+        rng = np.random.default_rng(0)
+        dataset = [
+            rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
+            for _ in range(4)
+        ]
+        for block in blocks:
+            for dense in block.layers:
+                dense.quantize(mode, config=config)
+                self.assertTrue(dense.calibration_pending)
+
+        strategy = strategy_registry.get_strategy(mode)
+        run = CalibrationRun(strategy, config, structure)
+        self.assertEqual(run.batch_size, 2)
+        run.run(dataset)
+        self.assertEqual(run.num_samples, 3)
+        for block in blocks:
+            for dense in block.layers:
+                self.assertFalse(dense.calibration_pending)
+        outputs = ops.convert_to_numpy(model(dataset[0]))
+        self.assertTrue(np.isfinite(outputs).all())
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_run_takes_the_first_output_of_a_block(self, mode):
+        # A block that returns `(hidden, cache)` hands its first output on.
+        vocab_size, seq_len, embed_dim = 32, 8, 4
+        embedding = layers.Embedding(vocab_size, embed_dim)
+        blocks = [TupleBlock(embed_dim) for _ in range(2)]
+        structure = {
+            "pre_block_layers": [embedding],
+            "sequential_blocks": blocks,
+        }
+        config = _config(
+            mode, num_samples=2, sequence_length=seq_len, group_size=-1
+        )
+        if mode == "awq":
+            config.num_grid_points = 3
+        x = embedding(np.zeros((1, seq_len), "int32"))
+        for block in blocks:
+            block(x)
+            block.dense.quantize(mode, config=config)
+        rng = np.random.default_rng(1)
+        dataset = [
+            rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
+            for _ in range(2)
+        ]
+        strategy = strategy_registry.get_strategy(mode)
+        CalibrationRun(strategy, config, structure).run(dataset)
+        for block in blocks:
+            self.assertFalse(block.dense.calibration_pending)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_run_skips_blocks_without_quantizable_layers(self, mode):
+        vocab_size, seq_len, embed_dim = 32, 8, 4
+        embedding = layers.Embedding(vocab_size, embed_dim)
+        empty = EmptyBlock()
+        block = models.Sequential([layers.Dense(4)])
+        structure = {
+            "pre_block_layers": [embedding],
+            "sequential_blocks": [empty, block],
+        }
+        config = _config(
+            mode, num_samples=2, sequence_length=seq_len, group_size=-1
+        )
+        if mode == "awq":
+            config.num_grid_points = 3
+        x = embedding(np.zeros((1, seq_len), "int32"))
+        block(empty(x))
+        block.layers[0].quantize(mode, config=config)
+        rng = np.random.default_rng(2)
+        dataset = [
+            rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
+            for _ in range(2)
+        ]
+        strategy = strategy_registry.get_strategy(mode)
+        CalibrationRun(strategy, config, structure).run(dataset)
+        self.assertFalse(block.layers[0].calibration_pending)

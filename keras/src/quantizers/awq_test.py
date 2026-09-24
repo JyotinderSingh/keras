@@ -1,5 +1,6 @@
 """Tests for AWQ quantization."""
 
+import math
 import os
 
 import numpy as np
@@ -13,7 +14,7 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
-from keras.src.quantizers.awq import AWQ
+from keras.src.quantizers.awq import AWQCalibrator
 from keras.src.quantizers.awq import _get_weight_scale
 from keras.src.quantizers.awq import awq_quantize_matrix
 from keras.src.quantizers.awq import awq_search_best_clip
@@ -99,7 +100,7 @@ class AWQAlgorithmTest(testing.TestCase):
         sample = RNG.standard_normal((128, 32)).astype("float32")
 
         best_max, gs, n_group = awq_search_best_clip(
-            weights_scaled, sample, scales, group_size=8, n_grid=20
+            weights_scaled, sample, scales, group_size=8, num_grid_points=20
         )
         self.assertEqual(gs, 8)
         self.assertEqual(n_group, 4)
@@ -356,16 +357,16 @@ class AWQLayerTest(testing.TestCase):
         )
 
         layer.quantize(config=config)
-        awq_obj = AWQ(layer, config)
+        calibrator = AWQCalibrator(layer, config)
 
         # Simulate activation capture
         calibration_data = RNG.standard_normal((64, 16)).astype("float32")
-        awq_obj.update_activation_magnitudes(calibration_data)
+        calibrator.observe(calibration_data)
 
-        self.assertEqual(awq_obj.num_samples, 64)
+        self.assertEqual(calibrator.num_samples, 64)
         # Activation magnitudes should be non-negative
         self.assertTrue(
-            ops.all(ops.greater_equal(awq_obj.activation_magnitudes, 0))
+            ops.all(ops.greater_equal(calibrator.activation_magnitudes, 0))
         )
 
     def test_awq_activation_accumulation(self):
@@ -382,22 +383,22 @@ class AWQLayerTest(testing.TestCase):
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=10
         )
         layer.quantize(config=config)
-        awq_obj = AWQ(layer, config)
+        calibrator = AWQCalibrator(layer, config)
 
         # First batch.
         batch1 = RNG.standard_normal((10, 16)).astype("float32")
-        awq_obj.update_activation_magnitudes(batch1)
+        calibrator.observe(batch1)
 
         # Second batch with a different row count to exercise the weighting.
         batch2 = ops.add(RNG.standard_normal((30, 16)).astype("float32"), 1.0)
-        awq_obj.update_activation_magnitudes(batch2)
+        calibrator.observe(batch2)
 
         # Running mean must equal the mean of |x| over all rows.
         combined = ops.concatenate([ops.abs(batch1), ops.abs(batch2)], axis=0)
         expected_mean = ops.mean(combined, axis=0)
-        self.assertEqual(awq_obj.num_samples, 40)
+        self.assertEqual(calibrator.num_samples, 40)
         self.assertAllClose(
-            awq_obj.activation_magnitudes, expected_mean, atol=1e-6
+            calibrator.activation_magnitudes, expected_mean, atol=1e-6
         )
 
     def test_awq_clip_sample_capture(self):
@@ -411,19 +412,19 @@ class AWQLayerTest(testing.TestCase):
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=5
         )
         layer.quantize(config=config)
-        awq_obj = AWQ(layer, config)
+        calibrator = AWQCalibrator(layer, config)
 
         # Feed more rows than the cap across several batches.
         for _ in range(4):
             batch = RNG.standard_normal((MAX_CLIP_SAMPLE_ROWS // 2, 16)).astype(
                 "float32"
             )
-            awq_obj.update_activation_magnitudes(batch)
+            calibrator.observe(batch)
 
         # The stash is bounded by MAX_CLIP_SAMPLE_ROWS.
-        self.assertEqual(awq_obj._clip_sample_rows, MAX_CLIP_SAMPLE_ROWS)
+        self.assertEqual(calibrator._clip_sample_rows, MAX_CLIP_SAMPLE_ROWS)
         total_rows = int(
-            sum(int(ops.shape(s)[0]) for s in awq_obj._clip_samples)
+            sum(int(ops.shape(s)[0]) for s in calibrator._clip_samples)
         )
         self.assertEqual(total_rows, MAX_CLIP_SAMPLE_ROWS)
 
@@ -440,12 +441,10 @@ class AWQLayerTest(testing.TestCase):
             apply_clip=False,
         )
         layer.quantize(config=config)
-        awq_obj = AWQ(layer, config)
-        awq_obj.update_activation_magnitudes(
-            RNG.standard_normal((32, 16)).astype("float32")
-        )
-        self.assertEqual(awq_obj._clip_sample_rows, 0)
-        self.assertEqual(awq_obj._clip_samples, [])
+        calibrator = AWQCalibrator(layer, config)
+        calibrator.observe(RNG.standard_normal((32, 16)).astype("float32"))
+        self.assertEqual(calibrator._clip_sample_rows, 0)
+        self.assertEqual(calibrator._clip_samples, [])
 
     def test_awq_layer_variables_created(self):
         """Test that AWQ layer variables are properly created."""
@@ -834,9 +833,9 @@ class AWQAccuracyTest(testing.TestCase):
         )
         layer.quantize(config=config)
 
-        awq_obj = AWQ(layer, config)
-        awq_obj.update_activation_magnitudes(calibration_data)
-        awq_obj.quantize_layer()
+        calibrator = AWQCalibrator(layer, config)
+        calibrator.observe(calibration_data)
+        calibrator.quantize()
 
         # Verify layer variables have correct shapes for grouped quantization
         if group_size > 0:
@@ -879,7 +878,7 @@ class AWQAccuracyTest(testing.TestCase):
             f"relative_mse={relative_mse:.4f}",
         )
 
-        awq_obj.free()
+        calibrator.release()
 
     def test_awq_save_load_round_trip(self):
         """Full AWQ quantize -> save -> load round trip.
@@ -1007,26 +1006,26 @@ class AWQAccuracyTest(testing.TestCase):
             },
         )
 
-        hook_calls = [0]
+        observe_calls = [0]
         max_magnitude = [0.0]
-        original_update = AWQ.update_activation_magnitudes
+        original_observe = AWQCalibrator.observe
 
-        def spy_update(awq_self, inp):
-            hook_calls[0] += 1
-            result = original_update(awq_self, inp)
-            magnitudes = ops.convert_to_numpy(awq_self.activation_magnitudes)
+        def spy_observe(calibrator, inp):
+            observe_calls[0] += 1
+            result = original_observe(calibrator, inp)
+            magnitudes = ops.convert_to_numpy(calibrator.activation_magnitudes)
             max_magnitude[0] = max(
                 max_magnitude[0], float(np.abs(magnitudes).max())
             )
             return result
 
-        AWQ.update_activation_magnitudes = spy_update
+        AWQCalibrator.observe = spy_observe
         try:
             model.quantize("awq", config=config)
         finally:
-            AWQ.update_activation_magnitudes = original_update
+            AWQCalibrator.observe = original_observe
 
-        self.assertGreater(hook_calls[0], 0)
+        self.assertGreater(observe_calls[0], 0)
         # All-zero magnitudes would be replaced with ones, making the
         # scale search activation-blind.
         self.assertGreater(max_magnitude[0], 0.0)
@@ -1072,29 +1071,30 @@ class AWQAccuracyTest(testing.TestCase):
         """AWQ must re-capture downstream statistics between stages.
 
         The two chained Dense layers form two execution stages. The first
-        sweep captures both layers (2 hook calls per sample); after the
-        first Dense is quantized, the second Dense's statistics must be
+        sweep captures both layers (2 hook calls per forward pass); after
+        the first Dense is quantized, the second Dense's statistics must be
         re-captured against the quantized upstream activations (1 more
-        call per sample). A single-sweep implementation records only
-        2 * num_samples calls.
+        call per forward pass). A single-sweep implementation records only
+        2 calls per forward pass.
         """
         num_samples = 4
         model, config = self._tiny_awq_model_and_config(num_samples)
 
-        hook_calls = [0]
-        original_update = AWQ.update_activation_magnitudes
+        observe_calls = [0]
+        original_observe = AWQCalibrator.observe
 
-        def spy_update(awq_self, inp):
-            hook_calls[0] += 1
-            return original_update(awq_self, inp)
+        def spy_observe(calibrator, inp):
+            observe_calls[0] += 1
+            return original_observe(calibrator, inp)
 
-        AWQ.update_activation_magnitudes = spy_update
+        AWQCalibrator.observe = spy_observe
         try:
             model.quantize("awq", config=config)
         finally:
-            AWQ.update_activation_magnitudes = original_update
+            AWQCalibrator.observe = original_observe
 
-        self.assertEqual(hook_calls[0], 3 * num_samples)
+        forwards = math.ceil(num_samples / config.calibration_batch_size)
+        self.assertEqual(observe_calls[0], 3 * forwards)
 
     def test_awq_calibration_runs_without_grad_tracking(self):
         """Calibration forwards must not build autograd graphs on torch.
@@ -1108,17 +1108,17 @@ class AWQAccuracyTest(testing.TestCase):
         model, config = self._tiny_awq_model_and_config()
 
         graph_free = [True]
-        original_update = AWQ.update_activation_magnitudes
+        original_observe = AWQCalibrator.observe
 
-        def spy_update(awq_self, inp):
+        def spy_observe(calibrator, inp):
             if getattr(inp, "grad_fn", None) is not None:
                 graph_free[0] = False
-            return original_update(awq_self, inp)
+            return original_observe(calibrator, inp)
 
-        AWQ.update_activation_magnitudes = spy_update
+        AWQCalibrator.observe = spy_observe
         try:
             model.quantize("awq", config=config)
         finally:
-            AWQ.update_activation_magnitudes = original_update
+            AWQCalibrator.observe = original_observe
 
         self.assertTrue(graph_free[0])

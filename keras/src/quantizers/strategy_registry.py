@@ -75,6 +75,9 @@ class QuantizationStrategy:
     # (pre-block layers + sequential blocks) before mutating any layer.
     requires_layer_structure = False
 
+    # Whether a layer quantized with this mode can enable LoRA.
+    supports_lora = True
+
     # --- Config resolution ------------------------------------------------
 
     def default_config(self):

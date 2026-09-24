@@ -954,6 +954,24 @@ class DenseTest(testing.TestCase):
         expected = quantizers.unpack_int4(packed_kernel, layer.units, axis=-1)
         self.assertAllClose(layer.kernel, expected)
 
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_calibration_modes_refuse_lora(self, mode):
+        # Not supported yet: the calibration forward has no term for a
+        # LoRA update and a merged save cannot re-quantize onto the
+        # calibrated grid; both modes say so.
+        if mode == "gptq":
+            config = GPTQConfig(dataset=None, tokenizer=None)
+        else:
+            config = AWQConfig(dataset=None, tokenizer=None)
+        layer = layers.Dense(4)
+        layer.build((None, 3))
+        layer.quantize(mode, config=config)
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            f"lora is not currently supported with {mode.upper()}",
+        ):
+            layer.enable_lora(2)
+
     def test_legacy_load_own_variables(self):
         # In previous versions, `load_own_variables` accepted a store with
         # numeric keys.
@@ -1006,10 +1024,10 @@ class DenseTest(testing.TestCase):
             "1": np.random.randint(0, 16, size=(8, 8), dtype="uint8"),  # kernel
             "2": np.random.random((1, 16)).astype("float32"),  # scale
             "3": np.random.random((1, 16)).astype("uint8"),  # zero
-            "4": np.random.random((8,)).astype("float32"),  # awq_scales
             # g_idx saved as int32 by a newer checkpoint; the cast on load
             # brings it into the float32 storage variable (see above).
-            "5": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="int32"),
+            "4": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="int32"),
+            "5": np.random.random((8,)).astype("float32"),  # awq_scales
         }
 
         # Test float32 layer.
@@ -1070,8 +1088,8 @@ class DenseTest(testing.TestCase):
         self.assertAllClose(layer.quantized_kernel, awq_store["1"])
         self.assertAllClose(layer.kernel_scale, awq_store["2"])
         self.assertAllClose(layer.kernel_zero, awq_store["3"])
-        self.assertAllClose(layer.awq_scales, awq_store["4"])
-        self.assertAllClose(layer.g_idx, awq_store["5"])
+        self.assertAllClose(layer.g_idx, awq_store["4"])
+        self.assertAllClose(layer.awq_scales, awq_store["5"])
         # The int32-saved g_idx is cast to the float32 variable on load.
         self.assertDType(layer.g_idx, "float32")
 

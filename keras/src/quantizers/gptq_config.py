@@ -4,146 +4,89 @@ from keras.src.quantizers.quantization_config import QuantizationConfig
 
 @keras_export("keras.quantizers.GPTQConfig")
 class GPTQConfig(QuantizationConfig):
-    """Configuration class for the GPTQ (Gradient-based Post-Training
-    Quantization) algorithm.
+    """Configuration class for GPTQ (Accurate Post-Training Quantization).
 
-    GPTQ is a post-training quantization method that quantizes neural network
-    weights to lower precision (e.g., 4-bit) while minimizing the impact on
-    model accuracy. It works by analyzing the Hessian matrix of the loss
-    function with respect to the weights and applying optimal quantization
-    that preserves the most important weight values.
+    GPTQ is a post-training quantization method that quantizes weights to
+    2, 3, 4 or 8 bits while minimizing the impact on model accuracy. It
+    accumulates the Hessian of each layer's inputs over calibration data,
+    quantizes the weights one column at a time, and corrects the columns
+    still to come for the quantization error already made.
 
-    **When to use GPTQ:**
-    - You want to reduce model size and memory usage
-    - You need faster inference on hardware that supports low-precision
-      operations
-    - You want to maintain model accuracy as much as possible
-    - You have a pre-trained model that you want to quantize without
-      retraining
+    Methodology:
+    1. Collects the Hessian of each layer's inputs from calibration data
+    2. Quantizes the weights column by column with error correction
+    3. Reorders the columns by importance (optional)
+    4. Quantizes a block's layers in execution order, re-estimating the
+       Hessians of later layers on the quantized activations
 
-    **How it works:**
-    1. Uses calibration data to compute the Hessian matrix for each layer
-    2. Applies iterative quantization with error correction
-    3. Reorders weights based on activation importance (optional)
-    4. Quantizes weights while minimizing quantization error
-
-    **Example usage:**
-    ```python
-    from keras.quantizers import GPTQConfig
-    from keras import Model
-
-    # Create configuration for 4-bit quantization
-    config = GPTQConfig(
-        dataset=calibration_data,          # Your calibration dataset
-        tokenizer=your_tokenizer,          # Tokenizer for text data
-        weight_bits=4,                     # Quantize to 4 bits
-        num_samples=128,                   # Number of calibration samples
-        sequence_length=512,               # Sequence length for each sample
-        hessian_damping=0.01,             # Hessian stabilization factor
-        group_size=128,                    # Weight grouping for quantization
-        symmetric=False,                   # Use asymmetric quantization
-        activation_order=True              # Reorder weights by importance
-    )
-
-    # Apply quantization to your model
-    model = Model(...)  # Your pre-trained model
-    model.quantize("gptq", config=config)
-
-    # The model now has quantized weights and can be used for inference
-    ```
-
-    **Benefits:**
-    - **Memory reduction**: 4-bit quantization reduces memory by ~8x compared
-      to float32
-    - **Faster inference**: Lower precision operations are faster on supported
-      hardware
-    - **Accuracy preservation**: Minimizes accuracy loss through optimal
-      quantization
-    - **No retraining required**: Works with pre-trained models
-
-    **Advanced usage examples:**
-
-    **Per-channel quantization (recommended for most cases):**
-    ```python
-    config = GPTQConfig(
-        dataset=calibration_data,
-        tokenizer=tokenizer,
-        weight_bits=4,
-        group_size=-1,  # -1 enables per-channel quantization
-        symmetric=False
-    )
-    ```
-
-    **Grouped quantization (for specific hardware requirements):**
-    ```python
-    config = GPTQConfig(
-        dataset=calibration_data,
-        tokenizer=tokenizer,
-        weight_bits=4,
-        group_size=64,  # 64 weights share the same scale factor
-        symmetric=True   # Use symmetric quantization
-    )
-    ```
-
-    **High-accuracy quantization with activation ordering:**
-    ```python
-    config = GPTQConfig(
-        dataset=calibration_data,
-        tokenizer=tokenizer,
-        weight_bits=4,
-        activation_order=True,  # Reorder weights by importance
-        hessian_damping=0.005,  # Lower damping for more precise
-        # quantization
-        num_samples=256          # More samples for better accuracy
-    )
-    ```
-
-    **References:**
-    - Original GPTQ paper: "GPTQ: Accurate Post-Training Quantization
-      for Generative Pre-trained Transformers"
-    - Implementation based on: https://github.com/IST-DASLab/gptq
-    - Suitable for: Transformer models, large language models, and other
-      deep neural networks
-
-    **Note:** The quality of quantization depends heavily on the calibration
-    dataset. Use representative data that covers the expected input
-    distribution for best results.
+    References:
+    - Original GPTQ paper: "GPTQ: Accurate Post-Training Quantization for
+      Generative Pre-trained Transformers" (https://arxiv.org/abs/2210.17323)
+    - Reference implementation: https://github.com/IST-DASLab/gptq
 
     Args:
         dataset: The calibration dataset. It can be an iterable that yields
             strings or pre-tokenized numerical tensors (e.g., a list of
             strings, a generator, or a NumPy array). This data is used to
             analyze the model's activations.
-        tokenizer: A `keras_nlp.Tokenizer` instance (or a similar callable)
-            that is used to process the `dataset` if it contains strings.
-        weight_bits: (int, optional) The number of bits to quantize weights to.
-            Defaults to 4.
-        num_samples: (int, optional) The number of calibration data samples to
-            use from the dataset. Defaults to 128.
-        calibration_batch_size: (int, optional) The number of calibration
-            samples to run through each block per forward pass during
-            calibration. Larger values reduce the number of forward passes
-            (and therefore wall-clock calibration time) without changing the
-            quantization result, at the cost of higher peak activation memory.
-            Defaults to 8.
-        sequence_length: (int, optional) The sequence length to use for each
-            calibration sample. Defaults to 512.
-        hessian_damping: (float, optional) The % of Hessian damping to use for
-            stabilization during inverse calculation. Defaults to 0.01.
-        group_size: (int, optional) The size of weight groups to quantize
-            together. A `group_size` of -1 indicates per-channel quantization.
+        tokenizer: A tokenizer instance (or a similar callable) that is used
+            to process the `dataset` if it contains strings.
+        weight_bits: The number of bits to quantize weights to. Supported
+            values are 2, 3, 4 and 8. Defaults to 4.
+        num_samples: The number of calibration data samples to use from the
+            dataset. Defaults to 128.
+        calibration_batch_size: The number of calibration samples to run
+            through each block per forward pass during calibration. Larger
+            values reduce the number of forward passes (and therefore
+            wall-clock calibration time) at the cost of higher peak
+            activation memory. The Hessian accumulates over the observed
+            rows, so the result is the same up to floating-point
+            accumulation order. Defaults to 8.
+        per_channel: Whether the scale and zero point are computed per
+            output channel. If `False`, one scale covers the whole kernel.
+            Defaults to `True`.
+        sequence_length: The sequence length to use for each calibration
+            sample. Defaults to 512.
+        hessian_damping: The fraction of the mean Hessian diagonal added to
+            the diagonal for stabilization before inversion. Defaults to
+            0.01.
+        group_size: The size of weight groups to quantize together. A
+            `group_size` of -1 means one group spanning all input features:
+            per-channel, or whole-tensor when `per_channel=False`.
             Defaults to 128.
-        symmetric: (bool, optional) If `True`, uses symmetric quantization.
-            If `False`, uses asymmetric quantization. Defaults to `False`.
-        activation_order: (bool, optional) If `True`, reorders weight columns
-            based on activation magnitude, which can improve quantization
-            accuracy. Defaults to `False`.
-        quantization_layer_structure: (dict, optional) A dictionary defining the
-            model's quantization structure. It should contain:
-            - "pre_block_layers": list of layers to run before the first block.
-            - "sequential_blocks": list of blocks to be quantized sequentially.
+        symmetric: If `True`, uses symmetric quantization. If `False`, uses
+            asymmetric quantization. Defaults to `False`.
+        activation_order: If `True`, reorders weight columns by the Hessian
+            diagonal so the most salient columns are quantized first, which
+            can improve quantization accuracy. Defaults to `False`.
+        quantization_layer_structure: A dictionary defining the model's
+            quantization structure. It should contain:
+            - "pre_block_layers": list of layers to run before the first
+              block (e.g., embedding layer).
+            - "sequential_blocks": list of transformer blocks to quantize
+              sequentially.
             If not provided, the model must implement
             `get_quantization_layer_structure`.
+
+    Example:
+    ```python
+    from keras.quantizers import GPTQConfig
+
+    # Create configuration for 4-bit GPTQ quantization
+    config = GPTQConfig(
+        dataset=calibration_data,          # Your calibration dataset
+        tokenizer=your_tokenizer,          # Tokenizer for text data
+        weight_bits=4,                     # Quantize to 4 bits
+        num_samples=128,                   # Number of calibration samples
+        sequence_length=512,               # Sequence length for each sample
+        group_size=128,                    # Weight grouping for quantization
+        activation_order=True,             # Reorder columns by importance
+    )
+
+    # Apply quantization to your model
+    model.quantize("gptq", config=config)
+    ```
+
     """
 
     def __init__(
@@ -197,6 +140,18 @@ class GPTQConfig(QuantizationConfig):
         self.activation_order = activation_order
         self.quantization_layer_structure = quantization_layer_structure
 
+    @property
+    def mode(self):
+        return "gptq"
+
+    def dtype_policy_string(self):
+        """Returns the dtype policy string for this configuration.
+
+        Returns:
+            A string representing the dtype policy, e.g. "gptq/4/128".
+        """
+        return f"gptq/{self.weight_bits}/{self.group_size}"
+
     def get_config(self):
         return {
             # Dataset, tokenizer and quantization layer structure are only
@@ -220,15 +175,3 @@ class GPTQConfig(QuantizationConfig):
     @classmethod
     def from_config(cls, config):
         return cls(**config)
-
-    @property
-    def mode(self):
-        return "gptq"
-
-    def dtype_policy_string(self):
-        """Returns the dtype policy string for this configuration.
-
-        Returns:
-            A string representing the dtype policy, e.g. "gptq_4bit".
-        """
-        return f"gptq/{self.weight_bits}/{self.group_size}"

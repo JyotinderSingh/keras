@@ -208,9 +208,14 @@ class Dense(Layer):
             raise ValueError(
                 "lora is already enabled. This can only be done once per layer."
             )
-        if self.quantization_mode == "gptq":
+        mode = self.quantization_mode
+        if (
+            mode is not None
+            and not strategy_registry.get_strategy(mode).supports_lora
+        ):
             raise NotImplementedError(
-                "lora is not currently supported with GPTQ quantization."
+                f"lora is not currently supported with {mode.upper()} "
+                "quantization."
             )
         self._tracker.unlock()
         # `kernel` is the unpacked kernel in its own shape whatever the
@@ -401,8 +406,8 @@ class Dense(Layer):
                 "quantized_kernel",
                 "kernel_scale",
                 "kernel_zero",
-                "awq_scales",
                 "g_idx",
+                "awq_scales",
             ],
         }
 

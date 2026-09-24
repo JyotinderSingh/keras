@@ -20,11 +20,23 @@ class AWQConfigTest(testing.TestCase):
         config = AWQConfig(dataset=["test"], tokenizer=self.MockTokenizer())
         self.assertEqual(config.weight_bits, 4)
         self.assertEqual(config.num_samples, 128)
+        self.assertEqual(config.calibration_batch_size, 8)
         self.assertEqual(config.sequence_length, 512)
         self.assertEqual(config.group_size, 128)
         self.assertEqual(config.num_grid_points, 20)
         self.assertTrue(config.apply_clip)
         self.assertEqual(config.mode, "awq")
+
+    def test_config_invalid_calibration_batch_size(self):
+        for value in (0, -4):
+            with self.assertRaisesRegex(
+                ValueError, "calibration_batch_size must be a positive"
+            ):
+                AWQConfig(
+                    dataset=["test"],
+                    tokenizer=self.MockTokenizer(),
+                    calibration_batch_size=value,
+                )
 
     def test_config_custom_values(self):
         """Test custom configuration values."""
@@ -94,11 +106,14 @@ class AWQConfigTest(testing.TestCase):
             tokenizer=self.MockTokenizer(),
             group_size=64,
             num_grid_points=30,
+            calibration_batch_size=16,
         )
         cfg = config.get_config()
         self.assertEqual(cfg["weight_bits"], 4)
         self.assertEqual(cfg["group_size"], 64)
         self.assertEqual(cfg["num_grid_points"], 30)
+        self.assertEqual(cfg["calibration_batch_size"], 16)
+        self.assertEqual(AWQConfig.from_config(cfg).calibration_batch_size, 16)
         self.assertTrue(cfg["apply_clip"])
         # Dataset and tokenizer should not be serialized
         self.assertIsNone(cfg["dataset"])

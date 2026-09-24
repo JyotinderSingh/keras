@@ -13,11 +13,11 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
-from keras.src.quantizers.gptq import GPTQ
+from keras.src.quantizers.calibration_run import find_layers_in_block
+from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq import _stable_permutation
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
-from keras.src.quantizers.gptq_core import find_layers_in_block
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
@@ -94,35 +94,35 @@ class GPTQTest(testing.TestCase):
     def test_initialization_with_dense_layer(self):
         mock_layer = _get_test_layer("Dense", kernel_shape=(64, 128))
 
-        gptq_instance = GPTQ(mock_layer)
-        self.assertEqual(gptq_instance.rows, 64)
-        self.assertEqual(gptq_instance.columns, 128)
-        self.assertEqual(gptq_instance.hessian.shape, (64, 64))
+        calibrator = GPTQCalibrator(mock_layer)
+        self.assertEqual(calibrator.rows, 64)
+        self.assertEqual(calibrator.columns, 128)
+        self.assertEqual(calibrator.hessian.shape, (64, 64))
 
     def test_initialization_with_einsumdense_3d(self):
         mock_layer = _get_test_layer("EinsumDense", kernel_shape=(64, 4, 32))
-        gptq_instance = GPTQ(mock_layer)
-        self.assertEqual(gptq_instance.rows, 64)
-        self.assertEqual(gptq_instance.columns, 4 * 32)
-        self.assertEqual(gptq_instance.hessian.shape, (64, 64))
+        calibrator = GPTQCalibrator(mock_layer)
+        self.assertEqual(calibrator.rows, 64)
+        self.assertEqual(calibrator.columns, 4 * 32)
+        self.assertEqual(calibrator.hessian.shape, (64, 64))
 
     def test_update_hessian(self):
         dense = _get_test_layer("Dense", kernel_shape=(16, 32))
-        dense_gptq = GPTQ(dense)
+        calibrator = GPTQCalibrator(dense)
 
         rng = np.random.default_rng(seed=42)
         batch1 = rng.standard_normal(size=(8, 16)).astype("float32")
 
-        dense_gptq.update_hessian_with_batch(batch1)
-        self.assertEqual(dense_gptq.num_samples, 8)
-        H1 = dense_gptq.hessian
+        calibrator.observe(batch1)
+        self.assertEqual(calibrator.num_samples, 8)
+        H1 = calibrator.hessian
 
         batch2 = rng.standard_normal(size=(4, 16)).astype("float32")
 
-        dense_gptq.update_hessian_with_batch(batch2)
-        self.assertEqual(dense_gptq.num_samples, 12)
+        calibrator.observe(batch2)
+        self.assertEqual(calibrator.num_samples, 12)
 
-        H2 = dense_gptq.hessian
+        H2 = calibrator.hessian
 
         self.assertNotAllClose(H1, H2)
 
@@ -139,21 +139,21 @@ class GPTQTest(testing.TestCase):
         )
 
         dense.quantize("gptq", config=config)
-        dense_gptq = GPTQ(
+        calibrator = GPTQCalibrator(
             dense,
             config,
         )
 
         calibration_data = rng.standard_normal(size=(128, 16)).astype("float32")
 
-        dense_gptq.update_hessian_with_batch(calibration_data)
-        dense_gptq.quantize_and_correct_layer()
+        calibrator.observe(calibration_data)
+        calibrator.quantize()
 
         self.assertEqual(backend.standardize_dtype(dense.kernel.dtype), "uint8")
 
-        dense_gptq.free()
-        self.assertIsNone(getattr(dense_gptq, "hessian", None))
-        self.assertIsNone(getattr(dense_gptq, "layer", None))
+        calibrator.release()
+        self.assertIsNone(getattr(calibrator, "hessian", None))
+        self.assertIsNone(getattr(calibrator, "layer", None))
 
     def _calibrate_gptq_dense(self, kernel_shape, weight_bits, group_size):
         rng = np.random.default_rng(seed=7)
@@ -166,11 +166,11 @@ class GPTQTest(testing.TestCase):
             group_size=group_size,
         )
         dense.quantize("gptq", config=config)
-        gptq = GPTQ(dense, config)
-        gptq.update_hessian_with_batch(
+        gptq = GPTQCalibrator(dense, config)
+        gptq.observe(
             rng.standard_normal((128, kernel_shape[0])).astype("float32")
         )
-        gptq.quantize_and_correct_layer()
+        gptq.quantize()
         return dense
 
     def test_gptq_2bit_packing_end_to_end(self):
@@ -234,19 +234,19 @@ class GPTQTest(testing.TestCase):
     def test_unsupported_layer_error(self):
         unsupported_layer = _get_test_layer("Unsupported", kernel_shape=None)
         with self.assertRaisesRegex(TypeError, "Unsupported layer type"):
-            GPTQ(unsupported_layer)
+            GPTQCalibrator(unsupported_layer)
 
     def test_update_hessian_invalid_input(self):
         rng = np.random.default_rng(seed=42)
         dense = _get_test_layer("Dense", kernel_shape=(16, 32))
-        gptq_instance = GPTQ(dense)
+        calibrator = GPTQCalibrator(dense)
         with self.assertRaisesRegex(ValueError, "cannot be None"):
-            gptq_instance.update_hessian_with_batch(None)
+            calibrator.observe(None)
         with self.assertRaisesRegex(ValueError, "cannot be empty"):
-            gptq_instance.update_hessian_with_batch(np.empty((0, 16)))
+            calibrator.observe(np.empty((0, 16)))
         with self.assertRaisesRegex(ValueError, "match input features"):
             bad_input = rng.standard_normal(size=(8, 99))
-            gptq_instance.update_hessian_with_batch(bad_input)
+            calibrator.observe(bad_input)
 
     def test_streaming_equals_big_batch(self):
         """Tests that streaming updates match big batch updates."""
@@ -257,15 +257,15 @@ class GPTQTest(testing.TestCase):
         layer_1 = layers.Dense(5, use_bias=False)
         layer_1.build(input_shape=(None, 7))
 
-        g1 = GPTQ(layer_1)
-        g1.update_hessian_with_batch(x)
+        g1 = GPTQCalibrator(layer_1)
+        g1.observe(x)
 
         # Streamed hessian update
         layer_2 = layers.Dense(5, use_bias=False)
         layer_2.build(input_shape=(None, 7))
-        g2 = GPTQ(layer_2)
-        g2.update_hessian_with_batch(x[:50])
-        g2.update_hessian_with_batch(x[50:])
+        g2 = GPTQCalibrator(layer_2)
+        g2.observe(x[:50])
+        g2.observe(x[50:])
 
         # Both the one-shot and streamed hessian updates should match
         self.assertAllClose(g1.hessian, g2.hessian, rtol=1e-6, atol=1e-6)
@@ -275,8 +275,8 @@ class GPTQTest(testing.TestCase):
         x = ops.array(np.random.randn(128, 7), "float32")
         layer = layers.Dense(5, use_bias=False)
         layer.build((None, 7))
-        g = GPTQ(layer)
-        g.update_hessian_with_batch(x)
+        g = GPTQCalibrator(layer)
+        g.observe(x)
 
         expected = ops.multiply(
             ops.divide(2.0, x.shape[0]), ops.matmul(ops.transpose(x), x)
@@ -291,13 +291,13 @@ class GPTQTest(testing.TestCase):
 
         layer1 = layers.Dense(5, use_bias=False)
         layer1.build((None, 7))
-        g1 = GPTQ(layer1)
-        g1.update_hessian_with_batch(x)
+        g1 = GPTQCalibrator(layer1)
+        g1.observe(x)
 
         layer2 = layers.Dense(5, use_bias=False)
         layer2.build((None, 7))
-        g2 = GPTQ(layer2)
-        g2.update_hessian_with_batch(x_flat)
+        g2 = GPTQCalibrator(layer2)
+        g2.observe(x_flat)
 
         self.assertAllClose(g1.hessian, g2.hessian, rtol=1e-6, atol=1e-6)
 
@@ -305,17 +305,15 @@ class GPTQTest(testing.TestCase):
         x = ops.array(np.random.randn(8, 7), "float32")
         layer = layers.Dense(5, use_bias=False)
         layer.build((None, 6))  # wrong in_features
-        g = GPTQ(layer)
+        g = GPTQCalibrator(layer)
 
         with self.assertRaisesRegex(ValueError, "do not match input features"):
-            g.update_hessian_with_batch(x)
+            g.observe(x)
 
         with self.assertRaisesRegex(ValueError, "cannot be None"):
-            g.update_hessian_with_batch(None)
+            g.observe(None)
         with self.assertRaisesRegex(ValueError, "cannot be empty"):
-            g.update_hessian_with_batch(
-                ops.array(np.empty((0, 7), dtype="float32"))
-            )
+            g.observe(ops.array(np.empty((0, 7), dtype="float32")))
 
     def test_num_samples_accumulates_correctly(self):
         """Tests that the number of samples is accumulated correctly when
@@ -323,11 +321,11 @@ class GPTQTest(testing.TestCase):
         x = ops.array(np.random.randn(64, 7), "float32")
         layer = layers.Dense(5, use_bias=False)
         layer.build((None, 7))
-        g = GPTQ(layer)
+        g = GPTQCalibrator(layer)
 
-        g.update_hessian_with_batch(x[:5])
-        g.update_hessian_with_batch(x[5:30])
-        g.update_hessian_with_batch(x[30:])
+        g.observe(x[:5])
+        g.observe(x[5:30])
+        g.observe(x[30:])
 
         self.assertEqual(g.num_samples, 64)
 
@@ -337,8 +335,8 @@ class GPTQTest(testing.TestCase):
         layer = layers.Dense(5, use_bias=False)
         layer.build((None, 7))
 
-        g = GPTQ(layer)
-        g.update_hessian_with_batch(x)
+        g = GPTQCalibrator(layer)
+        g.observe(x)
 
         # Should be finite and symmetric
         self.assertTrue(ops.all(ops.isfinite(g.hessian)))
@@ -352,7 +350,7 @@ class GPTQTest(testing.TestCase):
             l for l in model.layers if isinstance(l, layers.EinsumDense)
         )
 
-        g = GPTQ(einsum_dense_layer)
+        g = GPTQCalibrator(einsum_dense_layer)
 
         # should infer rows==7
         self.assertEqual(ops.shape(g.hessian), (7, 7))
@@ -372,12 +370,12 @@ class GPTQTest(testing.TestCase):
 
         x = ops.array(np.random.randn(50, 7), "float32")
 
-        g1 = GPTQ(einsum_dense_layer)
-        g1.update_hessian_with_batch(x)
+        g1 = GPTQCalibrator(einsum_dense_layer)
+        g1.observe(x)
 
-        g2 = GPTQ(einsum_dense_layer)
-        g2.update_hessian_with_batch(x[:20])
-        g2.update_hessian_with_batch(x[20:])
+        g2 = GPTQCalibrator(einsum_dense_layer)
+        g2.observe(x[:20])
+        g2.observe(x[20:])
 
         self.assertAllClose(g1.hessian, g2.hessian, rtol=1e-6, atol=1e-6)
 
@@ -460,9 +458,9 @@ class GPTQTest(testing.TestCase):
             )
             layer.quantize("gptq", config=config)
 
-            quantizer = GPTQ(layer, config)
-            quantizer.hessian = hessian_matrix
-            quantizer.quantize_and_correct_layer()
+            calibrator = GPTQCalibrator(layer, config)
+            calibrator.hessian = hessian_matrix
+            calibrator.quantize()
             return layer
 
         # Quantize two layers, one with and one without activation ordering.
@@ -637,27 +635,27 @@ class GPTQTest(testing.TestCase):
             },
         )
 
-        hook_calls = [0]
+        observe_calls = [0]
         max_off_diagonal = [0.0]
-        original_update = GPTQ.update_hessian_with_batch
+        original_observe = GPTQCalibrator.observe
 
-        def spy_update(gptq_self, inp):
-            hook_calls[0] += 1
-            result = original_update(gptq_self, inp)
-            hessian = ops.convert_to_numpy(gptq_self.hessian)
+        def spy_observe(calibrator, inp):
+            observe_calls[0] += 1
+            result = original_observe(calibrator, inp)
+            hessian = ops.convert_to_numpy(calibrator.hessian)
             off_diagonal = hessian - np.diag(np.diag(hessian))
             max_off_diagonal[0] = max(
                 max_off_diagonal[0], float(np.abs(off_diagonal).max())
             )
             return result
 
-        GPTQ.update_hessian_with_batch = spy_update
+        GPTQCalibrator.observe = spy_observe
         try:
             model.quantize("gptq", config=config)
         finally:
-            GPTQ.update_hessian_with_batch = original_update
+            GPTQCalibrator.observe = original_observe
 
-        self.assertGreater(hook_calls[0], 0)
+        self.assertGreater(observe_calls[0], 0)
         # A Hessian built from real activations has non-zero off-diagonal
         # entries; an all-zeros Hessian would be replaced by the identity
         # (dead-feature path), silently disabling error correction.
@@ -703,18 +701,18 @@ class GPTQTest(testing.TestCase):
         )
 
         graph_free = [True]
-        original_update = GPTQ.update_hessian_with_batch
+        original_observe = GPTQCalibrator.observe
 
-        def spy_update(gptq_self, inp):
+        def spy_observe(calibrator, inp):
             if getattr(inp, "grad_fn", None) is not None:
                 graph_free[0] = False
-            return original_update(gptq_self, inp)
+            return original_observe(calibrator, inp)
 
-        GPTQ.update_hessian_with_batch = spy_update
+        GPTQCalibrator.observe = spy_observe
         try:
             model.quantize("gptq", config=config)
         finally:
-            GPTQ.update_hessian_with_batch = original_update
+            GPTQCalibrator.observe = original_observe
 
         self.assertTrue(graph_free[0])
 
