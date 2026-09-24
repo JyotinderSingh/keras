@@ -36,27 +36,10 @@ class Operation(KerasSaveable):
     @traceback_utils.filter_traceback
     def __call__(self, *args, **kwargs):
         if traceback_utils.is_traceback_filtering_enabled():
-            if any_symbolic_tensors(args, kwargs):
-                call_fn = self.symbolic_call
-            else:
-                if self._remat_mode:
-                    if getattr(self, "quantization_mode", None) is not None:
-                        call_fn = self.rematerialized_call(
-                            self.quantized_call,
-                            *args,
-                            **kwargs,
-                        )
-                    else:
-                        call_fn = self.rematerialized_call(
-                            self.call, *args, **kwargs
-                        )
-                else:
-                    if getattr(self, "quantization_mode", None) is not None:
-                        call_fn = self.quantized_call
-                    else:
-                        call_fn = self.call
             try:
-                return call_fn(*args, **kwargs)
+                if any_symbolic_tensors(args, kwargs):
+                    return self.symbolic_call(*args, **kwargs)
+                return self._dispatch_call(*args, **kwargs)
             except Exception as e:
                 if not getattr(e, "_keras_call_info_injected", False):
                     raise traceback_utils.inject_argument_info_in_error(
@@ -71,20 +54,36 @@ class Operation(KerasSaveable):
         # Plain flow.
         if any_symbolic_tensors(args, kwargs):
             return self.symbolic_call(*args, **kwargs)
-        elif self._remat_mode:
-            if getattr(self, "quantization_mode", None) is not None:
-                return self.rematerialized_call(
-                    self.quantized_call, *args, **kwargs
-                )(*args, **kwargs)
-            else:
-                return self.rematerialized_call(self.call, *args, **kwargs)(
-                    *args, **kwargs
-                )
+        return self._dispatch_call(*args, **kwargs)
+
+    # A callable that observes the inputs of every forward pass, installed
+    # by `keras.src.quantizers.capture.calibration_scope`; `None` otherwise.
+    _calibration_capture = None
+
+    def _dispatch_call(self, *args, **kwargs):
+        """Runs the forward pass this operation dispatches to.
+
+        This is the one place that selects the forward: `quantized_call`
+        under a quantization mode, `call` otherwise, wrapped for
+        rematerialization when enabled. `__call__` and `stateless_call`
+        both route through it. A calibration capture registered on the
+        operation observes the input first, so it sees every dispatched
+        forward, whichever one that is. The capture runs outside the
+        rematerialization wrapper, on the concrete inputs, and only
+        forwards that arrive through `__call__` or `stateless_call` are
+        observed.
+        """
+        capture = self._calibration_capture
+        if capture is not None:
+            # The layer input: the first positional argument, or `inputs=`.
+            capture(args[0] if args else kwargs["inputs"])
+        if getattr(self, "quantization_mode", None) is not None:
+            call_fn = self.quantized_call
         else:
-            if getattr(self, "quantization_mode", None) is not None:
-                return self.quantized_call(*args, **kwargs)
-            else:
-                return self.call(*args, **kwargs)
+            call_fn = self.call
+        if self._remat_mode:
+            call_fn = self.rematerialized_call(call_fn, *args, **kwargs)
+        return call_fn(*args, **kwargs)
 
     def symbolic_call(self, *args, **kwargs):
         # Perform shape/dtype inference.

@@ -1209,19 +1209,7 @@ class Layer(BackendLayer, Operation):
             with backend.StatelessScope(
                 state_mapping=mapping, collect_losses=return_losses
             ) as scope:
-                if self.dtype_policy.quantization_mode is not None:
-                    if self._remat_mode is not None:
-                        outputs = self.rematerialized_call(
-                            self.quantized_call, *args, **kwargs
-                        )(*args, **kwargs)
-                    else:
-                        outputs = self.quantized_call(*args, **kwargs)
-                elif self._remat_mode is not None:
-                    outputs = self.rematerialized_call(
-                        self.call, *args, **kwargs
-                    )(*args, **kwargs)
-                else:
-                    outputs = self.call(*args, **kwargs)
+                outputs = self._dispatch_call(*args, **kwargs)
                 if return_losses:
                     losses = self.losses
         finally:
