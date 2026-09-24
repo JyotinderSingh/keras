@@ -1663,3 +1663,164 @@ class GPTQEinsumLayoutTest(testing.TestCase):
         restored.load_own_variables(store)
         self.assertEqual(tuple(restored.quantized_kernel.shape), (8, 4))
         self.assertAllClose(restored(x), y)
+
+
+def _reference_gptq(
+    weights_transpose,
+    hessian,
+    *,
+    bits,
+    blocksize,
+    damping,
+    group_size,
+    activation_order,
+    symmetric,
+):
+    """A NumPy port of the reference solve, in float64.
+
+    `GPTQ.fasterquant` with `Quantizer.find_params` (IST-DASLab/gptq),
+    `static_groups=False`. `hessian` is the accumulated Hessian before
+    revival and dampening. Two deliberate differences: dead inputs sort
+    last under activation ordering (the reference ranks them by the
+    revived diagonal, which on its per-sample Hessian scale is the
+    smallest entry in practice), and a symmetric range is two-sided for
+    every row (the reference keeps `[0, max]` for a row without negative
+    values).
+    """
+    maxq = 2**bits - 1
+
+    def find_params(x):
+        xmin = np.minimum(x.min(axis=1), 0.0)
+        xmax = np.maximum(x.max(axis=1), 0.0)
+        if symmetric:
+            xmax = np.maximum(np.abs(xmin), xmax)
+            xmin = -xmax
+        both_zero = (xmin == 0) & (xmax == 0)
+        xmin = np.where(both_zero, -1.0, xmin)
+        xmax = np.where(both_zero, 1.0, xmax)
+        scale = (xmax - xmin) / maxq
+        if symmetric:
+            zero = np.full_like(scale, (maxq + 1) / 2)
+        else:
+            zero = np.round(-xmin / scale)
+        return scale, zero
+
+    weights = np.asarray(weights_transpose, np.float64).copy()
+    hessian = np.asarray(hessian, np.float64).copy()
+    columns = weights.shape[1]
+    if group_size == -1:
+        group_scale, group_zero = find_params(weights)
+    dead = np.diag(hessian) == 0
+    hessian[dead, dead] = 1.0
+    weights[:, dead] = 0.0
+    if activation_order:
+        order = np.argsort(
+            -np.where(dead, 0.0, np.diag(hessian)), kind="stable"
+        )
+        weights = weights[:, order]
+        hessian = hessian[order][:, order]
+        inverse_order = np.argsort(order)
+    hessian[np.diag_indices(columns)] += damping * np.mean(np.diag(hessian))
+    inverse_hessian = np.linalg.cholesky(np.linalg.inv(hessian)).T
+    codes = np.zeros_like(weights)
+    scales, zeros = [], []
+    for block_start in range(0, columns, blocksize):
+        block_end = min(block_start + blocksize, columns)
+        block = weights[:, block_start:block_end].copy()
+        block_error = np.zeros_like(block)
+        block_inverse = inverse_hessian[
+            block_start:block_end, block_start:block_end
+        ]
+        for i in range(block_end - block_start):
+            column = block_start + i
+            if group_size != -1 and column % group_size == 0:
+                group_scale, group_zero = find_params(
+                    weights[:, column : column + group_size]
+                )
+                scales.append(group_scale)
+                zeros.append(group_zero)
+            w = block[:, i]
+            q = np.clip(np.round(w / group_scale) + group_zero, 0, maxq)
+            codes[:, column] = q
+            error = (w - group_scale * (q - group_zero)) / block_inverse[i, i]
+            block[:, i:] -= np.outer(error, block_inverse[i, i:])
+            block_error[:, i] = error
+        weights[:, block_end:] -= (
+            block_error @ inverse_hessian[block_start:block_end, block_end:]
+        )
+    if group_size == -1:
+        scales, zeros = [group_scale], [group_zero]
+    g_idx = np.arange(columns) // (columns if group_size == -1 else group_size)
+    if activation_order:
+        codes = codes[:, inverse_order]
+        g_idx = g_idx[inverse_order]
+    return codes, np.stack(scales, 1), np.stack(zeros, 1), g_idx
+
+
+class GPTQReferenceTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("asymmetric_per_channel", 4, -1, False, False),
+        ("asymmetric_grouped", 4, 8, False, False),
+        ("asymmetric_grouped_act_order", 4, 8, True, False),
+        ("symmetric_per_channel_8bit", 8, -1, False, True),
+        ("symmetric_grouped_act_order", 4, 8, True, True),
+        ("two_bit_grouped", 2, 16, False, False),
+        ("three_bit_grouped_act_order", 3, 8, True, False),
+    )
+    def test_solve_matches_the_reference(
+        self, bits, group_size, activation_order, symmetric
+    ):
+        # `GPTQCalibrator` reproduces the reference solve code for code,
+        # with an input that never fires during calibration.
+        rng = np.random.default_rng(0)
+        in_features, out_features, num_rows = 32, 12, 2048
+        mixing = np.eye(in_features) + 0.3 * rng.standard_normal(
+            (in_features, in_features)
+        )
+        x = (rng.standard_normal((num_rows, in_features)) @ mixing).astype(
+            "float32"
+        )
+        x[:, 5] = 0.0
+        layer = layers.Dense(out_features, use_bias=False)
+        layer.build((None, in_features))
+        layer.kernel.assign(
+            0.2 * rng.standard_normal((in_features, out_features))
+        )
+        config = GPTQConfig(
+            dataset=None,
+            tokenizer=None,
+            weight_bits=bits,
+            group_size=group_size,
+            activation_order=activation_order,
+            symmetric=symmetric,
+        )
+        layer.quantize("gptq", config=config)
+        calibrator = GPTQCalibrator(layer, config)
+        calibrator.observe(x)
+        hessian = ops.convert_to_numpy(calibrator.hessian)
+        weights_transpose = ops.convert_to_numpy(ops.transpose(layer._kernel))
+        calibrator.quantize(blocksize=8)
+        calibrator.release()
+
+        codes, scale, zero, g_idx = _reference_gptq(
+            weights_transpose,
+            hessian,
+            bits=bits,
+            blocksize=8,
+            damping=config.hessian_damping,
+            group_size=group_size,
+            activation_order=activation_order,
+            symmetric=symmetric,
+        )
+        qvariable = layer._qvariable()
+        self.assertAllEqual(ops.transpose(qvariable.unpack()), codes)
+        # The layer stores the divisor form of the scale.
+        self.assertAllClose(
+            ops.transpose(ops.reciprocal(qvariable.scale)), scale, rtol=1e-5
+        )
+        self.assertAllEqual(ops.transpose(qvariable.zero_point), zero)
+        self.assertAllEqual(qvariable.g_idx, g_idx)
+        # The dead input's weights land on its group's zero point.
+        self.assertAllEqual(
+            ops.convert_to_numpy(qvariable.unpack())[5], zero[:, g_idx[5]]
+        )

@@ -21,15 +21,12 @@ from keras.src.quantizers.quantizers import quantize_with_zero_point
 
 
 def _stable_permutation(metric):
-    """Return a stable permutation that sorts `metric` in descending order.
-    Uses an index-based jitter to break ties deterministically."""
-    n = ops.shape(metric)[0]
-    idx = ops.arange(0, n, dtype="int32")
-    # tiny jitter = (idx / n) * 1e-12 so it never flips a real strict ordering
-    jitter = ops.divide(ops.cast(idx, "float32"), ops.cast(n, "float32"))
-    metric_jittered = ops.add(metric, ops.multiply(jitter, 1e-12))
-    # argsort by negative to get descending
-    return ops.argsort(ops.negative(metric_jittered))
+    """The permutation that sorts `metric` in descending order.
+
+    Ties keep their index order on a backend whose `argsort` is stable
+    (JAX, torch); the reference leaves them to `torch.argsort` as well.
+    """
+    return ops.argsort(ops.negative(metric))
 
 
 def gptq_quantize_matrix(
@@ -41,6 +38,7 @@ def gptq_quantize_matrix(
     activation_order=False,
     order_metric=None,
     compute_scale_zero=compute_quantization_parameters,
+    dead_inputs=None,
 ):
     """
     Implements the GPTQ error correction updates.
@@ -81,6 +79,12 @@ def gptq_quantize_matrix(
          (default: None, uses diag(H)).
         compute_scale_zero: Function to compute scale and zero for
          quantization.
+        dead_inputs: Optional boolean mask [in_features] of inputs that
+         never fired during calibration. Their weights are zeroed before
+         the solve, as in the reference, so they quantize to the zero
+         point instead of widening their group's range. With
+         `group_size=-1` the per-channel parameters are computed first,
+         from the weights as given.
 
     Returns:
         quantized: Quantized weight matrix [out_features, in_features].
@@ -90,6 +94,34 @@ def gptq_quantize_matrix(
         g_idx: int32. Group indices for each feature [in_features].
     """
     in_features = ops.shape(weights_transpose)[1]
+    # Compute effective group size
+    effective_group_size = in_features if group_size == -1 else group_size
+    scale_chunks = []
+    zero_chunks = []
+    # Per-group cached params, reused until the column index crosses into
+    # the next group. The cache must live across processing blocks: a group
+    # can span several blocks (`group_size == -1` covers the whole matrix,
+    # and `group_size > blocksize` covers more than one block). Resetting it
+    # per block would recompute and re-append the same group's params once
+    # per block, corrupting the [out_features, n_groups] scale/zero layout.
+    cached_scale = None
+    cached_zero = None
+    cached_maxq = None
+    cached_group_start = -1
+    if effective_group_size == in_features:
+        # One group over every column. Its parameters come from the
+        # weights as given, before dead inputs are zeroed (the reference
+        # calls `find_params` before it zeroes them).
+        cached_scale, cached_zero, cached_maxq = compute_scale_zero(
+            weights_transpose
+        )
+        scale_chunks.append(cached_scale)
+        zero_chunks.append(cached_zero)
+        cached_group_start = 0
+    if dead_inputs is not None:
+        weights_transpose = ops.where(
+            ops.expand_dims(dead_inputs, 0), 0.0, weights_transpose
+        )
 
     if activation_order:
         # Use diag(H) as the importance proxy by default (as in AutoGPTQ).
@@ -127,23 +159,6 @@ def gptq_quantize_matrix(
     # Buffer for the final quantized matrix: [out_features, in_features]
     quantized_weights_buffer = ops.zeros_like(weights_transpose, dtype="int32")
 
-    scale_chunks = []
-    zero_chunks = []
-
-    # Compute effective group size
-    effective_group_size = in_features if group_size == -1 else group_size
-
-    # Per-group cached params, reused until the column index crosses into
-    # the next group. The cache must live across processing blocks: a group
-    # can span several blocks (`group_size == -1` covers the whole matrix,
-    # and `group_size > blocksize` covers more than one block). Resetting it
-    # per block would recompute and re-append the same group's params once
-    # per block, corrupting the [out_features, n_groups] scale/zero layout.
-    cached_scale = None
-    cached_zero = None
-    cached_maxq = None
-    cached_group_start = -1
-
     # Process features in blocks
     for block_start in range(0, in_features, blocksize):
         block_end = min(block_start + blocksize, in_features)
@@ -165,8 +180,9 @@ def gptq_quantize_matrix(
             global_idx = block_start + block_idx
             # weight_column: [out_features,]
             weight_column = block_weights[:, block_idx]
-            # Group-wise parameter reuse (compute once per group)
-            if not effective_group_size == in_features:  # group_size != -1
+            # Group-wise parameter reuse (compute once per group); the
+            # single global group was resolved before the loop.
+            if effective_group_size != in_features:
                 # Determine the group start index for the current column
                 group_start = (
                     global_idx // effective_group_size
@@ -185,17 +201,7 @@ def gptq_quantize_matrix(
                     scale_chunks.append(cached_scale)
                     zero_chunks.append(cached_zero)
                     cached_group_start = group_start
-                scale, zero, maxq = cached_scale, cached_zero, cached_maxq
-            else:
-                # Single global group covering all columns.
-                if cached_scale is None:
-                    cached_scale, cached_zero, cached_maxq = compute_scale_zero(
-                        weights_buffer
-                    )
-                    scale_chunks.append(cached_scale)
-                    zero_chunks.append(cached_zero)
-                    cached_group_start = 0
-                scale, zero, maxq = cached_scale, cached_zero, cached_maxq
+            scale, zero, maxq = cached_scale, cached_zero, cached_maxq
 
             # Quantize column and store it.
             # quantized_column: [out_features, 1]
@@ -283,14 +289,8 @@ def gptq_quantize_matrix(
         )
 
     # Concatenate recorded group params
-    if len(scale_chunks) == 0:
-        # Edge case: no groups recorded (empty input); fall back to whole matrix
-        s, z, _ = compute_scale_zero(weights_transpose)
-        scale = s
-        zero = z
-    else:
-        scale = ops.concatenate(scale_chunks, axis=1)
-        zero = ops.concatenate(zero_chunks, axis=1)
+    scale = ops.concatenate(scale_chunks, axis=1)
+    zero = ops.concatenate(zero_chunks, axis=1)
 
     return quantized_weights_buffer, scale, zero, g_idx
 
@@ -458,19 +458,21 @@ class GPTQCalibrator(Calibrator):
         zeros = []
         group_indices = []
         for index in range(self.batch):
-            hessian_matrix = self._dampened_hessian(hessians[index])
+            hessian_matrix, dead = self._dampened_hessian(hessians[index])
             # The inverse Hessian used for error correction is derived
             # inside `gptq_quantize_matrix` from the dampened Hessian using
             # a numerically stable Cholesky formulation (triangular solves,
-            # no dense inverse).
+            # no dense inverse). A dead input is the least salient one:
+            # it sorts last under activation ordering.
             quantized, scale, zero, g_idx = gptq_quantize_matrix(
                 ops.transpose(kernel[index]),
                 hessian=hessian_matrix,
                 blocksize=blocksize,
                 group_size=self.config.group_size,
                 activation_order=self.config.activation_order,
-                order_metric=ops.diagonal(hessian_matrix),
+                order_metric=ops.where(dead, 0.0, ops.diagonal(hessian_matrix)),
                 compute_scale_zero=self.compute_scale_zero,
+                dead_inputs=dead,
             )
             # The algorithm works on `[out, in]`; the layer stores the
             # view's `[in, out]` orientation with the group parameters as
@@ -511,7 +513,13 @@ class GPTQCalibrator(Calibrator):
         )
 
     def _dampened_hessian(self, hessian):
-        """The Hessian with dead inputs revived and its diagonal dampened."""
+        """The Hessian with dead inputs revived and its diagonal dampened.
+
+        Returns the dampened matrix and the mask of dead inputs: a zero
+        diagonal entry, an input that never fired during calibration. Its
+        diagonal is set to one so the matrix stays invertible; nothing
+        else in its row or column is non-zero.
+        """
         hessian_diagonal = ops.diagonal(hessian)
         dead_diagonal = ops.equal(hessian_diagonal, 0.0)
         hessian_diagonal = ops.where(dead_diagonal, 1.0, hessian_diagonal)
@@ -527,12 +535,13 @@ class GPTQCalibrator(Calibrator):
             self.config.hessian_damping, ops.mean(hessian_diagonal)
         )
         hessian_diagonal = ops.add(hessian_diagonal, damping_factor)
-        return ops.add(
+        dampened = ops.add(
             ops.subtract(
                 hessian_matrix, ops.diag(ops.diagonal(hessian_matrix))
             ),
             ops.diag(hessian_diagonal),
         )
+        return dampened, dead_diagonal
 
     def release(self):
         """Drops the Hessian."""

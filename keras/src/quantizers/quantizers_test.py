@@ -707,7 +707,8 @@ class ZeroPointPrimitivesTest(testing.TestCase):
         """
         scale = ops.array(0.125)
         maxq = ops.array(ops.subtract(ops.power(2, bits), 1), "float32")
-        zero = ops.array(ops.divide(maxq, 2.0))
+        # A zero point is an integer code (the symmetric one here).
+        zero = ops.array(ops.divide(ops.add(maxq, 1), 2.0))
 
         # Build dequantized grid points: x = scale * (k - zero), k in [0..maxq]
         ks = ops.arange(0, ops.add(maxq, 1))
@@ -1157,3 +1158,29 @@ class TernarizeTest(testing.TestCase):
         codes, scale = ternarize(ops.zeros((3, 4), "float32"))
         self.assertAllClose(codes, np.zeros((3, 4)))
         self.assertEqual(scale, 1.0)
+
+
+class ReferenceRulesTest(testing.TestCase):
+    """Rules shared with the reference GPTQ/AWQ quantizers."""
+
+    def test_symmetric_range_is_two_sided(self):
+        # Every row spans `[-max_abs, max_abs]` around the mid-code zero
+        # point, one-signed rows included.
+        x = ops.array([[0.2, 0.5, 1.0], [-1.0, -0.4, -0.1], [-0.3, 0.6, 0.0]])
+        scale, zero, maxq = compute_quantization_parameters(
+            x, bits=4, symmetric=True, per_channel=True
+        )
+        self.assertAllClose(scale, [[2.0 / 15.0], [2.0 / 15.0], [1.2 / 15.0]])
+        self.assertAllClose(zero, [[8.0], [8.0], [8.0]])
+        self.assertEqual(float(maxq), 15.0)
+
+    def test_quantize_rounds_before_adding_the_zero_point(self):
+        # `round(x / scale) + zero`, not `round(x / scale + zero)`: the two
+        # differ on a half-way tie, and the reference rounds first.
+        q = quantize_with_zero_point(
+            ops.array([[-0.5, 0.5, 1.5]]),
+            ops.array(1.0),
+            ops.array(7.0),
+            ops.array(15.0),
+        )
+        self.assertAllClose(q, [[7.0, 7.0, 9.0]])
