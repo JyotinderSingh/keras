@@ -26,6 +26,18 @@ from keras.src.quantizers.awq_config import AWQConfig
 RNG = np.random.default_rng(seed=42)
 
 
+def _second_moment(x):
+    """Mean of `x x^T` over the rows of a sample `x` [rows, in_features]."""
+    x = np.asarray(x, "float32")
+    return x.T @ x / x.shape[0]
+
+
+def _random_moment(weights):
+    """A second moment for `weights` [out, in] from a random sample."""
+    in_features = int(weights.shape[1])
+    return _second_moment(RNG.standard_normal((4 * in_features, in_features)))
+
+
 class MockTokenizer:
     """Simple tokenizer for testing."""
 
@@ -59,7 +71,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         scales = awq_search_optimal_scales(
-            weights, activations, num_grid_points=10, group_size=-1
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=10,
+            group_size=-1,
         )
 
         self.assertEqual(scales.shape, (16,))
@@ -75,7 +91,11 @@ class AWQAlgorithmTest(testing.TestCase):
         activations = ops.array(activations)
 
         scales = awq_search_optimal_scales(
-            weights, activations, num_grid_points=10, group_size=-1
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=10,
+            group_size=-1,
         )
 
         # Should handle gracefully without NaN or Inf
@@ -101,7 +121,11 @@ class AWQAlgorithmTest(testing.TestCase):
         sample = RNG.standard_normal((128, 32)).astype("float32")
 
         best_max, gs, n_group = awq_search_best_clip(
-            weights_scaled, sample, scales, group_size=8, num_grid_points=20
+            weights_scaled,
+            _second_moment(sample),
+            scales,
+            group_size=8,
+            num_grid_points=20,
         )
         self.assertEqual(gs, 8)
         self.assertEqual(n_group, 4)
@@ -142,10 +166,10 @@ class AWQAlgorithmTest(testing.TestCase):
             q, sc, z, aw, gi = awq_quantize_matrix(
                 weights,
                 x_stat,
+                _second_moment(sample),
                 num_grid_points=10,
                 group_size=group_size,
                 apply_clip=apply_clip,
-                activation_sample=sample,
             )
             # Same FP reference for both: unclipped scaled weights.
             w_scaled = ops.multiply(weights, aw)
@@ -176,7 +200,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
-            weights, activations, num_grid_points=10, group_size=-1
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=10,
+            group_size=-1,
         )
 
         # Quantized shape: [out_features, in_features]
@@ -200,7 +228,11 @@ class AWQAlgorithmTest(testing.TestCase):
 
         # Test per-channel mode (group_size=-1) which is well-supported
         quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
-            weights, activations, num_grid_points=5, group_size=8
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=5,
+            group_size=8,
         )
 
         # Quantized shape: [out_features, in_features]
@@ -237,7 +269,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
-            weights, activations, num_grid_points=5, group_size=group_size
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=5,
+            group_size=group_size,
         )
 
         # Quantized should match input shape
@@ -269,7 +305,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         quantized, scale, _, awq_scales, _ = awq_quantize_matrix(
-            weights, activations, num_grid_points=5, group_size=group_size
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=5,
+            group_size=group_size,
         )
 
         # Check for NaN/Inf in all outputs
@@ -294,7 +334,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         scales = awq_search_optimal_scales(
-            weights, activations, num_grid_points=5, group_size=group_size
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=5,
+            group_size=group_size,
         )
 
         # Scales should be [in_features]
@@ -326,7 +370,11 @@ class AWQAlgorithmTest(testing.TestCase):
         )
 
         _, scale, zero, _, _ = awq_quantize_matrix(
-            weights, activations, num_grid_points=3, group_size=group_size
+            weights,
+            activations,
+            _random_moment(weights),
+            num_grid_points=3,
+            group_size=group_size,
         )
 
         self.assertEqual(
@@ -402,50 +450,68 @@ class AWQLayerTest(testing.TestCase):
             calibrator.activation_magnitudes, expected_mean, atol=1e-6
         )
 
-    def test_awq_clip_sample_capture(self):
-        """Test that a bounded activation sample is stashed for clipping."""
-        from keras.src.quantizers.awq import MAX_CLIP_SAMPLE_ROWS
-
-        layer = layers.Dense(32)
-        layer.build(input_shape=(None, 16))
-
+    def test_second_moment_accumulates_over_batches(self):
+        # The running mean of `x x^T` does not depend on the batching.
+        x = RNG.standard_normal((96, 16)).astype("float32")
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=5
         )
-        layer.quantize(config=config)
-        calibrator = AWQCalibrator(layer, config)
 
-        # Feed more rows than the cap across several batches.
-        for _ in range(4):
-            batch = RNG.standard_normal((MAX_CLIP_SAMPLE_ROWS // 2, 16)).astype(
-                "float32"
+        def calibrator():
+            layer = layers.Dense(32)
+            layer.build(input_shape=(None, 16))
+            layer.quantize(config=config)
+            return AWQCalibrator(layer, config)
+
+        whole = calibrator()
+        whole.observe(x)
+        batched = calibrator()
+        batched.observe(x[:40])
+        batched.observe(x[40:])
+        self.assertEqual(batched.num_samples, 96)
+        self.assertAllClose(whole.second_moment, _second_moment(x), atol=1e-5)
+        self.assertAllClose(
+            batched.second_moment, whole.second_moment, atol=1e-5
+        )
+        self.assertAllClose(
+            batched.activation_magnitudes, whole.activation_magnitudes
+        )
+
+    def test_query_and_key_layers_skip_the_clipping_search(self):
+        # The reference rule: the attention scores depend on the product of
+        # the two projections, so one layer's output error is a poor guide
+        # for their clip bound. The pattern list is configurable.
+        weights = RNG.standard_normal((64, 32)).astype("float32")
+        weights[::8] *= 6.0  # outliers, so clipping changes the codes
+        x = RNG.standard_normal((128, 32)).astype("float32")
+
+        def codes(name, apply_clip, **kwargs):
+            layer = layers.Dense(64, name=name)
+            layer.build(input_shape=(None, 32))
+            layer.kernel.assign(weights.T)
+            config = AWQConfig(
+                dataset=None,
+                tokenizer=None,
+                group_size=8,
+                num_grid_points=5,
+                apply_clip=apply_clip,
+                **kwargs,
             )
-            calibrator.observe(batch)
+            layer.quantize("awq", config=config)
+            calibrator = AWQCalibrator(layer, config)
+            calibrator.observe(x)
+            calibrator.quantize()
+            calibrator.release()
+            return ops.convert_to_numpy(layer.quantized_kernel)
 
-        # The stash is bounded by MAX_CLIP_SAMPLE_ROWS.
-        self.assertEqual(calibrator._clip_sample_rows, MAX_CLIP_SAMPLE_ROWS)
-        total_rows = int(
-            sum(int(ops.shape(s)[0]) for s in calibrator._clip_samples)
+        unclipped = codes("dense", apply_clip=False)
+        clipped = codes("dense", apply_clip=True)
+        self.assertFalse(np.array_equal(clipped, unclipped))
+        self.assertAllEqual(codes("query", apply_clip=True), unclipped)
+        self.assertAllEqual(codes("key_dense", apply_clip=True), unclipped)
+        self.assertAllEqual(
+            codes("query", apply_clip=True, clip_skip_patterns=()), clipped
         )
-        self.assertEqual(total_rows, MAX_CLIP_SAMPLE_ROWS)
-
-    def test_awq_clip_disabled_skips_sample(self):
-        """Test that apply_clip=False does not stash a sample."""
-        layer = layers.Dense(32)
-        layer.build(input_shape=(None, 16))
-
-        config = AWQConfig(
-            dataset=None,
-            tokenizer=None,
-            group_size=-1,
-            num_grid_points=5,
-            apply_clip=False,
-        )
-        layer.quantize(config=config)
-        calibrator = AWQCalibrator(layer, config)
-        calibrator.observe(RNG.standard_normal((32, 16)).astype("float32"))
-        self.assertEqual(calibrator._clip_sample_rows, 0)
-        self.assertEqual(calibrator._clip_samples, [])
 
     def test_awq_layer_variables_created(self):
         """Test that AWQ layer variables are properly created."""
@@ -1382,3 +1448,148 @@ class AWQEinsumLayoutTest(testing.TestCase):
         self.assertEqual(
             tuple(layer.kernel_scale.shape), (experts * n_groups, width)
         )
+
+
+def _keras_pseudo_quantize(weights, group_size, bits=4):
+    """Fake quantization with Keras's group rule, in float64.
+
+    The range is stretched to include zero (GPTQ's rule, which
+    `compute_awq_scale_zero` shares); llm-awq's `pseudo_quantize_tensor`
+    uses the raw group range. The two agree on every group that spans
+    zero.
+    """
+    out_features, in_features = weights.shape
+    group = group_size if group_size > 0 else in_features
+    grouped = weights.reshape(-1, group)
+    low = np.minimum(grouped.min(axis=1, keepdims=True), 0.0)
+    high = np.maximum(grouped.max(axis=1, keepdims=True), 0.0)
+    flat = low == high
+    low = np.where(flat, low - 1.0, low)
+    high = np.where(flat, high + 1.0, high)
+    maxq = 2**bits - 1
+    scale = (high - low) / maxq
+    zero = np.clip(np.round(-low / scale), 0, maxq)
+    codes = np.clip(np.round(grouped / scale) + zero, 0, maxq)
+    return ((codes - zero) * scale).reshape(out_features, in_features)
+
+
+def _reference_scale_losses(weights, x, group_size, n_grid=20):
+    """AutoAWQ `_compute_best_scale` (duo scaling) for one linear layer.
+
+    Returns the candidate scales and the layer's output error on every
+    row of `x` for each `ratio = i / n_grid`, in float64.
+    """
+    weights = np.asarray(weights, np.float64)
+    x = np.asarray(x, np.float64)
+    out_features, in_features = weights.shape
+    x_mean = np.abs(x).mean(axis=0)
+    magnitude = np.abs(weights)
+    if group_size > 0:
+        grouped = magnitude.reshape(out_features, -1, group_size)
+        normalized = grouped / (grouped.max(axis=-1, keepdims=True) + 1e-6)
+        w_mean = normalized.reshape(out_features, in_features).mean(axis=0)
+    else:
+        w_mean = (
+            magnitude / (magnitude.max(axis=1, keepdims=True) + 1e-6)
+        ).mean(axis=0)
+    reference_output = x @ weights.T
+    candidates, losses = [], []
+    for i in range(n_grid):
+        ratio = i / n_grid
+        scales = x_mean**ratio / (w_mean ** (1 - ratio) + 1e-4)
+        scales = np.maximum(scales, 1e-4)
+        scales = scales / np.sqrt(scales.max() * scales.min())
+        reconstructed = _keras_pseudo_quantize(weights * scales, group_size)
+        reconstructed = reconstructed / scales
+        losses.append(np.mean((reference_output - x @ reconstructed.T) ** 2))
+        candidates.append(scales)
+    return np.stack(candidates), np.array(losses)
+
+
+def _reference_clip_errors(
+    weights_scaled, x_scaled, group_size, n_grid=20, max_shrink=0.5
+):
+    """llm-awq `auto_clip_layer` on every row of `x_scaled`.
+
+    Returns the candidate bounds `[steps, out, n_groups]` and the
+    per-(channel, group) partial-output error of each, in float64.
+    """
+    weights_scaled = np.asarray(weights_scaled, np.float64)
+    x_scaled = np.asarray(x_scaled, np.float64)
+    out_features, in_features = weights_scaled.shape
+    group = group_size if group_size > 0 else in_features
+    n_groups = in_features // group
+    x_grouped = x_scaled.reshape(1, -1, n_groups, group)
+    w_grouped = weights_scaled.reshape(out_features, 1, n_groups, group)
+    group_max = np.abs(w_grouped).max(axis=-1, keepdims=True)
+    reference_output = (x_grouped * w_grouped).sum(axis=-1)
+    bounds, errors = [], []
+    for step in range(int(max_shrink * n_grid)):
+        bound = group_max * (1 - step / n_grid)
+        clipped = np.clip(w_grouped, -bound, bound)
+        quantized = _keras_pseudo_quantize(
+            clipped.reshape(out_features, in_features), group_size
+        ).reshape(out_features, 1, n_groups, group)
+        output = (x_grouped * quantized).sum(axis=-1)
+        errors.append(((output - reference_output) ** 2).mean(axis=1))
+        bounds.append(bound[:, 0, :, 0])
+    return np.stack(bounds), np.stack(errors)
+
+
+class AWQReferenceTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("per_channel", -1), ("grouped_8", 8), ("grouped_32", 32)
+    )
+    def test_scale_search_matches_the_reference(self, group_size):
+        # The scales come from the reference grid, and the layer's output
+        # error of the chosen candidate over every calibration row is the
+        # grid's minimum, computed here without the second moment.
+        weights = RNG.standard_normal((24, 64)).astype("float32")
+        x = RNG.standard_normal((512, 64)).astype("float32")
+        x[:, :8] *= 4.0  # a few salient channels
+        candidates, losses = _reference_scale_losses(weights, x, group_size)
+
+        scales = ops.convert_to_numpy(
+            awq_search_optimal_scales(
+                weights,
+                np.abs(x).mean(axis=0),
+                _second_moment(x),
+                group_size=group_size,
+            )
+        )
+        distances = np.abs(candidates - scales).max(axis=1)
+        chosen = int(np.argmin(distances))
+        self.assertLess(distances[chosen], 1e-4)
+        self.assertLessEqual(losses[chosen], losses.min() * (1 + 1e-5))
+
+    @parameterized.named_parameters(("grouped_8", 8), ("grouped_16", 16))
+    def test_clip_search_matches_the_reference(self, group_size):
+        # For every output channel and group, the chosen bound's partial
+        # output error over every calibration row is the grid's minimum.
+        weights = RNG.standard_normal((32, 64)).astype("float32")
+        weights[::4] *= 5.0
+        x = RNG.standard_normal((512, 64)).astype("float32")
+        awq_scales = np.abs(x).mean(axis=0) ** 0.5
+        weights_scaled = weights * awq_scales
+        bounds, errors = _reference_clip_errors(
+            weights_scaled, x / awq_scales, group_size
+        )
+
+        clip_bound, _, n_groups = awq_search_best_clip(
+            weights_scaled,
+            _second_moment(x),
+            awq_scales,
+            group_size=group_size,
+        )
+        clip_bound = ops.convert_to_numpy(clip_bound)[:, :, 0]
+        self.assertEqual(clip_bound.shape, (32, n_groups))
+        # Which grid step each bound is, then that step's error.
+        steps = np.argmin(np.abs(bounds - clip_bound[None]), axis=0)
+        chosen_bound = np.take_along_axis(bounds, steps[None], axis=0)[0]
+        self.assertAllClose(chosen_bound, clip_bound, rtol=1e-5)
+        chosen_error = np.take_along_axis(errors, steps[None], axis=0)[0]
+        self.assertTrue(
+            np.all(chosen_error <= errors.min(axis=0) * (1 + 1e-5) + 1e-12)
+        )
+        # The grid is the reference's: ten steps of 0.05 from the max.
+        self.assertEqual(bounds.shape[0], 10)

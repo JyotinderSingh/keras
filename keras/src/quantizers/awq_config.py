@@ -45,14 +45,20 @@ class AWQConfig(QuantizationConfig):
             `group_size` of -1 indicates per-channel quantization.
             Defaults to 128.
         num_grid_points: The number of grid search points for finding optimal
-            per-channel scales. Higher values may find better scales but
-            take longer. Defaults to 20.
-        apply_clip: Whether to run the AutoAWQ-style weight clipping search
-            after the scale search. This grid-searches a per-group shrink
-            factor on the weight max and clips the (scaled) weights to the
-            value that minimizes activation-aware reconstruction error before
-            quantization. Improves accuracy at a small calibration cost.
-            Defaults to True.
+            per-channel scales, `ratio = i / num_grid_points` for `i` below
+            it. Higher values may find better scales but take longer.
+            Defaults to 20, as in the reference implementations.
+        apply_clip: Whether to run the reference clipping search after the
+            scale search. It grid-searches a per-group shrink of the weight
+            max, in steps of 1/20 down to 0.55, and clips the scaled weights
+            to the bound with the smallest output error before quantization.
+            Improves accuracy at a small calibration cost. Defaults to True.
+        clip_skip_patterns: Layers whose name contains one of these strings
+            are not clipped. The references skip the query and key
+            projections, since the attention scores depend on their product
+            and one layer's output error is a poor guide for them. Defaults
+            to `("q_", "k_", "query", "key", "Wqkv")`, the reference list;
+            pass an empty tuple to clip every layer.
         quantization_layer_structure: A dictionary defining the model's
             quantization structure. It should contain:
             - "pre_block_layers": list of layers to run before the first
@@ -94,6 +100,7 @@ class AWQConfig(QuantizationConfig):
         group_size: int = 128,
         num_grid_points: int = 20,
         apply_clip: bool = True,
+        clip_skip_patterns=("q_", "k_", "query", "key", "Wqkv"),
         quantization_layer_structure: dict = None,
     ):
         super().__init__()
@@ -118,6 +125,12 @@ class AWQConfig(QuantizationConfig):
             )
         if num_grid_points <= 0:
             raise ValueError("num_grid_points must be a positive integer.")
+        clip_skip_patterns = tuple(clip_skip_patterns)
+        if not all(isinstance(p, str) and p for p in clip_skip_patterns):
+            raise ValueError(
+                "clip_skip_patterns must be a sequence of non-empty strings. "
+                f"Received: {clip_skip_patterns!r}"
+            )
 
         self.dataset = dataset
         self.tokenizer = tokenizer
@@ -128,6 +141,7 @@ class AWQConfig(QuantizationConfig):
         self.group_size = group_size
         self.num_grid_points = num_grid_points
         self.apply_clip = apply_clip
+        self.clip_skip_patterns = clip_skip_patterns
         self.quantization_layer_structure = quantization_layer_structure
 
     @property
@@ -158,6 +172,7 @@ class AWQConfig(QuantizationConfig):
             "group_size": self.group_size,
             "num_grid_points": self.num_grid_points,
             "apply_clip": self.apply_clip,
+            "clip_skip_patterns": list(self.clip_skip_patterns),
         }
 
     @classmethod

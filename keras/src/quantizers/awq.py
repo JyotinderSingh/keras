@@ -3,7 +3,28 @@
 AWQ protects salient weights by finding optimal per-channel scales based on
 activation magnitudes, then applies those scales before quantization.
 
-Reference: https://arxiv.org/abs/2306.00978
+Reference: https://arxiv.org/abs/2306.00978, llm-awq (mit-han-lab) and
+AutoAWQ (casper-hansen), whose duo-scaling grid and clipping search this
+module follows.
+
+Both searches score a candidate by the layer's mean squared output error
+over the calibration set, the paper's objective. The error is computed
+exactly from the input second moment `mean(x x^T)` the calibrator
+accumulates, not from stored activations: for a weight error `E` it is
+`mean(sum(E @ G * E, axis=1))`, and a group's partial output uses the
+group's diagonal block of `G`. The references run the layer on the stored
+activations, all of them for the scale search and a strided sample of 512
+rows for the clipping search.
+
+Two departures from the references remain. They search one scale per set
+of layers that share an input (query, key and value together) and score
+it on the output of the enclosing module, folding `1 / s` into the
+preceding operation; Keras searches each layer on its own output and
+keeps `1 / s` in the layer as `awq_scales`, so the layers need not agree.
+And `CalibrationRun` feeds each block the quantized outputs of the block
+before it, GPTQ's rule, where the references calibrate every block on
+the float model's activations; on SmolLM2-135M the two gave the same
+held-out perplexity over three calibration seeds.
 """
 
 import functools
@@ -18,13 +39,6 @@ from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
-
-# Maximum number of activation rows stashed per problem of a layer for the
-# AutoAWQ-style clipping search (a kernel with a batch axis stashes this
-# many rows per expert). Bounds calibration memory; a few hundred rows is
-# enough to estimate per-group reconstruction error (matches AutoAWQ's
-# ``n_sample_token`` default of 512).
-MAX_CLIP_SAMPLE_ROWS = 512
 
 
 def _get_weight_scale(weights, group_size):
@@ -102,9 +116,23 @@ def _fake_quantize_weights(
     return dequantize_with_sz_map(quantized, scale, zero, g_idx)
 
 
+def _output_error(weight_error, second_moment):
+    """Mean squared output error a weight error causes on the calibration set.
+
+    `weight_error` is `[out_features, in_features]`, the float weights minus
+    their reconstruction; `second_moment` is the `[in_features, in_features]`
+    mean of `x x^T` over the calibration rows. The result equals
+    `mean(square(x @ weight_error^T))` over rows and output features, taken
+    without the rows.
+    """
+    projected = ops.matmul(weight_error, ops.cast(second_moment, "float32"))
+    return ops.mean(ops.sum(ops.multiply(projected, weight_error), axis=1))
+
+
 def awq_search_optimal_scales(
     weights,
     activation_magnitudes,
+    second_moment,
     *,
     num_grid_points=20,
     group_size=-1,
@@ -113,24 +141,32 @@ def awq_search_optimal_scales(
     """Search for optimal AWQ scales using grid search.
 
     The AWQ algorithm finds scaling factors that protect salient weights.
-    For each channel, we search for an optimal ratio in [0, 1] that minimizes
-    the activation-weighted quantization error.
+    For each channel, we search for an optimal ratio in `[0, 1)` that
+    minimizes the layer's output error after quantization.
 
     The key insight: we MULTIPLY weights by scales before quantization to
     expand salient weights. This ensures quantization noise is small relative
     to the expanded weight magnitude. During inference, we divide by scales
     to restore the original magnitude.
 
-    Scale formula (reference llm-awq / AutoAWQ):
-        scales = (x_stat**ratio / w_stat**(1 - ratio)).clamp(min=1e-4)
-    where ``x_stat`` is the per-channel activation magnitude and ``w_stat`` is
-    the per-in-channel weight magnitude from :func:`_get_weight_scale`. Scales
-    are then normalized by ``sqrt(max * min)``.
-    Loss function: Activation-weighted MSE (approximates output error)
+    Scale formula (AutoAWQ's duo scaling; llm-awq uses the activation term
+    alone):
+        scales = (x_stat**ratio / (w_stat**(1 - ratio) + 1e-4)).clamp(1e-4)
+    where `x_stat` is the per-channel activation magnitude and `w_stat` is
+    the per-in-channel weight magnitude from `_get_weight_scale`. Scales are
+    then normalized by `sqrt(max * min)`. `ratio` takes `num_grid_points`
+    values `i / num_grid_points`, so `1.0` is not a candidate, as in the
+    references.
+
+    Loss: the layer's mean squared output error over the calibration set,
+    computed from `second_moment` (`_output_error`). The reference runs
+    the layer on the stored activations; the value is the same.
 
     Args:
         weights: Weight tensor [out_features, in_features] (transposed kernel).
         activation_magnitudes: Per-channel activation magnitudes [in_features].
+        second_moment: Mean of `x x^T` over the calibration rows
+            [in_features, in_features].
         num_grid_points: Number of grid search points. Defaults to 20.
         group_size: Group size for quantization (-1 for per-channel).
         compute_scale_zero: Function to compute scale and zero for
@@ -140,70 +176,43 @@ def awq_search_optimal_scales(
         best_scales: Optimal per-channel scales [in_features].
     """
     in_features = ops.shape(weights)[1]
-
-    # Per-channel activation statistic (reference AWQ uses mean(|x|)).
     x_stat = ops.cast(activation_magnitudes, "float32")
-    # Avoid zero or very small values.
+    # A channel that never fires gets scale 1 rather than the clamp floor,
+    # which would drag the normalization of every other channel with it.
     x_stat = ops.where(ops.less(x_stat, 1e-8), ops.ones_like(x_stat), x_stat)
-
-    # Per-in-channel weight statistic (llm-awq get_weight_scale). This is the
-    # term the previous implementation dropped.
     w_stat = _get_weight_scale(weights, group_size)
-    w_stat = ops.where(ops.less(w_stat, 1e-8), ops.ones_like(w_stat), w_stat)
 
     best_loss = None
     best_scales = ops.ones((in_features,), dtype="float32")
-
-    # Grid search over ratio values from 0 to 1
-    for i in range(num_grid_points + 1):
+    for i in range(num_grid_points):
         ratio = i / num_grid_points
-
-        # Reference scale formula: balance activation and weight magnitudes.
         scales = ops.divide(
-            ops.power(x_stat, ratio), ops.power(w_stat, 1.0 - ratio)
+            ops.power(x_stat, ratio),
+            ops.add(ops.power(w_stat, 1.0 - ratio), 1e-4),
         )
         scales = ops.maximum(scales, 1e-4)
-
-        # Normalize scales to avoid extreme values
         scale_mean = ops.sqrt(ops.multiply(ops.max(scales), ops.min(scales)))
-        scale_mean = ops.maximum(scale_mean, 1e-8)
         scales = ops.divide(scales, scale_mean)
+        scales = ops.where(ops.isfinite(scales), scales, ops.ones_like(scales))
 
-        # Apply scales to weights by MULTIPLYING (expand salient weights)
-        # weights_scaled: [out_features, in_features]
         weights_scaled = ops.multiply(weights, scales)
-
         dequantized = _fake_quantize_weights(
             weights_scaled, in_features, group_size, compute_scale_zero
         )
-
-        # Scale back down by DIVIDING to restore original magnitude
         reconstructed = ops.divide(dequantized, scales)
-
-        # Compute activation-weighted MSE loss
-        # This approximates the output error: ||W*X - W_hat*X||^2
-        # by weighting each channel's error by x_stat^2
-        weight_error = ops.square(ops.subtract(weights, reconstructed))
-        # Weight by activation magnitudes squared (broadcast over out_features)
-        weighted_error = ops.multiply(weight_error, ops.square(x_stat))
-        loss = ops.mean(weighted_error)
-
-        # Track best
-        if best_loss is None:
+        loss = _output_error(
+            ops.subtract(weights, reconstructed), second_moment
+        )
+        # Strict improvement keeps the first minimum, as in the reference.
+        if best_loss is None or ops.less(loss, best_loss):
             best_loss = loss
             best_scales = scales
-        else:
-            is_better = ops.less(loss, best_loss)
-            if is_better:
-                best_loss = loss
-                best_scales = scales
-
     return best_scales
 
 
 def awq_search_best_clip(
     weights_scaled,
-    activation_sample,
+    second_moment,
     awq_scales,
     *,
     group_size=-1,
@@ -212,64 +221,66 @@ def awq_search_best_clip(
     output_channel_batch_size=64,
     compute_scale_zero=compute_awq_scale_zero,
 ):
-    """Search per-group weight clipping bounds (AutoAWQ ``best_clip``).
+    """Per-group clipping search (llm-awq `auto_clip_layer`).
 
-    After the AWQ scales have been applied, quantization error can be further
-    reduced by clipping the weight magnitudes. For each output channel and
-    quantization group this grid-searches a shrink factor on the per-group max
-    and keeps the value that minimizes the reconstruction error of the layer
-    output against a stashed activation sample.
-
-    The reconstruction uses the *scaled* input (``x / awq_scales``) so that it
-    matches the effective inference computation ``(x / s) @ (W * s)^T``.
+    For every output channel and group, the group's absolute maximum is
+    shrunk by `1 - i / num_grid_points` for `i` in
+    `range(int(max_shrink * num_grid_points))`, the scaled weights are
+    clipped to the bound and fake-quantized, and the bound with the smallest
+    partial-output error against the unclipped scaled weights is kept. The
+    error is exact over the calibration set: it uses the group's diagonal
+    block of the second moment of the scaled inputs `x / awq_scales`, where
+    the reference estimates it on a strided sample of 512 rows. The search
+    runs after the scale search, on the scaled weights, as in the reference.
 
     Args:
-        weights_scaled: Scaled weight matrix ``[out_features, in_features]``
-            (``W * awq_scales``).
-        activation_sample: Raw activation sample ``[rows, in_features]``.
-        awq_scales: Per-in-channel AWQ scales ``[in_features]``.
-        group_size: Quantization group size (``-1`` for per-channel).
-        num_grid_points: Number of shrink factors to try. Defaults to 20.
-        max_shrink: Maximum fractional shrink of the per-group max (the search
-            spans ``[1, 1 - max_shrink]``). Defaults to 0.5.
-        output_channel_batch_size: Output-channel batch size, to bound peak
-            memory.
+        weights_scaled: Scaled weights [out_features, in_features].
+        second_moment: Mean of `x x^T` over the calibration rows
+            [in_features, in_features], for the unscaled inputs.
+        awq_scales: The per-input-channel scales [in_features].
+        group_size: Quantization group size (-1 for per-channel).
+        num_grid_points: Grid resolution; the step is `1 / num_grid_points`.
+            Defaults to 20.
+        max_shrink: Largest shrink searched, exclusive: with the defaults
+            the bounds run from `1.0` down to `0.55` of the group max.
+            Defaults to 0.5.
+        output_channel_batch_size: Output channels searched per step, to
+            bound the intermediate tensors. It does not change the result.
         compute_scale_zero: Function to compute scale and zero for
             quantization.
 
     Returns:
-        clip_bound: Per-group clipping bound ``[out_features, n_groups, 1]``.
-        effective_group_size: Group size used for reshaping.
-        n_groups: Number of groups.
+        `(clip_bound, effective_group_size, n_groups)`: the bound is
+        `[out_features, n_groups, 1]`.
     """
     out_features, in_features = ops.shape(weights_scaled)
     awq_scales = ops.cast(awq_scales, "float32")
-    x = ops.cast(activation_sample, "float32")
-    if ops.ndim(x) > 2:
-        x = ops.reshape(x, (-1, in_features))
-    # Effective input to the scaled weights (see docstring).
-    x_scaled = ops.divide(x, awq_scales)
-
     if group_size and group_size > 0 and in_features % group_size == 0:
         effective_group_size = group_size
     else:
-        # Per-channel, or a group size that does not evenly divide the input:
-        # fall back to a single group per output channel for the clip search.
         effective_group_size = in_features
     n_groups = in_features // effective_group_size
-    # [rows, n_groups, effective_group_size]
-    x_grouped = ops.reshape(x_scaled, (-1, n_groups, effective_group_size))
+
+    # The second moment of the scaled inputs `x / s` is `G / (s s^T)`; a
+    # group's partial output only involves its diagonal block.
+    inverse_scales = ops.reciprocal(awq_scales)
+    scaled_moment = ops.multiply(
+        ops.cast(second_moment, "float32"),
+        ops.outer(inverse_scales, inverse_scales),
+    )
+    blocks = ops.reshape(
+        scaled_moment,
+        (n_groups, effective_group_size, n_groups, effective_group_size),
+    )
+    # [group, group] -> [n_groups, group, group]
+    blocks = ops.transpose(ops.diagonal(blocks, axis1=0, axis2=2), (2, 0, 1))
+
     w_grouped = ops.reshape(
         weights_scaled, (out_features, n_groups, effective_group_size)
     )
-    group_max = ops.max(
-        ops.abs(w_grouped), axis=-1, keepdims=True
-    )  # [out_features, n_groups, 1]
-
-    num_shrinks = max(1, int(num_grid_points))
-    step = max_shrink / num_grid_points
+    group_max = ops.max(ops.abs(w_grouped), axis=-1, keepdims=True)
+    num_shrinks = int(max_shrink * num_grid_points)
     quantizer_group_size = effective_group_size if n_groups > 1 else -1
-
     clip_bound_parts = []
     num_batches = (
         out_features + output_channel_batch_size - 1
@@ -278,17 +289,14 @@ def awq_search_best_clip(
         batch_start = batch_idx * output_channel_batch_size
         batch_end = min(batch_start + output_channel_batch_size, out_features)
         batch_size = batch_end - batch_start
-        # [batch_size, n_groups, effective_group_size]
         batch_weights = w_grouped[batch_start:batch_end]
         batch_group_max = group_max[batch_start:batch_end]
-        # Reference output for this output-channel batch:
-        # [batch_size, rows, n_groups].
-        reference_output = ops.einsum("rng,ong->orn", x_grouped, batch_weights)
-
         clip_bound = batch_group_max
         best_error = None
         for shrink_idx in range(num_shrinks):
-            bound = ops.multiply(batch_group_max, 1.0 - shrink_idx * step)
+            bound = ops.multiply(
+                batch_group_max, 1.0 - shrink_idx / num_grid_points
+            )
             weights_clipped = ops.clip(
                 batch_weights, ops.negative(bound), bound
             )
@@ -298,18 +306,18 @@ def awq_search_best_clip(
                 quantizer_group_size,
                 compute_scale_zero,
             )
-            weights_dequantized = ops.reshape(
-                weights_dequantized,
-                (batch_size, n_groups, effective_group_size),
+            weight_error = ops.subtract(
+                ops.reshape(
+                    weights_dequantized,
+                    (batch_size, n_groups, effective_group_size),
+                ),
+                batch_weights,
             )
-            clipped_output = ops.einsum(
-                "rng,ong->orn", x_grouped, weights_dequantized
+            # Mean squared partial-output error per (channel, group).
+            error = ops.einsum(
+                "ong,ngh,onh->on", weight_error, blocks, weight_error
             )
-            error = ops.mean(
-                ops.square(ops.subtract(clipped_output, reference_output)),
-                axis=1,
-            )  # [batch_size, n_groups]
-            error = ops.expand_dims(error, axis=-1)  # [batch_size, n_groups, 1]
+            error = ops.expand_dims(error, axis=-1)
             if best_error is None:
                 best_error = error
                 clip_bound = bound
@@ -318,7 +326,6 @@ def awq_search_best_clip(
                 best_error = ops.where(better, error, best_error)
                 clip_bound = ops.where(better, bound, clip_bound)
         clip_bound_parts.append(clip_bound)
-
     clip_bound = ops.concatenate(clip_bound_parts, axis=0)
     return clip_bound, effective_group_size, n_groups
 
@@ -326,66 +333,54 @@ def awq_search_best_clip(
 def awq_quantize_matrix(
     weights_transpose,
     activation_magnitudes,
+    second_moment,
     *,
     num_grid_points=20,
     group_size=-1,
     apply_clip=False,
-    activation_sample=None,
     clip_num_grid_points=20,
     clip_max_shrink=0.5,
     compute_scale_zero=compute_awq_scale_zero,
 ):
-    """Quantize a weight matrix using AWQ.
+    """Quantizes one weight matrix with AWQ.
 
-    This function performs the complete AWQ quantization process:
-    1. Find optimal per-channel scales via grid search
-    2. Apply scales to weights
-    3. (Optional) Search and apply per-group clipping bounds
-    4. Compute quantization parameters
-    5. Quantize weights
+    Runs the scale search, scales the weights, optionally runs the clipping
+    search on the scaled weights, and quantizes them group-wise.
 
     Args:
-        weights_transpose: Weight matrix [out_features, in_features].
-        activation_magnitudes: Per-channel activation magnitudes [in_features].
-        num_grid_points: Number of grid search points.
-        group_size: Group size for quantization.
-        apply_clip: Whether to run the AutoAWQ-style clipping search. Requires
-            ``activation_sample`` to be provided.
-        activation_sample: Optional raw activation sample [rows, in_features]
-            used only for the clipping search.
-        clip_num_grid_points: Number of shrink factors for the clipping
-            search.
-        clip_max_shrink: Maximum fractional shrink for the clipping search.
+        weights_transpose: Weights [out_features, in_features].
+        activation_magnitudes: Per-channel mean `|x|` [in_features].
+        second_moment: Mean of `x x^T` over the calibration rows
+            [in_features, in_features].
+        num_grid_points: Grid points of the scale search.
+        group_size: Quantization group size (-1 for per-channel).
+        apply_clip: Whether to run the clipping search.
+        clip_num_grid_points: Grid resolution of the clipping search.
+        clip_max_shrink: Largest shrink of the clipping search.
         compute_scale_zero: Function to compute scale and zero for
             quantization.
 
     Returns:
-        quantized: Quantized weights [out_features, in_features].
-        scale: Quantization scales [out_features, n_groups].
-        zero: Zero points [out_features, n_groups].
-        awq_scales: AWQ per-channel scales [in_features].
-        g_idx: Group indices [in_features].
+        `(quantized, scale, zero, awq_scales, g_idx)`: the codes
+        [out_features, in_features], the multiplier scale and zero point
+        [out_features, n_groups], the input scales [in_features] and the
+        group index [in_features].
     """
     out_features, in_features = ops.shape(weights_transpose)
-
-    # Step 1: Find optimal AWQ scales via grid search
     awq_scales = awq_search_optimal_scales(
         weights_transpose,
         activation_magnitudes,
+        second_moment,
         num_grid_points=num_grid_points,
         group_size=group_size,
         compute_scale_zero=compute_scale_zero,
     )
-
-    # Step 2: Apply AWQ scales by MULTIPLYING (expand salient weights)
-    # weights_scaled: [out_features, in_features]
     weights_scaled = ops.multiply(weights_transpose, awq_scales)
 
-    # Step 3: (Optional) Search and apply per-group clipping bounds.
-    if apply_clip and activation_sample is not None:
+    if apply_clip:
         clip_bound, effective_group_size, n_groups = awq_search_best_clip(
             weights_scaled,
-            activation_sample,
+            second_moment,
             awq_scales,
             group_size=group_size,
             num_grid_points=clip_num_grid_points,
@@ -399,29 +394,17 @@ def awq_quantize_matrix(
         weights_scaled = ops.reshape(w_grouped, (out_features, in_features))
 
     if group_size == -1:
-        # Per-channel quantization (no grouping)
         scale, zero, maxq = compute_scale_zero(weights_scaled, group_size=-1)
-
-        # Quantize
         quantized = quantize_with_zero_point(weights_scaled, scale, zero, maxq)
-
-        # Build group indices (all 0s for per-channel). Integer group
-        # metadata, kept as int32.
         g_idx = ops.zeros((in_features,), dtype="int32")
     else:
-        # Grouped quantization - use proper per-row grouping
         scale, zero, maxq = compute_scale_zero(
             weights_scaled, group_size=group_size
         )
-
-        # Compute group indices: maps each input feature to its group
         g_idx = ops.cast(ops.arange(0, in_features) // group_size, "int32")
-
-        # Quantize using group index mapping
         quantized = quantize_with_sz_map(
             weights_scaled, scale, zero, g_idx, maxq
         )
-
     return quantized, scale, zero, awq_scales, g_idx
 
 
@@ -432,9 +415,11 @@ class AWQCalibrator(Calibrator):
     performs AWQ quantization on layer weights.
 
     The AWQ algorithm works by:
-    1. Collecting per-channel mean activation magnitudes
+    1. Collecting per-channel mean activation magnitudes and the input
+       second moment, one of each per problem of the calibration view
     2. Using activation magnitudes to determine weight saliency
-    3. Finding optimal per-channel scales via grid search
+    3. Finding optimal per-channel scales via grid search on the layer's
+       output error
     4. (Optional) Searching per-group weight clipping bounds
     5. Applying scales before quantization to protect salient weights
 
@@ -451,26 +436,23 @@ class AWQCalibrator(Calibrator):
         super().__init__(layer, config)
         self.compute_scale_zero = compute_awq_scale_zero
 
-        # Initialize activation magnitude accumulator (running per-channel
-        # MEAN of |x|, as in the reference AWQ implementations), one row
-        # of statistics per problem of the calibration view.
+        # Running per-channel mean of |x| (the reference's activation
+        # statistic) and the running mean of `x x^T`, from which both
+        # searches compute the output error exactly.
         shape = (self.rows,)
+        moment_shape = (self.rows, self.rows)
         if self.batch > 1:
             shape = (self.batch,) + shape
+            moment_shape = (self.batch,) + moment_shape
         self.activation_magnitudes = ops.zeros(shape, dtype="float32")
-
-        # Bounded stash of raw activation rows for the clipping search.
-        self._clip_samples = []
-        self._clip_sample_rows = 0
+        self.second_moment = ops.zeros(moment_shape, dtype="float32")
 
     def observe(self, inputs):
-        """Updates the per-channel activation magnitudes with a new batch.
+        """Updates the activation statistics with a new batch.
 
-        This tracks the running per-channel MEAN of the absolute activation
-        value across all calibration batches (matching llm-awq / AutoAWQ),
-        accumulated with a numerically stable batch-count-weighted update. It
-        also stashes a bounded sample of raw activation rows that the clipping
-        search reuses.
+        Tracks the running per-channel mean of `|x|` and the running mean
+        of `x x^T` over all calibration rows, each with a batch-count-weighted
+        update, so the result does not depend on the batching.
 
         Args:
             inputs: A 2D or higher-dimensional tensor of input activations
@@ -492,27 +474,25 @@ class AWQCalibrator(Calibrator):
         x = ops.cast(self.view.inputs_to_view(inputs), "float32")
         num_new_samples = int(ops.shape(x)[-2])
         total_samples = self.num_samples + num_new_samples
+        weight = num_new_samples / total_samples
 
-        # Running per-channel mean of |x| via a stable weighted update:
-        #   mean <- mean + (batch_mean - mean) * n / (count + n)
         batch_mean = ops.mean(ops.abs(x), axis=-2)
-        delta = ops.subtract(batch_mean, self.activation_magnitudes)
         self.activation_magnitudes = ops.add(
             self.activation_magnitudes,
-            ops.multiply(delta, num_new_samples / total_samples),
+            ops.multiply(
+                ops.subtract(batch_mean, self.activation_magnitudes), weight
+            ),
+        )
+        gram = ops.matmul(ops.swapaxes(x, -1, -2), x)
+        gram = ops.divide(ops.add(gram, ops.swapaxes(gram, -1, -2)), 2.0)
+        batch_moment = ops.divide(gram, float(num_new_samples))
+        self.second_moment = ops.add(
+            self.second_moment,
+            ops.multiply(
+                ops.subtract(batch_moment, self.second_moment), weight
+            ),
         )
         self.num_samples = total_samples
-
-        # Stash a bounded sample of raw activations for the clipping search.
-        if (
-            self.config.apply_clip
-            and self._clip_sample_rows < MAX_CLIP_SAMPLE_ROWS
-        ):
-            take = min(
-                num_new_samples, MAX_CLIP_SAMPLE_ROWS - self._clip_sample_rows
-            )
-            self._clip_samples.append(x[..., :take, :])
-            self._clip_sample_rows += take
 
     def quantize(self):
         """Perform AWQ quantization on the layer.
@@ -524,16 +504,11 @@ class AWQCalibrator(Calibrator):
         """
         kernel = self._kernel_view()
         magnitudes = self.activation_magnitudes
-
-        # Assemble the stashed activation sample for the clipping search.
-        apply_clip = self.config.apply_clip
-        activation_sample = None
-        if apply_clip and self._clip_samples:
-            activation_sample = ops.concatenate(self._clip_samples, axis=-2)
+        moments = self.second_moment
         if self.batch == 1:
             magnitudes = ops.expand_dims(magnitudes, 0)
-            if activation_sample is not None:
-                activation_sample = ops.expand_dims(activation_sample, 0)
+            moments = ops.expand_dims(moments, 0)
+        apply_clip = self.config.apply_clip and not self._skips_clip()
 
         codes = []
         scales = []
@@ -541,18 +516,13 @@ class AWQCalibrator(Calibrator):
         input_scales = []
         group_indices = []
         for index in range(self.batch):
-            # Perform AWQ quantization
             quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
                 ops.transpose(kernel[index]),
                 magnitudes[index],
+                moments[index],
                 num_grid_points=self.config.num_grid_points,
                 group_size=self.config.group_size,
-                apply_clip=apply_clip and activation_sample is not None,
-                activation_sample=(
-                    None
-                    if activation_sample is None
-                    else activation_sample[index]
-                ),
+                apply_clip=apply_clip,
                 compute_scale_zero=self.compute_scale_zero,
             )
             # Cast to uint8 for storage. The algorithm works on `[out, in]`;
@@ -587,8 +557,19 @@ class AWQCalibrator(Calibrator):
             awq_scales=awq_scales,
         )
 
+    def _skips_clip(self):
+        """Whether the layer is excluded from the clipping search by name.
+
+        The references skip the query and key projections: the clipping
+        objective is one layer's output error, and the attention scores
+        depend on the product of the two.
+        """
+        name = self.original_layer.name
+        return any(
+            pattern in name for pattern in self.config.clip_skip_patterns
+        )
+
     def release(self):
-        """Drops the statistics and the stashed rows."""
+        """Drops the statistics."""
         del self.activation_magnitudes
-        self._clip_samples = []
-        self._clip_sample_rows = 0
+        del self.second_moment
