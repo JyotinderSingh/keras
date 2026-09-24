@@ -16,10 +16,12 @@ from keras.src.quantizers.geometry import ProjectionGeometry
 class Calibrator:
     """Per-layer calibration state and solve for one calibration mode.
 
-    The constructor resolves the 2-D `(rows, columns)` view the algorithm
-    works on from the layer's geometry (`calibration_rows_columns`).
-    `rows` is the number of input features a sample of the layer's
-    inputs carries; `num_samples` counts the input rows observed so far.
+    The constructor resolves the layer's `CalibrationView`: the 2-D
+    `(rows, columns)` matrix the algorithm works on and `batch`, the
+    number of independent problems a kernel axis shared with the inputs
+    stacks. `rows` is the number of contracted features a sample of the
+    layer's inputs carries; `num_samples` counts the input rows observed
+    so far, per problem.
 
     Args:
         layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
@@ -47,16 +49,17 @@ class Calibrator:
             raise TypeError(
                 f"Unsupported layer type for {self.mode.upper()}: {type(layer)}"
             )
-        self.rows, self.columns = geometry.calibration_rows_columns(
-            tuple(layer.kernel.shape)
-        )
+        self.view = geometry.calibration_view()
+        self.batch = self.view.batch
+        self.rows = self.view.rows
+        self.columns = self.view.columns
 
     def observe(self, inputs):
         """Accumulates statistics from one batch of the layer's inputs."""
         raise NotImplementedError
 
-    def _flatten_inputs(self, inputs):
-        """Validates `inputs` and lays them out as `float32` `[-1, rows]`."""
+    def _check_inputs(self, inputs):
+        """Validates one batch of the layer's inputs before `observe`."""
         if inputs is None:
             raise ValueError("Input tensor cannot be None.")
         if len(inputs.shape) < 2:
@@ -66,20 +69,10 @@ class Calibrator:
             )
         if ops.size(inputs) == 0:
             raise ValueError("Input tensor cannot be empty.")
-        if len(inputs.shape) > 2:
-            inputs = ops.reshape(inputs, (-1, inputs.shape[-1]))
-        return ops.cast(inputs, "float32")
 
     def _kernel_view(self):
-        """The layer's kernel in the `(rows, columns)` view.
-
-        The variable itself for a 2-D kernel, a reshaped copy for a 3-D
-        one.
-        """
-        kernel = self.original_layer.kernel
-        if len(kernel.shape) != 2:
-            kernel = ops.reshape(kernel, (self.rows, self.columns))
-        return kernel
+        """The layer's kernel laid out through the calibration view."""
+        return self.view.kernel_to_view(self.original_layer.kernel)
 
     def quantize(self):
         """Solves for the layer's codes and writes them back."""

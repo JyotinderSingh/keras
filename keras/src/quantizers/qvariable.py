@@ -235,6 +235,11 @@ class QVariable:
             and transposes it). It replaces `scheme.channel_axis`, which
             must then be `None`; `scale` itself stays the stored variable,
             so consumers that serialize it see the stored form.
+        permutation: Optional axis order in which the stored codes
+            flatten `shape`: the unpacked codes are the weight transposed
+            by `permutation` and flattened to 2-D, as the calibration
+            modes store an einsum kernel whose contracted axes do not
+            lead. `None` (or the identity) keeps the weight's own order.
         compute_dtype: Dtype the unpacked codes are cast to before the
             arithmetic. A grouped scheme returns this dtype; a per-channel
             or per-tensor scheme returns its promotion with the scale's
@@ -254,6 +259,7 @@ class QVariable:
         g_idx=None,
         input_scales=None,
         align_scale=None,
+        permutation=None,
         compute_dtype="float32",
     ):
         if scheme.has_zero_point != (zero_point is not None):
@@ -276,11 +282,22 @@ class QVariable:
                 "itself, so it needs a scheme with no `channel_axis` and "
                 f"no groups. Received: scheme={scheme!r}"
             )
+        shape = tuple(int(d) for d in shape)
+        if permutation is not None:
+            permutation = tuple(int(axis) for axis in permutation)
+            if sorted(permutation) != list(range(len(shape))):
+                raise ValueError(
+                    "`permutation` must permute the axes of `shape`. "
+                    f"Received: permutation={permutation}, shape={shape}"
+                )
+            if permutation == tuple(range(len(shape))):
+                permutation = None
         self.codes = codes
         self.scale = scale
         self.layout = layout
         self.scheme = scheme
-        self.shape = tuple(int(d) for d in shape)
+        self.shape = shape
+        self.permutation = permutation
         self.zero_point = zero_point
         self.g_idx = g_idx
         self.input_scales = input_scales
@@ -336,6 +353,12 @@ class QVariable:
 
     def _restore_shape(self, tensor):
         """Restores `shape`; an einsum kernel is N-D."""
+        if self.permutation is not None:
+            permuted = tuple(self.shape[axis] for axis in self.permutation)
+            inverse = [0] * len(self.permutation)
+            for position, axis in enumerate(self.permutation):
+                inverse[axis] = position
+            return ops.transpose(ops.reshape(tensor, permuted), inverse)
         if tuple(tensor.shape) != self.shape:
             tensor = ops.reshape(tensor, self.shape)
         return tensor

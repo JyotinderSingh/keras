@@ -323,7 +323,11 @@ class GPTQCalibrator(Calibrator):
             group_size=config.group_size,
             compute_dtype=layer.variable_dtype,
         )
-        self.hessian = ops.zeros((self.rows, self.rows), dtype="float32")
+        # One Hessian per problem of the calibration view.
+        hessian_shape = (self.rows, self.rows)
+        if self.batch > 1:
+            hessian_shape = (self.batch,) + hessian_shape
+        self.hessian = ops.zeros(hessian_shape, dtype="float32")
 
     @classmethod
     def undersampling_warning(cls, layers):
@@ -358,34 +362,38 @@ class GPTQCalibrator(Calibrator):
         computed over a large dataset without loading all samples into memory
         at once.
 
-        The inputs are first laid out as a 2D matrix [num_samples,
-        num_features] before the Hessian is calculated.
+        The layer's calibration view first lays the inputs out as a 2D
+        matrix [num_samples, num_features] (with a leading problem axis
+        for a batched kernel) before the Hessian is calculated.
 
         Args:
             inputs: A 2D or higher-dimensional tensor of input activations
-                from a calibration batch.
+                from a calibration batch, in the layer's input layout.
 
         Raises:
             ValueError: If the feature dimension of `inputs` does not match
                 the dimensions of the pre-initialized Hessian matrix
                 `self.hessian`.
         """
-        x = self._flatten_inputs(inputs)
-        if ops.shape(self.hessian)[0] != ops.shape(x)[-1]:
+        self._check_inputs(inputs)
+        input_features = self.view.input_features(inputs)
+        if input_features != self.rows:
             raise ValueError(
-                f"Hessian dimensions ({ops.shape(self.hessian)[0]}) do not "
-                f"match input features ({ops.shape(x)[-1]})."
+                f"Hessian dimensions ({self.rows}) do not match input "
+                f"features ({input_features})."
             )
-        num_new_samples = int(ops.shape(x)[0])
+        x = ops.cast(self.view.inputs_to_view(inputs), "float32")
+
+        num_new_samples = int(ops.shape(x)[-2])
         num_prev_samples = self.num_samples
         total_samples = num_prev_samples + num_new_samples
 
-        # gram_matrix: [features, features]
-        gram_matrix = ops.matmul(ops.transpose(x), x)
+        # gram_matrix: [features, features], per problem
+        gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
         # Ensures numerical stability and symmetry in case of large floating
         # point activations.
         gram_matrix = ops.divide(
-            ops.add(gram_matrix, ops.transpose(gram_matrix)), 2.0
+            ops.add(gram_matrix, ops.swapaxes(gram_matrix, -1, -2)), 2.0
         )
 
         # Decay previous mean and add current per-sample contribution
@@ -440,53 +448,47 @@ class GPTQCalibrator(Calibrator):
             blocksize: (int, optional) The size of the weight block to process
              at a time. Defaults to 128.
         """
-        weights_transpose = ops.transpose(self._kernel_view())
+        kernel = self._kernel_view()
+        hessians = self.hessian
+        if self.batch == 1:
+            hessians = ops.expand_dims(hessians, 0)
 
-        # Dampen the Hessian for Stability
-        hessian_diagonal = ops.diagonal(self.hessian)
-        dead_diagonal = ops.equal(hessian_diagonal, 0.0)
-        hessian_diagonal = ops.where(dead_diagonal, 1.0, hessian_diagonal)
-        hessian_matrix = ops.add(
-            self.hessian,
-            ops.diag(
-                ops.where(dead_diagonal, 1.0, ops.zeros_like(hessian_diagonal))
-            ),
-        )
-
-        # Add dampening factor to the Hessian diagonal
-        damping_factor = ops.multiply(
-            self.config.hessian_damping, ops.mean(hessian_diagonal)
-        )
-        hessian_diagonal = ops.add(hessian_diagonal, damping_factor)
-        hessian_matrix = ops.add(
-            ops.subtract(
-                hessian_matrix, ops.diag(ops.diagonal(hessian_matrix))
-            ),
-            ops.diag(hessian_diagonal),
-        )
-
-        # The inverse Hessian used for error correction is derived inside
-        # `gptq_quantize_matrix` from the dampened Hessian using a numerically
-        # stable Cholesky formulation (triangular solves, no dense inverse).
-        quantized, scale, zero, g_idx = gptq_quantize_matrix(
-            weights_transpose,
-            hessian=hessian_matrix,
-            blocksize=blocksize,
-            group_size=self.config.group_size,
-            activation_order=self.config.activation_order,
-            order_metric=ops.diagonal(hessian_matrix),
-            compute_scale_zero=self.compute_scale_zero,
-        )
+        codes = []
+        scales = []
+        zeros = []
+        group_indices = []
+        for index in range(self.batch):
+            hessian_matrix = self._dampened_hessian(hessians[index])
+            # The inverse Hessian used for error correction is derived
+            # inside `gptq_quantize_matrix` from the dampened Hessian using
+            # a numerically stable Cholesky formulation (triangular solves,
+            # no dense inverse).
+            quantized, scale, zero, g_idx = gptq_quantize_matrix(
+                ops.transpose(kernel[index]),
+                hessian=hessian_matrix,
+                blocksize=blocksize,
+                group_size=self.config.group_size,
+                activation_order=self.config.activation_order,
+                order_metric=ops.diagonal(hessian_matrix),
+                compute_scale_zero=self.compute_scale_zero,
+            )
+            # The algorithm works on `[out, in]`; the layer stores the
+            # view's `[in, out]` orientation with the group parameters as
+            # `[n_groups, out]`, so the forward pass never transposes.
+            codes.append(ops.transpose(quantized))
+            scales.append(ops.transpose(scale))
+            zeros.append(ops.transpose(zero))
+            # Each problem's groups follow the previous problem's.
+            group_indices.append(
+                ops.add(g_idx, index * ops.shape(scales[-1])[0])
+            )
+        quantized = ops.concatenate(codes, axis=0)
+        scale = ops.concatenate(scales, axis=0)
+        zero = ops.concatenate(zeros, axis=0)
+        g_idx = ops.concatenate(group_indices, axis=0)
         quantized = ops.cast(
             quantized, self.original_layer.quantized_kernel.dtype
         )
-
-        # The algorithm works on `[out, in]`; the layer stores the kernel's
-        # own `[in, out]` orientation with the group parameters as
-        # `[n_groups, out]`, so the forward pass never transposes.
-        quantized = ops.transpose(quantized)
-        scale = ops.transpose(scale)
-        zero = ops.transpose(zero)
 
         if self.config.weight_bits == 4:
             # For 4-bit weights, we pack two values per byte.
@@ -506,6 +508,30 @@ class GPTQCalibrator(Calibrator):
 
         strategy_registry.get_strategy("gptq").write_back(
             self.original_layer, quantized, scale, zero, g_idx
+        )
+
+    def _dampened_hessian(self, hessian):
+        """The Hessian with dead inputs revived and its diagonal dampened."""
+        hessian_diagonal = ops.diagonal(hessian)
+        dead_diagonal = ops.equal(hessian_diagonal, 0.0)
+        hessian_diagonal = ops.where(dead_diagonal, 1.0, hessian_diagonal)
+        hessian_matrix = ops.add(
+            hessian,
+            ops.diag(
+                ops.where(dead_diagonal, 1.0, ops.zeros_like(hessian_diagonal))
+            ),
+        )
+
+        # Add dampening factor to the Hessian diagonal
+        damping_factor = ops.multiply(
+            self.config.hessian_damping, ops.mean(hessian_diagonal)
+        )
+        hessian_diagonal = ops.add(hessian_diagonal, damping_factor)
+        return ops.add(
+            ops.subtract(
+                hessian_matrix, ops.diag(ops.diagonal(hessian_matrix))
+            ),
+            ops.diag(hessian_diagonal),
         )
 
     def release(self):

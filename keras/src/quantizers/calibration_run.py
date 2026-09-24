@@ -264,9 +264,9 @@ def stream_inputs(layers_map, calibrators, execution_trace=None):
 
     Registers a calibration capture (`keras.src.quantizers.capture`) on
     each layer, which the dispatch machinery runs before each of the
-    layer's forward passes, whichever forward that is. The capture lays
-    the input out as the 2-D `[-1, rows]` matrix the calibrator's
-    statistics describe and passes it to `calibrators[name].observe`.
+    layer's forward passes, whichever forward that is, and passes the
+    input to `calibrators[name].observe`, which lays it out through the
+    layer's calibration view.
     Every capture is removed on exit, even if an exception occurs;
     nothing on the layers is rebound.
 
@@ -296,13 +296,7 @@ def stream_inputs(layers_map, calibrators, execution_trace=None):
                 # id cannot be recycled while tracing).
                 execution_trace[name] = (call_counter[0], inputs)
                 call_counter[0] += 1
-            # Explicitly reshape the input tensor to be 2D, with the
-            # second dimension matching the number of input features
-            # expected by the layer's kernel.
-            # This correctly handles inputs of any dimensionality
-            # (e.g., 3D or 4D).
-            calibrator = calibrators[name]
-            calibrator.observe(ops.reshape(inputs, (-1, calibrator.rows)))
+            calibrators[name].observe(inputs)
 
         return capture
 

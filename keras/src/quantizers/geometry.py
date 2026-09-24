@@ -17,7 +17,8 @@ Two geometry families exist today:
   `EinsumProjectionGeometry`, whose axis analysis lives on the layer
   itself and is reached through the geometry's hooks), which axes the
   quantizers reduce over, how a scale lines up with the kernel and with
-  the outputs, and the 2D `(rows, columns)` view of an N-D kernel.
+  the outputs, the 2D `(rows, columns)` view of an N-D kernel, and the
+  `CalibrationView` the calibration modes derive from the equation.
 - Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
   plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
   projection (`ReversibleLookupGeometry`).
@@ -89,10 +90,113 @@ change at all: declare its `family` and implement the strategy's
 `_build_<family>`, `_call_<family>` and `_quantize_<family>` methods.
 """
 
+import math
 import string
 
 from keras.src import ops
 from keras.src.quantizers.quantizers import ternarize
+
+
+class CalibrationView:
+    """The 2-D view of a projection kernel that calibration works on.
+
+    GPTQ and AWQ act on a matrix whose rows are the kernel's contracted
+    axes and whose columns are the axes that reach the output from the
+    kernel alone, each flattened in the kernel's own axis order. An axis
+    shared by the inputs, the kernel and the output (the expert axis of a
+    mixture-of-experts down projection) is a batch axis: every index is
+    an independent problem, calibrated from its own slice of the inputs.
+
+    `kernel_to_view` lays the kernel out as `(batch, rows, columns)` and
+    `inputs_to_view` lays the layer's inputs out as `(batch, samples,
+    rows)`, so the row index means the same flattened contracted index on
+    both sides; without a batch axis the inputs view is `(samples, rows)`.
+    `kernel_permutation` is the axis order the view flattens; a stored
+    `(batch * rows, columns)` matrix is restored from it by `QVariable`.
+
+    Args:
+        kernel_shape: The kernel's own shape.
+        kernel_batch_axes: Kernel axes shared with the inputs and output.
+        kernel_contracted_axes: Kernel axes contracted with the inputs.
+        kernel_free_axes: Kernel axes that reach the output alone.
+        input_batch_axes: Input axes matching `kernel_batch_axes`, in the
+            same order.
+        input_contracted_axes: Input axes matching
+            `kernel_contracted_axes`, in the same order.
+    """
+
+    def __init__(
+        self,
+        kernel_shape,
+        *,
+        kernel_batch_axes,
+        kernel_contracted_axes,
+        kernel_free_axes,
+        input_batch_axes,
+        input_contracted_axes,
+    ):
+        self.kernel_shape = tuple(int(d) for d in kernel_shape)
+        self.kernel_permutation = (
+            tuple(kernel_batch_axes)
+            + tuple(kernel_contracted_axes)
+            + tuple(kernel_free_axes)
+        )
+        if sorted(self.kernel_permutation) != list(
+            range(len(self.kernel_shape))
+        ):
+            raise ValueError(
+                "The batch, contracted and free axes must partition the "
+                f"kernel axes. Received: kernel_shape={self.kernel_shape}, "
+                f"kernel_batch_axes={tuple(kernel_batch_axes)}, "
+                f"kernel_contracted_axes={tuple(kernel_contracted_axes)}, "
+                f"kernel_free_axes={tuple(kernel_free_axes)}"
+            )
+        self.batch = math.prod(self.kernel_shape[i] for i in kernel_batch_axes)
+        self.rows = math.prod(
+            self.kernel_shape[i] for i in kernel_contracted_axes
+        )
+        self.columns = math.prod(self.kernel_shape[i] for i in kernel_free_axes)
+        self.input_batch_axes = tuple(input_batch_axes)
+        self.input_contracted_axes = tuple(input_contracted_axes)
+
+    @property
+    def permuted(self):
+        """Whether the view reorders the kernel axes."""
+        return self.kernel_permutation != tuple(range(len(self.kernel_shape)))
+
+    def kernel_to_view(self, kernel):
+        """Lays the kernel out as `(batch, rows, columns)`."""
+        if self.permuted:
+            kernel = ops.transpose(kernel, self.kernel_permutation)
+        return ops.reshape(kernel, (self.batch, self.rows, self.columns))
+
+    def input_features(self, inputs):
+        """Number of contracted features the inputs carry per sample."""
+        rank = len(inputs.shape)
+        return math.prod(
+            inputs.shape[axis % rank] for axis in self.input_contracted_axes
+        )
+
+    def inputs_to_view(self, inputs):
+        """Lays the layer's inputs out as `(batch, samples, rows)`.
+
+        The result is `(samples, rows)` when the kernel has no batch axis
+        (or a batch axis of size one).
+        """
+        rank = len(inputs.shape)
+        batch = [axis % rank for axis in self.input_batch_axes]
+        contracted = [axis % rank for axis in self.input_contracted_axes]
+        free = [
+            axis
+            for axis in range(rank)
+            if axis not in batch and axis not in contracted
+        ]
+        order = batch + free + contracted
+        if order != list(range(rank)):
+            inputs = ops.transpose(inputs, order)
+        if self.batch > 1:
+            return ops.reshape(inputs, (self.batch, -1, self.rows))
+        return ops.reshape(inputs, (-1, self.rows))
 
 
 class QuantizationGeometry:
@@ -137,13 +241,22 @@ class ProjectionGeometry(QuantizationGeometry):
         """
         return tuple(self.layer.kernel_shape)
 
-    def calibration_rows_columns(self, kernel_shape):
-        """2D `(rows, columns)` view used by the calibration strategies.
+    def calibration_view(self):
+        """The `CalibrationView` the calibration strategies work on.
 
-        Kept apart from `rows_columns`: the calibration strategies may split
-        a kernel by a different rule than the weight-only ones.
+        Kept apart from `rows_columns`, which folds every non-contracted
+        axis into the columns: calibration stacks an axis shared with the
+        inputs into independent problems along the rows, and may permute
+        the kernel axes.
         """
-        return kernel_shape[0], kernel_shape[1]
+        return CalibrationView(
+            self.weight_shape,
+            kernel_batch_axes=(),
+            kernel_contracted_axes=(0,),
+            kernel_free_axes=(1,),
+            input_batch_axes=(),
+            input_contracted_axes=(-1,),
+        )
 
     def contract(self, inputs, kernel):
         """Contracts `inputs` against a kernel in the contraction shape."""
@@ -259,26 +372,34 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     strategies to it.
     """
 
-    def calibration_rows_columns(self, kernel_shape):
-        if len(kernel_shape) not in (2, 3):
+    def calibration_view(self):
+        axes = self.layer.einsum_axes
+        # The equation analysis already refuses a kernel axis absent from
+        # both the inputs and the output; what is left to check is that the
+        # kernel has something to contract and something to output, and
+        # that the inputs are not summed over an axis on their own.
+        if (
+            not axes.kernel_reduced_axes
+            or not axes.kernel_free_axes
+            or sorted(axes.input_contracted_axes)
+            != sorted(axes.input_reduced_axes)
+        ):
             raise ValueError(
-                "Calibration only supports 2D or 3D kernels. Received: "
-                f"kernel_shape={tuple(kernel_shape)}"
+                "Cannot derive a calibration view for the `EinsumDense` "
+                f"equation '{self.layer.equation}'. The kernel needs at "
+                "least one axis contracted with the inputs and one axis "
+                "that reaches the output, and the inputs must not be summed "
+                "over an axis of their own. Exclude the layer with "
+                "`filters`."
             )
-        if len(kernel_shape) == 2:
-            return kernel_shape[0], kernel_shape[1]
-        # 3D kernels are split by locating the model dimension (the largest
-        # one): [d_model, heads, head_dim] is a QKV projection, while
-        # [heads, head_dim, d_model] is an attention output projection.
-        shape = list(kernel_shape)
-        d_model_dim_index = shape.index(max(shape))
-        if d_model_dim_index == 0:  # QKV projection case
-            in_features, heads, head_dim = shape
-            return in_features, heads * head_dim
-        elif d_model_dim_index in [1, 2]:  # Attention Output case
-            heads, head_dim, out_features = shape
-            return heads * head_dim, out_features
-        raise ValueError("Could not determine row/column split.")
+        return CalibrationView(
+            self.weight_shape,
+            kernel_batch_axes=axes.kernel_batch_axes,
+            kernel_contracted_axes=axes.kernel_reduced_axes,
+            kernel_free_axes=axes.kernel_free_axes,
+            input_batch_axes=axes.input_batch_axes,
+            input_contracted_axes=axes.input_contracted_axes,
+        )
 
     def contract(self, inputs, kernel):
         return ops.einsum(self.layer.equation, inputs, kernel)

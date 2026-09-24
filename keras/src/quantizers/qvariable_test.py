@@ -153,6 +153,42 @@ class QVariableTest(testing.TestCase):
                 align_scale=ops.transpose,
             )
 
+    def test_permutation_restores_the_weight_axes(self):
+        # The calibration modes store an einsum kernel as its permuted 2-D
+        # view; the view carries the axis order back to the weight.
+        weight = np.arange(24, dtype="float32").reshape(2, 3, 4)
+        codes = np.transpose(weight, (1, 0, 2)).reshape(3, 8).astype("int8")
+        view = QVariable(
+            codes=codes,
+            scale=np.float32(1.0),
+            layout=NoPack(),
+            scheme=WeightScheme(code_range=(-127, 127)),
+            shape=(2, 3, 4),
+            permutation=(1, 0, 2),
+        )
+        self.assertEqual(view.permutation, (1, 0, 2))
+        self.assertAllClose(view.unpack(), weight)
+        self.assertAllClose(view.dequantize(), weight)
+        # The identity order is no permutation at all.
+        identity = QVariable(
+            codes=codes,
+            scale=np.float32(1.0),
+            layout=NoPack(),
+            scheme=WeightScheme(code_range=(-127, 127)),
+            shape=(3, 8),
+            permutation=(0, 1),
+        )
+        self.assertIsNone(identity.permutation)
+        with self.assertRaisesRegex(ValueError, "permute the axes"):
+            QVariable(
+                codes=codes,
+                scale=np.float32(1.0),
+                layout=NoPack(),
+                scheme=WeightScheme(code_range=(-127, 127)),
+                shape=(2, 3, 4),
+                permutation=(0, 0, 2),
+            )
+
     def test_per_channel_scale_divides(self):
         codes = np.array([[-127, 64], [3, 0]], "int8")
         scale = np.array([2.0, 4.0], "float32")

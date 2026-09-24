@@ -13,6 +13,7 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.calibration_run import find_layers_in_block
 from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq import _stable_permutation
@@ -235,6 +236,11 @@ class GPTQTest(testing.TestCase):
         unsupported_layer = _get_test_layer("Unsupported", kernel_shape=None)
         with self.assertRaisesRegex(TypeError, "Unsupported layer type"):
             GPTQCalibrator(unsupported_layer)
+        # A projection that does not support the mode is refused too.
+        ternary = layers.TernaryDense(4)
+        ternary.build((None, 3))
+        with self.assertRaisesRegex(TypeError, "Unsupported layer type"):
+            GPTQCalibrator(ternary)
 
     def test_update_hessian_invalid_input(self):
         rng = np.random.default_rng(seed=42)
@@ -1413,3 +1419,247 @@ class TestModelQuantization(testing.TestCase):
         self.assertIsNone(
             restored_dense.quantization_config.quantization_layer_structure
         )
+
+
+class GPTQEinsumLayoutTest(testing.TestCase):
+    """GPTQ splits an einsum kernel by its equation, not by its shape."""
+
+    def _config(self, group_size=-1, activation_order=False):
+        return GPTQConfig(
+            dataset=None,
+            tokenizer=None,
+            weight_bits=4,
+            symmetric=False,
+            group_size=group_size,
+            activation_order=activation_order,
+        )
+
+    def _einsum_layer(self, equation, output_shape, input_shape, kernel=None):
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        if kernel is not None:
+            layer.kernel.assign(kernel)
+        return layer
+
+    def _dense_layer(self, kernel):
+        layer = layers.Dense(kernel.shape[1])
+        layer.build((None, kernel.shape[0]))
+        layer.kernel.assign(kernel)
+        return layer
+
+    def _calibrate(self, layer, x, config):
+        layer.quantize("gptq", config=config)
+        gptq = GPTQCalibrator(layer, config)
+        gptq.observe(x)
+        gptq.quantize()
+        return gptq
+
+    def _dequantized(self, layer):
+        strategy = strategy_registry.get_strategy("gptq")
+        return ops.convert_to_numpy(strategy.qvariable(layer).dequantize())
+
+    @parameterized.named_parameters(
+        # Gemma's query projection `[heads, d_model, head_dim]` against the
+        # same weights laid out `[d_model, heads, head_dim]`.
+        ("gemma_q", "btd,ndh->btnh", "btd,dnh->btnh", (None, 2, 4)),
+        # A mixture-of-experts gate `[experts, d_model, inner]` against
+        # `[d_model, experts, inner]`.
+        ("expert_gate", "btd,edi->btei", "btd,dei->btei", (None, 3, 6)),
+    )
+    def test_kernel_only_axes_share_one_hessian(
+        self, equation, reference_equation, output_shape
+    ):
+        input_shape = (None, 5, 8)
+        rng = np.random.default_rng(seed=3)
+        layer = self._einsum_layer(equation, output_shape, input_shape)
+        kernel = ops.convert_to_numpy(layer.kernel)
+        reference = self._einsum_layer(
+            reference_equation,
+            output_shape,
+            input_shape,
+            kernel=np.transpose(kernel, (1, 0, 2)),
+        )
+        x = rng.standard_normal((2, 5, 8)).astype("float32")
+        gptq = self._calibrate(layer, x, self._config())
+        gptq_reference = self._calibrate(reference, x, self._config())
+
+        # One Hessian over the model width, shared by every head or expert.
+        self.assertEqual(tuple(gptq.hessian.shape), (8, 8))
+        self.assertAllClose(gptq.hessian, gptq_reference.hessian)
+        self.assertAllClose(
+            self._dequantized(layer),
+            np.transpose(self._dequantized(reference), (1, 0, 2)),
+        )
+        self.assertAllClose(layer(x), reference(x))
+        # Stored as `(d_model, packed columns)`, like the reference layout.
+        columns = int(np.prod(output_shape[1:]))
+        self.assertEqual(
+            tuple(layer.quantized_kernel.shape),
+            tuple(reference.quantized_kernel.shape),
+        )
+        self.assertEqual(tuple(layer.quantized_kernel.shape), (8, columns // 2))
+        self.assertEqual(tuple(layer.g_idx.shape), (8,))
+
+    @parameterized.named_parameters(
+        # A QKV projection `[d_model, heads, head_dim]` is the `Dense`
+        # kernel `(d_model, heads * head_dim)`.
+        ("qkv", "btd,dnh->btnh", (None, 2, 4), (None, 5, 8), (8, 8)),
+        # An attention output projection `[heads, head_dim, d_model]` is the
+        # `Dense` kernel `(heads * head_dim, d_model)`.
+        (
+            "attention_output",
+            "btnh,nhd->btd",
+            (None, 8),
+            (None, 5, 2, 4),
+            (8, 8),
+        ),
+    )
+    def test_contracted_axes_match_dense(
+        self, equation, output_shape, input_shape, dense_shape
+    ):
+        rng = np.random.default_rng(seed=5)
+        layer = self._einsum_layer(equation, output_shape, input_shape)
+        kernel = ops.convert_to_numpy(layer.kernel)
+        dense = self._dense_layer(kernel.reshape(dense_shape))
+        x = rng.standard_normal((2,) + input_shape[1:]).astype("float32")
+        x_dense = x.reshape(2, 5, dense_shape[0])
+        gptq = self._calibrate(layer, x, self._config())
+        gptq_dense = self._calibrate(dense, x_dense, self._config())
+
+        self.assertAllClose(gptq.hessian, gptq_dense.hessian)
+        self.assertAllClose(
+            self._dequantized(layer).reshape(dense_shape),
+            self._dequantized(dense),
+        )
+        self.assertAllClose(
+            ops.reshape(layer(x), (2, 5, dense_shape[1])), dense(x_dense)
+        )
+
+    @parameterized.named_parameters(
+        ("one_group_per_expert", -1, False),
+        ("grouped_with_activation_order", 3, True),
+    )
+    def test_batch_axis_calibrates_each_expert_alone(
+        self, group_size, activation_order
+    ):
+        # A mixture-of-experts down projection `[experts, inner, d_model]`:
+        # the expert axis is shared by the inputs, so every expert is its
+        # own problem, calibrated from its own slice of the inputs.
+        experts, inner, width = 3, 6, 8
+        rng = np.random.default_rng(seed=11)
+        layer = self._einsum_layer(
+            "btei,eid->bted", (None, experts, width), (None, 5, experts, inner)
+        )
+        kernel = ops.convert_to_numpy(layer.kernel)
+        x = rng.standard_normal((2, 5, experts, inner)).astype("float32")
+        config = self._config(group_size, activation_order)
+        gptq = self._calibrate(layer, x, config)
+        self.assertEqual(tuple(gptq.hessian.shape), (experts, inner, inner))
+
+        dequantized = self._dequantized(layer)
+        outputs = ops.convert_to_numpy(layer(x))
+        n_groups = 1 if group_size == -1 else inner // group_size
+        g_idx = ops.convert_to_numpy(layer.g_idx).reshape(experts, inner)
+        for expert in range(experts):
+            dense = self._dense_layer(kernel[expert])
+            x_expert = x[:, :, expert, :]
+            gptq_expert = self._calibrate(
+                dense, x_expert.reshape(-1, inner), config
+            )
+            self.assertAllClose(gptq.hessian[expert], gptq_expert.hessian)
+            self.assertAllClose(dequantized[expert], self._dequantized(dense))
+            self.assertAllClose(outputs[:, :, expert, :], dense(x_expert))
+            # The experts stack along the rows, each with its own groups.
+            self.assertAllClose(
+                g_idx[expert],
+                ops.convert_to_numpy(dense.g_idx) + expert * n_groups,
+            )
+        self.assertEqual(
+            tuple(layer.quantized_kernel.shape),
+            (experts * inner, width // 2),
+        )
+        self.assertEqual(
+            tuple(layer.kernel_scale.shape), (experts * n_groups, width)
+        )
+
+    def test_equation_without_a_view_is_refused(self):
+        layer = self._einsum_layer("bt,nh->btnh", (None, 2, 3), (None, 5))
+        with self.assertRaisesRegex(
+            ValueError, "Cannot derive a calibration view"
+        ):
+            layer.quantize("gptq", config=self._config())
+
+    def test_permuted_layout_round_trips_through_model_save(self):
+        # The issue's path: `Model.quantize` on a block with a Gemma-style
+        # `[heads, d_model, head_dim]` projection, then `model.save`.
+        vocab_size, seq_len, embed_dim = 32, 8, 4
+        inputs = layers.Input(shape=(seq_len,), dtype="int32")
+        embedding = layers.Embedding(vocab_size, embed_dim)
+        x = embedding(inputs)
+        block = models.Sequential(
+            [
+                layers.EinsumDense(
+                    "btd,ndh->btnh", output_shape=(seq_len, 2, 4)
+                ),
+                layers.Reshape((seq_len, 8)),
+            ]
+        )
+        x = block(x)
+        x = layers.GlobalAveragePooling1D()(x)
+        outputs = layers.Dense(2)(x)
+        model = models.Model(inputs, outputs)
+
+        rng = np.random.default_rng(seed=17)
+        dataset = [
+            rng.integers(0, vocab_size, size=(1, seq_len)).astype("int32")
+            for _ in range(3)
+        ]
+        config = GPTQConfig(
+            dataset=dataset,
+            tokenizer=lambda text: text,
+            num_samples=2,
+            sequence_length=seq_len,
+            group_size=-1,
+            weight_bits=4,
+            quantization_layer_structure={
+                "pre_block_layers": [embedding],
+                "sequential_blocks": [block],
+            },
+        )
+        model.quantize("gptq", config=config)
+        projection = block.layers[0]
+        # Stored by the model width: 4 rows of 8 columns packed to 4 bytes.
+        self.assertEqual(tuple(projection.quantized_kernel.shape), (4, 4))
+        self.assertEqual(tuple(projection.g_idx.shape), (4,))
+
+        x_eval = rng.integers(0, vocab_size, size=(2, seq_len)).astype("int32")
+        y_quantized = model.predict(x_eval)
+        path = os.path.join(self.get_temp_dir(), "model.keras")
+        model.save(path)
+        restored = saving.load_model(path)
+        self.assertAllClose(restored.predict(x_eval), y_quantized)
+        restored_block = next(
+            l for l in restored.layers if isinstance(l, models.Sequential)
+        )
+        self.assertEqual(
+            tuple(restored_block.layers[0].quantized_kernel.shape), (4, 4)
+        )
+
+    def test_permuted_layout_round_trips_through_variables(self):
+        rng = np.random.default_rng(seed=13)
+        layer = self._einsum_layer("btd,ndh->btnh", (None, 2, 4), (None, 5, 8))
+        x = rng.standard_normal((2, 5, 8)).astype("float32")
+        self._calibrate(layer, x, self._config())
+        y = ops.convert_to_numpy(layer(x))
+
+        store = {}
+        layer.save_own_variables(store)
+        restored = layers.EinsumDense(
+            "btd,ndh->btnh",
+            output_shape=(None, 2, 4),
+            dtype="gptq/4/-1_from_float32",
+        )
+        restored.build((None, 5, 8))
+        restored.load_own_variables(store)
+        self.assertEqual(tuple(restored.quantized_kernel.shape), (8, 4))
+        self.assertAllClose(restored(x), y)

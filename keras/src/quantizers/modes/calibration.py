@@ -174,16 +174,25 @@ class CalibrationStrategy(QuantizationStrategy):
         # marks a live float layer pending after this returns.
         layer.calibration_pending = False
 
-        rows, columns = geometry.calibration_rows_columns(input_shape)
+        # The view reads the kernel shape off the geometry.
+        del input_shape
+        view = geometry.calibration_view()
+        rows = view.batch * view.rows
+        columns = view.columns
 
         bits = self.resolve_weight_bits(layer, config)
         kernel_columns = self._pack_layout(bits, columns).packed_length(columns)
         group_size = self.resolve_group_size(layer, config)
-        n_groups = 1 if group_size == -1 else math.ceil(rows / group_size)
+        n_groups = view.batch * (
+            1 if group_size == -1 else math.ceil(view.rows / group_size)
+        )
 
-        # Stored in the kernel's own `[in, out]` orientation and packed
-        # along the output axis, like the int4 layout, so the forward pass
-        # unpacks and dequantizes without a transpose.
+        # Stored as the view's `(batch * rows, columns)` matrix in `[in,
+        # out]` orientation (the view's axis order, which may permute the
+        # kernel's), packed along the output axis like the int4 layout, so
+        # the forward pass unpacks and dequantizes without a transpose of
+        # its own. The problems of a batch axis stack along the rows, each
+        # with its own groups.
         layer.quantized_kernel = layer.add_weight(
             name="kernel",
             shape=(rows, kernel_columns),
@@ -297,26 +306,24 @@ class CalibrationStrategy(QuantizationStrategy):
         config = layer.quantization_config
         bits = self.resolve_weight_bits(layer, config)
         group_size = self.resolve_group_size(layer, config)
-        # The group parameters are stored as `[n_groups, out]`, so their
-        # axes give the unpacked column count the packed codes stand for
-        # and, with the group index, the row count.
-        columns = int(layer.kernel_scale.shape[1])
-        rows = int(layer.g_idx.shape[0])
+        view = geometry.calibration_view()
         return QVariable(
             codes=layer.quantized_kernel,
             scale=layer.kernel_scale,
             zero_point=layer.kernel_zero,
             g_idx=layer.g_idx,
-            layout=self._pack_layout(bits, columns),
+            layout=self._pack_layout(bits, view.columns),
             scheme=WeightScheme(
                 code_range=(0, 2**bits - 1),
                 has_zero_point=True,
-                # `-1` means one group spanning every input row.
-                group_size=rows if group_size == -1 else group_size,
+                # `-1` means one group spanning every input row of a
+                # problem.
+                group_size=view.rows if group_size == -1 else group_size,
                 group_axis=0,
             ),
             input_scales=self._input_scales(layer),
             shape=geometry.weight_shape,
+            permutation=view.kernel_permutation,
             compute_dtype=layer.compute_dtype,
         )
 

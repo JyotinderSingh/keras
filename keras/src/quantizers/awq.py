@@ -19,10 +19,11 @@ from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
 
-# Maximum number of activation rows stashed per layer for the AutoAWQ-style
-# clipping search. Bounds calibration memory; a few hundred rows is enough to
-# estimate per-group reconstruction error (matches AutoAWQ's ``n_sample_token``
-# default of 512).
+# Maximum number of activation rows stashed per problem of a layer for the
+# AutoAWQ-style clipping search (a kernel with a batch axis stashes this
+# many rows per expert). Bounds calibration memory; a few hundred rows is
+# enough to estimate per-group reconstruction error (matches AutoAWQ's
+# ``n_sample_token`` default of 512).
 MAX_CLIP_SAMPLE_ROWS = 512
 
 
@@ -451,8 +452,12 @@ class AWQCalibrator(Calibrator):
         self.compute_scale_zero = compute_awq_scale_zero
 
         # Initialize activation magnitude accumulator (running per-channel
-        # MEAN of |x|, as in the reference AWQ implementations).
-        self.activation_magnitudes = ops.zeros((self.rows,), dtype="float32")
+        # MEAN of |x|, as in the reference AWQ implementations), one row
+        # of statistics per problem of the calibration view.
+        shape = (self.rows,)
+        if self.batch > 1:
+            shape = (self.batch,) + shape
+        self.activation_magnitudes = ops.zeros(shape, dtype="float32")
 
         # Bounded stash of raw activation rows for the clipping search.
         self._clip_samples = []
@@ -469,25 +474,28 @@ class AWQCalibrator(Calibrator):
 
         Args:
             inputs: A 2D or higher-dimensional tensor of input activations
-                from a calibration batch.
+                from a calibration batch, in the layer's input layout.
 
         Raises:
             ValueError: If the feature dimension of `inputs` does not match
                 the per-channel statistics `self.activation_magnitudes`.
         """
-        x = self._flatten_inputs(inputs)
-        if ops.shape(self.activation_magnitudes)[0] != ops.shape(x)[-1]:
+        self._check_inputs(inputs)
+        input_features = self.view.input_features(inputs)
+        if input_features != self.rows:
             raise ValueError(
-                "Activation statistics "
-                f"({ops.shape(self.activation_magnitudes)[0]}) do not match "
-                f"input features ({ops.shape(x)[-1]})."
+                f"Activation statistics ({self.rows}) do not match input "
+                f"features ({input_features})."
             )
-        num_new_samples = int(ops.shape(x)[0])
+        # Lay out as [batch_samples, in_features], with a leading problem
+        # axis for a batched kernel.
+        x = ops.cast(self.view.inputs_to_view(inputs), "float32")
+        num_new_samples = int(ops.shape(x)[-2])
         total_samples = self.num_samples + num_new_samples
 
         # Running per-channel mean of |x| via a stable weighted update:
         #   mean <- mean + (batch_mean - mean) * n / (count + n)
-        batch_mean = ops.mean(ops.abs(x), axis=0)
+        batch_mean = ops.mean(ops.abs(x), axis=-2)
         delta = ops.subtract(batch_mean, self.activation_magnitudes)
         self.activation_magnitudes = ops.add(
             self.activation_magnitudes,
@@ -503,7 +511,7 @@ class AWQCalibrator(Calibrator):
             take = min(
                 num_new_samples, MAX_CLIP_SAMPLE_ROWS - self._clip_sample_rows
             )
-            self._clip_samples.append(x[:take])
+            self._clip_samples.append(x[..., :take, :])
             self._clip_sample_rows += take
 
     def quantize(self):
@@ -514,32 +522,56 @@ class AWQCalibrator(Calibrator):
         2. Quantizes the layer weights
         3. Updates the layer's quantized variables
         """
-        weights_transpose = ops.transpose(self._kernel_view())
+        kernel = self._kernel_view()
+        magnitudes = self.activation_magnitudes
 
         # Assemble the stashed activation sample for the clipping search.
         apply_clip = self.config.apply_clip
         activation_sample = None
         if apply_clip and self._clip_samples:
-            activation_sample = ops.concatenate(self._clip_samples, axis=0)
+            activation_sample = ops.concatenate(self._clip_samples, axis=-2)
+        if self.batch == 1:
+            magnitudes = ops.expand_dims(magnitudes, 0)
+            if activation_sample is not None:
+                activation_sample = ops.expand_dims(activation_sample, 0)
 
-        # Perform AWQ quantization
-        quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
-            weights_transpose,
-            self.activation_magnitudes,
-            num_grid_points=self.config.num_grid_points,
-            group_size=self.config.group_size,
-            apply_clip=apply_clip and activation_sample is not None,
-            activation_sample=activation_sample,
-            compute_scale_zero=self.compute_scale_zero,
-        )
-
-        # Cast to uint8 for storage. The algorithm works on `[out, in]`; the
-        # layer stores the kernel's own `[in, out]` orientation with the
-        # group parameters as `[n_groups, out]`, so the forward pass never
-        # transposes.
-        quantized = ops.transpose(ops.cast(quantized, "uint8"))
-        scale = ops.transpose(scale)
-        zero = ops.transpose(zero)
+        codes = []
+        scales = []
+        zeros = []
+        input_scales = []
+        group_indices = []
+        for index in range(self.batch):
+            # Perform AWQ quantization
+            quantized, scale, zero, awq_scales, g_idx = awq_quantize_matrix(
+                ops.transpose(kernel[index]),
+                magnitudes[index],
+                num_grid_points=self.config.num_grid_points,
+                group_size=self.config.group_size,
+                apply_clip=apply_clip and activation_sample is not None,
+                activation_sample=(
+                    None
+                    if activation_sample is None
+                    else activation_sample[index]
+                ),
+                compute_scale_zero=self.compute_scale_zero,
+            )
+            # Cast to uint8 for storage. The algorithm works on `[out, in]`;
+            # the layer stores the view's `[in, out]` orientation with the
+            # group parameters as `[n_groups, out]`, so the forward pass
+            # never transposes.
+            codes.append(ops.transpose(ops.cast(quantized, "uint8")))
+            scales.append(ops.transpose(scale))
+            zeros.append(ops.transpose(zero))
+            input_scales.append(awq_scales)
+            # Each problem's groups follow the previous problem's.
+            group_indices.append(
+                ops.add(g_idx, index * ops.shape(scales[-1])[0])
+            )
+        quantized = ops.concatenate(codes, axis=0)
+        scale = ops.concatenate(scales, axis=0)
+        zero = ops.concatenate(zeros, axis=0)
+        awq_scales = ops.concatenate(input_scales, axis=0)
+        g_idx = ops.concatenate(group_indices, axis=0)
 
         # Pack to 4-bit along the output axis.
         quantized, _, _ = quantizers.pack_int4(

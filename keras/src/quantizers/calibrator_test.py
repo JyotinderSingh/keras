@@ -14,29 +14,28 @@ class _Bare(Calibrator):
 class CalibratorTest(testing.TestCase):
     """The per-layer object of a calibration mode."""
 
-    def test_resolves_the_two_d_view_from_the_geometry(self):
+    def test_resolves_the_calibration_view(self):
         dense = layers.Dense(32)
         dense.build((None, 16))
         for cls in (GPTQCalibrator, AWQCalibrator):
             calibrator = cls(dense)
-            self.assertEqual((calibrator.rows, calibrator.columns), (16, 32))
+            self.assertEqual(
+                (calibrator.batch, calibrator.rows, calibrator.columns),
+                (1, 16, 32),
+            )
+            self.assertIs(calibrator.original_layer, dense)
             self.assertEqual(calibrator.num_samples, 0)
-        # A 3-D einsum kernel is viewed as `(rows, columns)`.
+        # An einsum kernel's view follows its equation.
         einsum = layers.EinsumDense("...h,hio->...io", output_shape=(4, 8))
         einsum.build((None, 16))
         calibrator = GPTQCalibrator(einsum)
-        self.assertEqual((calibrator.rows, calibrator.columns), (16, 32))
-        self.assertEqual(tuple(calibrator._kernel_view().shape), (16, 32))
-        self.assertIs(calibrator.original_layer, einsum)
-        # The rank guard lives on the geometry, once.
-        four_d = layers.EinsumDense(
-            "abc,cdef->abdef", output_shape=(3, 2, 3, 2)
+        self.assertEqual(
+            (calibrator.batch, calibrator.rows, calibrator.columns),
+            (1, 16, 32),
         )
-        four_d.build((None, 3, 4))
-        with self.assertRaisesRegex(ValueError, "only supports 2D or 3D"):
-            GPTQCalibrator(four_d)
-        # An unbuilt layer reports the missing kernel, not an unsupported
-        # type (the wording of the `AttributeError` varies by backend).
+        self.assertEqual(calibrator.view.kernel_permutation, (0, 1, 2))
+        # An unbuilt layer reports the missing kernel shape, not an
+        # unsupported type (the `AttributeError` wording varies by backend).
         with self.assertRaisesRegex(AttributeError, "kernel"):
             GPTQCalibrator(layers.Dense(4))
 
