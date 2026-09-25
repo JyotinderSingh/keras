@@ -9,7 +9,7 @@ from keras.src.api_export import keras_export
 from keras.src.backend import KerasTensor
 from keras.src.layers.layer import Layer
 from keras.src.quantizers.geometry import LookupGeometry
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
+from keras.src.quantizers.quantizers import dequantize_grouped
 from keras.src.saving import serialization_lib
 
 
@@ -482,7 +482,7 @@ class Embedding(Layer):
                 )
             else:
                 # Sub-channel: grouped dequantization using shared utility
-                float_embeddings = dequantize_with_sz_map(
+                float_embeddings = dequantize_grouped(
                     ops.cast(unpacked_embeddings, self.compute_dtype),
                     embeddings_scale,
                     self.embeddings_zero,
@@ -535,7 +535,7 @@ class Embedding(Layer):
                         to_numpy=True,
                     )
                 )
-                # Transpose back
+                # Transpose back to (input_dim, output_dim) layout
                 requantized_embeddings = ops.transpose(requantized_t)
                 new_scale = ops.transpose(scale_t)
                 embeddings_zero = ops.transpose(zero_t)

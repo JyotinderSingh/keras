@@ -1,18 +1,22 @@
 import itertools
 import math
+import warnings
 
 import numpy as np
 from absl.testing import parameterized
 
+from keras.src import backend
 from keras.src import ops
 from keras.src import quantizers
 from keras.src import random
 from keras.src import testing
 from keras.src.quantizers.quantizers import compute_quantization_parameters
+from keras.src.quantizers.quantizers import dequantize_grouped
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_zero_point
+from keras.src.quantizers.quantizers import ternarize
 from keras.src.testing.test_utils import named_product
 
 
@@ -315,15 +319,10 @@ class QuantizersTest(testing.TestCase):
             )
         )
 
-        # Use dequantize_with_sz_map with generated g_idx
+        # Decode with the divisor scale through `dequantize_grouped`
         g_idx = ops.arange(input_dim) // block_size
-        dequantized = ops.transpose(
-            quantizers.dequantize_with_sz_map(
-                ops.transpose(ops.cast(quantized, scale.dtype)),
-                ops.transpose(scale),
-                ops.transpose(zero),
-                g_idx,
-            )
+        dequantized = dequantize_grouped(
+            ops.cast(quantized, scale.dtype), scale, zero, g_idx, group_axis=0
         )
 
         rmse = ops.sqrt(ops.mean(ops.square(kernel - dequantized)))
@@ -380,15 +379,14 @@ class QuantizersTest(testing.TestCase):
             )
         )
 
-        # Use dequantize_with_sz_map with generated g_idx
+        # Decode with the divisor scale through `dequantize_grouped`
         g_idx = ops.arange(input_dim) // block_size
-        grouped_dequantized = ops.transpose(
-            quantizers.dequantize_with_sz_map(
-                ops.transpose(ops.cast(grouped_quantized, grouped_scale.dtype)),
-                ops.transpose(grouped_scale),
-                ops.transpose(grouped_zero),
-                g_idx,
-            )
+        grouped_dequantized = dequantize_grouped(
+            ops.cast(grouped_quantized, grouped_scale.dtype),
+            grouped_scale,
+            grouped_zero,
+            g_idx,
+            group_axis=0,
         )
 
         grouped_rmse = ops.sqrt(
@@ -453,19 +451,20 @@ class QuantizersTest(testing.TestCase):
         zero = ops.convert_to_numpy(zero).astype("float32")
         self.assertTrue(np.all(zero >= -8) and np.all(zero <= 7))
         g_idx = np.arange(kernel.shape[0]) // block_size
-        dequantized = (quantized - zero[g_idx]) * scale[g_idx]
-        half_step = scale[g_idx] / 2 + 1e-6
+        dequantized = (quantized - zero[g_idx]) / scale[g_idx]
+        half_step = 0.5 / scale[g_idx] + 1e-6
         self.assertTrue(np.all(np.abs(dequantized - kernel) <= half_step))
 
     @parameterized.named_parameters(("tensor", False), ("numpy", True))
     def test_grouped_zero_point_exact_values(self, to_numpy):
         # One group of three rows: column 0 is all positive and column 1
-        # all negative, so each range is widened to include zero.
+        # all negative, so each range is widened to include zero; the
+        # divisor scale spreads the 15 code steps over that range of 1.5.
         kernel = np.array([[0.5, -1.5], [1.0, -1.0], [1.5, -0.5]], "float32")
         _, scale, zero = quantizers.abs_max_quantize_grouped_with_zero_point(
             kernel, block_size=3, to_numpy=to_numpy
         )
-        self.assertAllClose(scale, [[1.5 / 15, 1.5 / 15]])
+        self.assertAllClose(scale, [[15 / 1.5, 15 / 1.5]])
         self.assertAllClose(zero, [[-8, 7]])
 
     @parameterized.named_parameters(
@@ -496,6 +495,57 @@ class QuantizersTest(testing.TestCase):
         low, high = value_range
         self.assertTrue(low <= codes.min() and codes.max() <= high)
         self.assertTrue(low <= zero.min() and zero.max() <= high)
+
+    @parameterized.named_parameters(
+        ("tensor_float32", False, "float32"),
+        ("numpy_float32", True, "float32"),
+        ("tensor_bfloat16", False, "bfloat16"),
+        ("numpy_bfloat16", True, "bfloat16"),
+        ("tensor_float64", False, "float64"),
+        ("numpy_float64", True, "float64"),
+    )
+    def test_grouped_all_zero_group_stays_finite(self, to_numpy, dtype):
+        # An all-zero group has an empty range. Even with no `epsilon` its
+        # divisor scale is finite, in the input dtype as the backend holds
+        # it, and computed with no divide-by-zero warning on either path;
+        # its codes are all the zero point, so they decode to 0.
+        kernel = np.zeros((8, 2), "float32")
+        kernel[4:, 0] = [0.5, -0.25, 1.0, 0.75]
+        # A float64 kernel arrives as a NumPy array, as a caller's may. A
+        # backend without float64 holds it as float32, and a device
+        # without it cannot run the case.
+        if dtype == "float64":
+            x = kernel.astype("float64")
+        else:
+            x = ops.cast(kernel, dtype)
+        try:
+            held = ops.convert_to_tensor(x, dtype=dtype)
+        except TypeError:
+            self.skipTest(f"{dtype} is not available on this device")
+        expected_dtype = backend.standardize_dtype(held.dtype)
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", RuntimeWarning)
+            codes, scale, zero = (
+                quantizers.abs_max_quantize_grouped_with_zero_point(
+                    x,
+                    block_size=4,
+                    epsilon=0.0,
+                    to_numpy=to_numpy,
+                )
+            )
+        self.assertEqual(backend.standardize_dtype(scale.dtype), expected_dtype)
+        codes = ops.convert_to_numpy(codes).astype("float32")
+        scale = ops.convert_to_numpy(scale).astype("float32")
+        zero = ops.convert_to_numpy(zero).astype("float32")
+        self.assertTrue(np.all(np.isfinite(scale)))
+        # Group 0 of both columns and group 1 of column 1 are all zero.
+        self.assertAllClose(codes[:4], np.broadcast_to(zero[0], (4, 2)))
+        self.assertAllClose(codes[4:, 1], np.full((4,), zero[1, 1]))
+        # The non-zero group is untouched by the floor: 15 code steps over
+        # a range of 1.25, on which every value is exactly representable.
+        self.assertAllClose(scale[1, 0], 12.0)
+        dequantized = (codes[4:, 0] - zero[1, 0]) / scale[1, 0]
+        self.assertAllClose(dequantized, kernel[4:, 0])
 
 
 class Int4QuantizationConfigTest(testing.TestCase):
@@ -1085,3 +1135,25 @@ class GroupedQuantizationParametersTest(testing.TestCase):
                 (out_features, n_groups),
                 f"Failed for group_size={group_size}",
             )
+
+
+class TernarizeTest(testing.TestCase):
+    def test_default_threshold_returns_reciprocal_mean(self):
+        kernel = ops.array([[0.5, -0.5], [0.1, -1.5]], "float32")
+        codes, scale = ternarize(kernel)
+        # threshold = 0.5 * mean(|W|) = 0.325, so 0.1 maps to 0.
+        self.assertAllClose(codes, [[1.0, -1.0], [0.0, -1.0]])
+        self.assertAllClose(scale, 1.0 / 0.65)
+
+    def test_fixed_threshold_returns_unit_scale(self):
+        kernel = ops.array([[0.5, -0.5], [0.1, -1.5]], "float32")
+        codes, scale = ternarize(kernel, threshold=0.2)
+        self.assertAllClose(codes, [[1.0, -1.0], [0.0, -1.0]])
+        self.assertEqual(scale, 1.0)
+
+    def test_all_zero_kernel_returns_unit_scale(self):
+        # All-zero codes decode to 0 under any finite scale: the scale is
+        # 1.0 rather than the infinite reciprocal of `mean(|W|) == 0`.
+        codes, scale = ternarize(ops.zeros((3, 4), "float32"))
+        self.assertAllClose(codes, np.zeros((3, 4)))
+        self.assertEqual(scale, 1.0)

@@ -8,6 +8,7 @@ from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.packing import unpack_ternary
+from keras.src.quantizers.quantizers import ternarize
 
 
 @keras_export("keras.layers.TernaryDense")
@@ -313,11 +314,7 @@ class _TernaryDenseGeometry(ProjectionGeometry):
 
     def ternary_values(self):
         layer = self.layer
-        # Hard ternary values in {-1, 0, +1}. This is exactly the forward
-        # value of the straight-through kernel used in training.
-        kernel_ternary = ops.convert_to_numpy(layer._ternary_kernel())
-        if layer.threshold is None:
-            beta = float(ops.convert_to_numpy(ops.mean(ops.abs(layer._kernel))))
-        else:
-            beta = 1.0
-        return kernel_ternary, beta
+        # The rule of the straight-through kernel used in training, so the
+        # frozen codes are exactly its forward value; the scale is the
+        # stored divisor `1 / beta`, or 1.0 with a fixed threshold.
+        return ternarize(layer._kernel, layer.threshold)

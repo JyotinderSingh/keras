@@ -131,12 +131,18 @@ def abs_max_quantize_grouped_with_zero_point(
     around zero. A group's range always includes zero, so its zero point is
     representable in `value_range` and the grid holds an exact zero.
 
+    The scale is a divisor, as in `abs_max_quantize`: it maps a group's
+    `[min, max]` range onto `value_range`, a value quantizes to
+    `round(x * scale) + zero_point` and a code decodes to
+    `(code - zero_point) / scale`.
+
     Args:
         inputs: Input tensor to quantize. Shape: `(input_dim, output_dim)`.
         block_size: Number of elements per group along axis 0.
         value_range: Tuple of `(min, max)` quantization range.
         dtype: Data type of quantized output.
-        epsilon: Small value to avoid division by zero.
+        epsilon: Small value added to a group's range before its scale is
+            computed.
         to_numpy: Whether to compute in NumPy, which keeps the weight off
             the accelerator during quantization, rather than in backend
             ops. Both paths apply the same formula; `bfloat16` inputs can
@@ -146,7 +152,8 @@ def abs_max_quantize_grouped_with_zero_point(
         A tuple `(quantized_tensor, scale, zero_point)` where:
             - `quantized_tensor`: Same shape as inputs, dtype=`dtype`.
             - `scale`: Shape `(n_groups, output_dim)` where
-              `n_groups = ceil(input_dim / block_size)`.
+              `n_groups = ceil(input_dim / block_size)`, in the dtype of
+              `inputs` as the backend holds it.
             - `zero_point`: Shape `(n_groups, output_dim)`, dtype=`int8`.
 
     Example:
@@ -173,6 +180,19 @@ def abs_max_quantize_grouped_with_zero_point(
     return _abs_max_quantize_grouped_with_zero_point_tensor(
         inputs, block_size, value_range, dtype, epsilon
     )
+
+
+def _grouped_range_floor(dtype, q_range):
+    """Smallest group range the grouped quantizer divides by.
+
+    `q_range` times the smallest normal of `dtype` bounds the divisor
+    scale at `1 / tiny`, which every float dtype represents. A float64
+    range takes float32's floor: a backend may hold float64 as float32
+    (JAX without x64), and float32's `1 / tiny` is finite in both.
+    """
+    if dtype == "float64":
+        dtype = "float32"
+    return q_range * float(ml_dtypes.finfo(dtype).tiny)
 
 
 def _abs_max_quantize_grouped_with_zero_point_numpy(
@@ -208,17 +228,24 @@ def _abs_max_quantize_grouped_with_zero_point_numpy(
     min_val = np.minimum(np.min(inputs_reshaped, axis=1, keepdims=True), 0.0)
     max_val = np.maximum(np.max(inputs_reshaped, axis=1, keepdims=True), 0.0)
 
-    # Scale maps the [min, max] range to [qmin, qmax]; the floor keeps an
-    # all-zero group finite when `epsilon` underflows in the input dtype.
-    scale = np.divide(np.subtract(max_val, min_val) + epsilon, qmax - qmin)
-    scale = np.maximum(scale, ml_dtypes.finfo(scale.dtype).tiny)
+    # The divisor scale maps the [min, max] range onto [qmin, qmax]. The
+    # range is floored at `(qmax - qmin) * tiny`, so an all-zero group
+    # (whose `epsilon` may underflow in the input dtype) gets a scale of at
+    # most `1 / tiny`, which every float dtype represents; its codes are
+    # then all the zero point, which any finite scale decodes to 0.
+    q_range = qmax - qmin
+    group_range = np.maximum(
+        np.add(np.subtract(max_val, min_val), epsilon),
+        _grouped_range_floor(original_dtype, q_range),
+    )
+    scale = np.divide(q_range, group_range)
 
     # Zero point shifts the quantized range to include the original zero
-    zero_point = np.round(np.divide(-min_val, scale)) + qmin
+    zero_point = np.round(np.multiply(np.negative(min_val), scale)) + qmin
     zero_point = np.clip(zero_point, qmin, qmax)
 
-    # Quantize: q = round(input / scale) + zero_point
-    outputs = np.round(np.divide(inputs_reshaped, scale)) + zero_point
+    # Quantize: q = round(input * scale) + zero_point
+    outputs = np.round(np.multiply(inputs_reshaped, scale)) + zero_point
     outputs = np.clip(outputs, qmin, qmax)
     outputs = outputs.astype(dtype)
 
@@ -264,21 +291,24 @@ def _abs_max_quantize_grouped_with_zero_point_tensor(
     min_val = ops.minimum(ops.min(inputs_reshaped, axis=1, keepdims=True), 0.0)
     max_val = ops.maximum(ops.max(inputs_reshaped, axis=1, keepdims=True), 0.0)
 
-    # Scale maps the [min, max] range to [qmin, qmax]; the floor keeps an
-    # all-zero group finite when `epsilon` underflows in the input dtype.
-    scale = ops.divide(
-        ops.add(ops.subtract(max_val, min_val), epsilon), qmax - qmin
+    # Divisor scale, with the same floor on the range as the NumPy path.
+    q_range = qmax - qmin
+    group_range = ops.maximum(
+        ops.add(ops.subtract(max_val, min_val), epsilon),
+        _grouped_range_floor(original_dtype, q_range),
     )
-    scale = ops.maximum(scale, float(ml_dtypes.finfo(original_dtype).tiny))
+    scale = ops.divide(q_range, group_range)
 
     # Zero point shifts the quantized range to include the original zero
     zero_point = ops.add(
-        ops.round(ops.divide(ops.negative(min_val), scale)), qmin
+        ops.round(ops.multiply(ops.negative(min_val), scale)), qmin
     )
     zero_point = ops.clip(zero_point, qmin, qmax)
 
-    # Quantize: q = round(input / scale) + zero_point
-    outputs = ops.add(ops.round(ops.divide(inputs_reshaped, scale)), zero_point)
+    # Quantize: q = round(input * scale) + zero_point
+    outputs = ops.add(
+        ops.round(ops.multiply(inputs_reshaped, scale)), zero_point
+    )
     outputs = ops.cast(ops.clip(outputs, qmin, qmax), dtype)
 
     # Remove padding and squeeze to (n_groups, output_dim)
@@ -559,6 +589,33 @@ def quantize_with_sz_map(
     return quantize_with_zero_point(weights_matrix, scales, zeros, maxq)
 
 
+def divisor_scale(scale, dtype):
+    """Returns the stored form of a multiplier `scale`: its reciprocal.
+
+    Every quantization mode stores the scale it divides by, the form the
+    abs-max quantizers and `ternarize` produce. The calibration quantizers
+    (`compute_quantization_parameters`, the GPTQ solve and the AWQ search)
+    keep the multiplier form of their reference implementations,
+    `real = (code - zero) * scale`, whose half-way ties a divisor would
+    round differently; their write-backs store the divisor this returns:
+    `1 / scale`, floored at the smallest normal value of `dtype` (the
+    variable the result is stored in) so it is always finite.
+    """
+    tiny = float(ml_dtypes.finfo(backend.standardize_dtype(dtype)).tiny)
+    return ops.reciprocal(ops.maximum(ops.cast(scale, "float32"), tiny))
+
+
+def dequantize_grouped(codes, scale, zero, g_idx, group_axis=-1):
+    """Dequantizes grouped codes with their stored divisor scale.
+
+    The divisor counterpart of `dequantize_with_sz_map`: the real value is
+    `(code - zero) / scale`. See `_take_group_params` for `g_idx` and
+    `group_axis`.
+    """
+    scales, zeros = _take_group_params(scale, zero, g_idx, group_axis)
+    return ops.divide(ops.subtract(codes, zeros), scales)
+
+
 def dequantize_with_sz_map(weights_matrix, scale, zero, g_idx, group_axis=-1):
     """Dequantizes codes with per-group multiplier scales.
 
@@ -567,3 +624,37 @@ def dequantize_with_sz_map(weights_matrix, scale, zero, g_idx, group_axis=-1):
     """
     scales, zeros = _take_group_params(scale, zero, g_idx, group_axis)
     return dequantize_with_zero_point(weights_matrix, scales, zeros)
+
+
+def ternarize(kernel, threshold=None):
+    """Ternarizes `kernel` to `{-1, 0, +1}` codes with their divisor scale.
+
+    The BitNet b1.58 rule: a weight becomes `sign(w)` when `|w|` exceeds
+    the threshold and 0 otherwise. With `threshold=None` the threshold is
+    `0.5 * mean(|W|)` and the scale is `1 / mean(|W|)`, so `codes / scale`
+    carries the kernel's magnitude; with a fixed threshold the scale is
+    1.0. An all-zero kernel has all-zero codes, which any finite scale
+    decodes, so its scale is 1.0 as well rather than an infinite
+    reciprocal; a positive mean below the smallest normal value of the
+    kernel's dtype is floored there so the reciprocal stays finite.
+
+    Args:
+        kernel: The float weight to ternarize.
+        threshold: Optional fixed, non-negative threshold on `|w|`.
+
+    Returns:
+        `(codes, scale)`: the codes as a NumPy array in the kernel's dtype
+        and the scale as a Python float.
+    """
+    abs_kernel = ops.abs(kernel)
+    beta = ops.mean(abs_kernel)
+    t = ops.multiply(beta, 0.5) if threshold is None else threshold
+    codes = ops.multiply(
+        ops.sign(kernel), ops.cast(ops.greater(abs_kernel, t), kernel.dtype)
+    )
+    codes = ops.convert_to_numpy(codes)
+    beta = float(ops.convert_to_numpy(beta))
+    if threshold is not None or beta <= 0.0:
+        return codes, 1.0
+    tiny = ml_dtypes.finfo(backend.standardize_dtype(kernel.dtype)).tiny
+    return codes, 1.0 / max(beta, float(tiny))

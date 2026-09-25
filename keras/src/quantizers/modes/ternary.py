@@ -34,7 +34,8 @@ class TernaryStrategy(QuantizationStrategy):
             dtype="uint8",
             trainable=False,
         )
-        # Scalar BitNet b1.58 beta scale; 1.0 in fixed-threshold mode.
+        # Scalar divisor scale, `1 / beta` (BitNet b1.58); 1.0 with a
+        # fixed threshold.
         layer.kernel_scale = layer.add_weight(
             name="kernel_scale",
             shape=(),
@@ -60,7 +61,7 @@ class TernaryStrategy(QuantizationStrategy):
             ops.matmul(inputs, pos),
             ops.matmul(inputs, neg),
         )
-        x = ops.multiply(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
+        x = ops.divide(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
         if layer.bias is not None:
             x = ops.add(x, layer.bias)
         if layer.activation is not None:
@@ -75,9 +76,9 @@ class TernaryStrategy(QuantizationStrategy):
         # default, or the layer's own values (`TernaryDense` freezes exactly
         # the forward value of its straight-through kernel, so quantizing
         # does not change the layer's outputs).
-        kernel_ternary, beta = geometry.ternary_values()
+        kernel_ternary, scale = geometry.ternary_values()
         packed_kernel, _, _ = pack_ternary(kernel_ternary, axis=0)
         del layer._kernel
         layer.quantized_build(kernel_shape, "ternary")
         layer._packed_kernel.assign(packed_kernel)
-        layer.kernel_scale.assign(beta)
+        layer.kernel_scale.assign(scale)

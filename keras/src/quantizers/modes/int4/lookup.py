@@ -19,7 +19,7 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
+from keras.src.quantizers.quantizers import dequantize_grouped
 
 
 class Int4LookupHandlers:
@@ -146,7 +146,7 @@ class Int4LookupHandlers:
             embeddings_zero = ops.take(layer.embeddings_zero, inputs, axis=0)
 
             # Scale/zero are [batch..., n_groups], g_idx is [output_dim]
-            outputs = dequantize_with_sz_map(
+            outputs = dequantize_grouped(
                 ops.cast(outputs, dtype=layer.compute_dtype),
                 embeddings_scale,
                 embeddings_zero,
@@ -180,7 +180,7 @@ class Int4LookupHandlers:
         else:
             # Asymmetric sub-channel: the zero point cannot be pulled out of
             # the matmul, so dequantize the embeddings first.
-            float_embeddings = dequantize_with_sz_map(
+            float_embeddings = dequantize_grouped(
                 ops.cast(unpacked_embeddings, dtype),
                 scale,
                 zero,
