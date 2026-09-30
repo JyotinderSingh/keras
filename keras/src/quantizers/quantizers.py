@@ -433,22 +433,22 @@ def compute_quantization_parameters(
         min_values = ops.min(x_reshaped, axis=1)
         max_values = ops.max(x_reshaped, axis=1)
 
-    # Asymmetric quantization: clamp the range to include zero, matching
-    # reference GPTQ/AWQ (`xmin = min(xmin, 0)`, `xmax = max(xmax, 0)`).
-    # This guarantees the zero point lands in `[0, maxq]`, so it is
-    # representable in `bits`-bit packed formats, and that the quantized
-    # grid can represent 0 exactly, even for groups whose values are
-    # all-negative or all-positive.
-    if not symmetric:
-        min_values = ops.minimum(min_values, 0.0)
-        max_values = ops.maximum(max_values, 0.0)
+    # Clamp the range to include zero for both symmetric and asymmetric
+    # quantization, matching reference GPTQ/AWQ (`xmin = min(xmin, 0)`,
+    # `xmax = max(xmax, 0)`). This guarantees the zero point lands in
+    # `[0, maxq]`, so it is representable in `bits`-bit packed formats, and
+    # that the quantized grid can represent 0 exactly, even for groups whose
+    # values are all-negative or all-positive.
+    min_values = ops.minimum(min_values, 0.0)
+    max_values = ops.maximum(max_values, 0.0)
 
-    # Symmetric quantization: make range symmetric around zero
+    # Symmetric quantization: the range is `[-max_abs, max_abs]` for every
+    # row. (The reference GPTQ folds only a row with negative values and
+    # keeps `[0, max]` for the others, whose largest weights its mid-code
+    # zero point then cannot represent; compressed-tensors folds both.)
     if symmetric:
         max_abs = ops.maximum(ops.abs(min_values), max_values)
-        min_values = ops.where(
-            ops.less(min_values, 0), ops.negative(max_abs), min_values
-        )
+        min_values = ops.negative(max_abs)
         max_values = max_abs
 
     # Ensure non-zero range to avoid division errors
@@ -505,10 +505,12 @@ def quantize_with_zero_point(input_tensor, scale, zero, maxq):
     epsilon = ops.cast(1e-8, dtype=scale.dtype)
     safe_scale = ops.where(ops.equal(scale, 0), epsilon, scale)
 
-    quantized_tensor = ops.round(
-        ops.add(
-            ops.divide(input_tensor, safe_scale), ops.cast(zero, scale.dtype)
-        )
+    # Round the scaled value first, then shift by the zero point, as the
+    # reference does; rounding the sum can land on the other side of a
+    # half-way tie.
+    quantized_tensor = ops.add(
+        ops.round(ops.divide(input_tensor, safe_scale)),
+        ops.cast(zero, scale.dtype),
     )
     quantized_tensor = ops.clip(quantized_tensor, 0, maxq)
     return quantized_tensor

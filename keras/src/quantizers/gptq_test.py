@@ -1,6 +1,7 @@
 import functools
 import os
 from collections.abc import Callable
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -13,16 +14,14 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
+from keras.src.quantizers import gptq
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.calibration_run import find_layers_in_block
 from keras.src.quantizers.gptq import GPTQCalibrator
-from keras.src.quantizers.gptq import _stable_permutation
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantizers import compute_quantization_parameters
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
-from keras.src.quantizers.quantizers import dequantize_with_zero_point
-from keras.src.quantizers.quantizers import quantize_with_zero_point
 from keras.src.testing.test_utils import named_product
 
 VOCAB_SIZE = 1000
@@ -150,6 +149,21 @@ class GPTQTest(testing.TestCase):
         calibrator.quantize()
 
         self.assertEqual(backend.standardize_dtype(dense.kernel.dtype), "uint8")
+
+    def test_layer_without_observations_is_rounded_to_nearest(self):
+        # A layer the calibration data never reached has an all-zero
+        # Hessian. Its inputs are not dead: the kernel keeps its values.
+        dense = _get_test_layer("Dense", kernel_shape=(16, 32))
+        kernel = ops.convert_to_numpy(dense.kernel)
+        config = GPTQConfig(dataset=None, tokenizer=None, group_size=4)
+        dense.quantize("gptq", config=config)
+        GPTQCalibrator(dense, config).quantize()
+
+        strategy = strategy_registry.get_strategy("gptq")
+        quantized_weight = strategy.quantized_weight(dense)
+        dequantized = quantized_weight.dequantize("float32")
+        step = ops.convert_to_numpy(ops.max(quantized_weight.scale))
+        self.assertAllClose(dequantized, kernel, atol=step / 2 + 1e-6)
 
     def _calibrate_gptq_dense(self, kernel_shape, weight_bits, group_size):
         rng = np.random.default_rng(seed=7)
@@ -376,100 +390,6 @@ class GPTQTest(testing.TestCase):
 
         self.assertAllClose(g1.hessian, g2.hessian, rtol=1e-6, atol=1e-6)
 
-    def test_identity_hessian_matches_direct_quantization(self):
-        """Tests that the matrix quantization without error correction
-        matches the direct implementation."""
-        in_features, out_features = 16, 8
-        weights = ops.reshape(
-            ops.linspace(
-                -0.9, 1.1, in_features * out_features, dtype="float32"
-            ),
-            (in_features, out_features),
-        )
-        weights_transpose = ops.transpose(weights)
-
-        # hessian = identity => inverse Hessian is identity; no cross-feature
-        # correction (since all off-diagonal elements are zero), which means
-        # there is no interaction between different features.
-        hessian = ops.eye(in_features, dtype="float32")
-
-        quantized_weights, scale_map, zero_map, g_idx = gptq_quantize_matrix(
-            weights_transpose,
-            hessian,
-            blocksize=128,
-            group_size=1,  # per-column quantization
-            activation_order=False,
-            compute_scale_zero=_compute_scale_zero,
-        )
-
-        dequantized_weights = dequantize_with_sz_map(
-            quantized_weights, scale_map, zero_map, g_idx
-        )
-
-        # Compare function output with columnwise direct application
-        # of quantization.
-        out = ops.zeros_like(weights_transpose)
-        for j in range(ops.shape(weights_transpose)[1]):
-            column = weights_transpose[:, j : j + 1]
-            scale, zero, maxq = _compute_scale_zero(column)
-            quantized_col = quantize_with_zero_point(column, scale, zero, maxq)
-            dequantized = dequantize_with_zero_point(quantized_col, scale, zero)
-            out = ops.slice_update(
-                out, (0, j), ops.expand_dims(dequantized[:, 0], 1)
-            )
-
-        self.assertAllClose(dequantized_weights, out, atol=1e-6)
-
-    def test_activation_order_produces_equivalent_weights(self):
-        """
-        Tests that quantizing with `activation_order=True` yields the same
-        final weights as `activation_order=False`, because the internal
-        permutation should be undone.
-        """
-        # Set up shared inputs and a non-trivial permutation.
-        in_features, out_features = 8, 6
-        initial_weights = ops.array(
-            np.random.randn(in_features, out_features), "float32"
-        )
-
-        # Generate a Hessian that creates a non-trivial permutation.
-        hessian_diag = ops.random.shuffle(
-            ops.linspace(10.0, 1.0, in_features, dtype="float32")
-        )
-        hessian_matrix = ops.diag(hessian_diag)
-
-        # Sanity check: ensure the permutation is not the identity.
-        perm = _stable_permutation(hessian_diag)
-        self.assertFalse(ops.all(ops.equal(perm, ops.arange(in_features))))
-
-        def create_and_quantize(use_activation_order):
-            layer = layers.Dense(out_features, use_bias=False)
-            layer.build((None, in_features))
-            layer.set_weights([ops.copy(initial_weights)])
-
-            config = GPTQConfig(
-                dataset=None,
-                tokenizer=None,
-                group_size=-1,
-                activation_order=use_activation_order,
-            )
-            layer.quantize("gptq", config=config)
-
-            calibrator = GPTQCalibrator(layer, config)
-            calibrator.hessian = hessian_matrix
-            calibrator.quantize()
-            return layer
-
-        # Quantize two layers, one with and one without activation ordering.
-        ordered_layer = create_and_quantize(use_activation_order=True)
-        unordered_layer = create_and_quantize(use_activation_order=False)
-
-        self.assertAllClose(
-            ordered_layer.get_weights()[0],
-            unordered_layer.get_weights()[0],
-            msg="Weights should be identical as the permutation is undone.",
-        )
-
     def test_non_positive_definite_hessian_raises(self):
         """A non-positive-definite Hessian is rejected with a clear error.
 
@@ -583,50 +503,6 @@ class GPTQTest(testing.TestCase):
             self.assertIn(dense.path, found)
             self.assertIs(found[dense.path], dense)
 
-    @parameterized.named_parameters(
-        ("per_channel", -1, 1),
-        ("group_gt_blocksize", 256, 2),
-        ("group_eq_blocksize", 128, 4),
-        ("group_lt_blocksize", 64, 8),
-    )
-    def test_gptq_quantize_matrix_group_param_shapes(
-        self, group_size, expected_groups
-    ):
-        """Scale/zero must have one column per quantization group.
-
-        Regression test: the per-group parameter cache was reset at every
-        processing block, so a group spanning several blocks (`group_size`
-        of -1, or larger than `blocksize`) had its params recomputed and
-        re-appended once per block, producing `[out, n_blocks]`-shaped
-        scales that could not be assigned to the layer's
-        `[out, n_groups]` variables.
-        """
-        rng = np.random.default_rng(0)
-        in_features, out_features = 512, 16
-        w = ops.convert_to_tensor(
-            rng.standard_normal((out_features, in_features)).astype("float32")
-        )
-        x = rng.standard_normal((2048, in_features)).astype("float32")
-        hessian = ops.convert_to_tensor(
-            (2.0 / 2048) * (x.T @ x)
-            + 0.01 * np.eye(in_features, dtype="float32")
-        )
-        config = GPTQConfig(
-            tokenizer=None, dataset=None, weight_bits=4, group_size=group_size
-        )
-        _, scale, zero, g_idx = gptq_quantize_matrix(
-            w,
-            hessian=hessian,
-            blocksize=128,
-            group_size=group_size,
-            compute_scale_zero=_scale_zero_fn(config),
-        )
-        self.assertEqual(tuple(scale.shape), (out_features, expected_groups))
-        self.assertEqual(tuple(zero.shape), (out_features, expected_groups))
-        self.assertEqual(
-            int(ops.convert_to_numpy(ops.max(g_idx))), expected_groups - 1
-        )
-
     def test_gptq_model_quantize_per_channel_group_size(self):
         """`model.quantize("gptq")` with `group_size=-1` must not crash.
 
@@ -711,17 +587,6 @@ class GPTQTest(testing.TestCase):
         # 2 samples x 8 tokens = 16 tokens for a 256-feature layer.
         with self.assertWarnsRegex(UserWarning, "undersampled"):
             model.quantize("gptq", config=config)
-
-
-def _compute_scale_zero(x, **_):
-    # Per-column asymmetric int4 example
-    # scale = (max-min)/maxq, zero = round(-min/scale)
-    maxq = 15.0
-    xmin = ops.min(x, axis=0, keepdims=True)
-    xmax = ops.max(x, axis=0, keepdims=True)
-    scale = ops.divide(ops.subtract(xmax, xmin), ops.add(maxq, 1e-8))
-    zero = ops.round(ops.divide(ops.negative(xmin), ops.add(scale, 1e-8)))
-    return scale, zero, maxq
 
 
 def _get_sequence_classifier():
@@ -1289,4 +1154,194 @@ class TestModelQuantization(testing.TestCase):
         # Stored by the model width: 4 rows of 4 columns packed to 2 bytes.
         self.assertEqual(
             tuple(restored_block.layers[1].quantized_kernel.shape), (4, 2)
+        )
+
+
+def _reference_gptq(
+    weights_transpose,
+    hessian,
+    *,
+    bits,
+    blocksize,
+    damping,
+    group_size,
+    activation_order,
+    symmetric,
+    keras_codes,
+):
+    """A NumPy port of the reference solve, in float64.
+
+    `GPTQ.fasterquant` with `Quantizer.find_params` (IST-DASLab/gptq),
+    `static_groups=False`. `hessian` is the accumulated Hessian before
+    revival and dampening. Two deliberate differences: dead inputs sort
+    last under activation ordering (the reference ranks them by the
+    revived diagonal, which on its per-sample Hessian scale is the
+    smallest entry in practice), and a symmetric range is two-sided for
+    every row (the reference keeps `[0, max]` for a row without negative
+    values).
+
+    Where `w / scale` lies within 1e-5 of a half-way point, float noise
+    decides the rounding, so the port takes the code in `keras_codes`
+    (`[out_features, in_features]`) if it is one of the two nearest, and
+    continues the solve from it.
+    """
+    maxq = 2**bits - 1
+
+    def find_params(x):
+        xmin = np.minimum(x.min(axis=1), 0.0)
+        xmax = np.maximum(x.max(axis=1), 0.0)
+        if symmetric:
+            xmax = np.maximum(np.abs(xmin), xmax)
+            xmin = -xmax
+        both_zero = (xmin == 0) & (xmax == 0)
+        xmin = np.where(both_zero, -1.0, xmin)
+        xmax = np.where(both_zero, 1.0, xmax)
+        scale = (xmax - xmin) / maxq
+        if symmetric:
+            zero = np.full_like(scale, (maxq + 1) / 2)
+        else:
+            zero = np.round(-xmin / scale)
+        return scale, zero
+
+    weights = np.asarray(weights_transpose, np.float64).copy()
+    hessian = np.asarray(hessian, np.float64).copy()
+    columns = weights.shape[1]
+    if group_size == -1:
+        group_scale, group_zero = find_params(weights)
+    dead = np.diag(hessian) == 0
+    hessian[dead, dead] = 1.0
+    weights[:, dead] = 0.0
+    order = np.arange(columns)
+    if activation_order:
+        order = np.argsort(
+            -np.where(dead, 0.0, np.diag(hessian)), kind="stable"
+        )
+        weights = weights[:, order]
+        hessian = hessian[order][:, order]
+        inverse_order = np.argsort(order)
+    hessian[np.diag_indices(columns)] += damping * np.mean(np.diag(hessian))
+    inverse_hessian = np.linalg.cholesky(np.linalg.inv(hessian)).T
+    codes = np.zeros_like(weights)
+    scales, zeros = [], []
+    for block_start in range(0, columns, blocksize):
+        block_end = min(block_start + blocksize, columns)
+        block = weights[:, block_start:block_end].copy()
+        block_error = np.zeros_like(block)
+        block_inverse = inverse_hessian[
+            block_start:block_end, block_start:block_end
+        ]
+        for i in range(block_end - block_start):
+            column = block_start + i
+            if group_size != -1 and column % group_size == 0:
+                group_scale, group_zero = find_params(
+                    weights[:, column : column + group_size]
+                )
+                scales.append(group_scale)
+                zeros.append(group_zero)
+            w = block[:, i]
+            scaled = w / group_scale
+            q = np.clip(np.round(scaled) + group_zero, 0, maxq)
+            tie = np.abs(scaled - np.floor(scaled) - 0.5) < 1e-5
+            chosen = keras_codes[:, order[column]]
+            nearest = np.abs(chosen - group_zero - scaled) < 0.5 + 1e-5
+            q = np.where(tie & nearest, chosen, q)
+            codes[:, column] = q
+            error = (w - group_scale * (q - group_zero)) / block_inverse[i, i]
+            block[:, i:] -= np.outer(error, block_inverse[i, i:])
+            block_error[:, i] = error
+        weights[:, block_end:] -= (
+            block_error @ inverse_hessian[block_start:block_end, block_end:]
+        )
+    if group_size == -1:
+        scales, zeros = [group_scale], [group_zero]
+    g_idx = np.arange(columns) // (columns if group_size == -1 else group_size)
+    if activation_order:
+        codes = codes[:, inverse_order]
+        g_idx = g_idx[inverse_order]
+    return codes, np.stack(scales, 1), np.stack(zeros, 1), g_idx
+
+
+class GPTQReferenceTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("asymmetric_per_channel", 4, -1, False, False),
+        ("asymmetric_grouped", 4, 8, False, False),
+        ("asymmetric_grouped_act_order", 4, 8, True, False),
+        ("symmetric_per_channel_8bit", 8, -1, False, True),
+        ("symmetric_grouped", 4, 8, False, True),
+        ("symmetric_grouped_act_order", 4, 8, True, True),
+        ("two_bit_grouped", 2, 16, False, False),
+        ("three_bit_grouped_act_order", 3, 8, True, False),
+        ("group_below_blocksize", 4, 4, False, False),
+        # An explicit group over every input takes its range after the
+        # dead input is zeroed, unlike `group_size=-1`.
+        ("group_of_all_inputs", 4, 32, False, False),
+    )
+    def test_solve_matches_the_reference(
+        self, bits, group_size, activation_order, symmetric
+    ):
+        # `GPTQCalibrator` reproduces the reference solve code for code,
+        # with an input that never fires during calibration. A symmetric
+        # group's negative extreme lands on a half-way point, where the
+        # port follows Keras's rounding.
+        rng = np.random.default_rng(0)
+        in_features, out_features, num_rows = 32, 12, 2048
+        mixing = np.eye(in_features) + 0.3 * rng.standard_normal(
+            (in_features, in_features)
+        )
+        x = (rng.standard_normal((num_rows, in_features)) @ mixing).astype(
+            "float32"
+        )
+        x[:, 5] = 0.0
+        kernel = 0.2 * rng.standard_normal((in_features, out_features))
+        # The dead input's weights would set every row's range.
+        kernel[5] = 3.0
+        layer = layers.Dense(out_features, use_bias=False)
+        layer.build((None, in_features))
+        layer.kernel.assign(kernel)
+        config = GPTQConfig(
+            dataset=None,
+            tokenizer=None,
+            weight_bits=bits,
+            group_size=group_size,
+            activation_order=activation_order,
+            symmetric=symmetric,
+        )
+        layer.quantize("gptq", config=config)
+        calibrator = GPTQCalibrator(layer, config)
+        calibrator.observe(x)
+        hessian = ops.convert_to_numpy(calibrator.hessian)
+        weights_transpose = ops.convert_to_numpy(ops.transpose(layer._kernel))
+        # A block size of 8 spans several blocks over 32 inputs.
+        with mock.patch.object(
+            gptq,
+            "gptq_quantize_matrix",
+            functools.partial(gptq.gptq_quantize_matrix, blocksize=8),
+        ):
+            calibrator.quantize()
+        quantized_weight = layer._quantized_weight()
+        keras_codes = ops.convert_to_numpy(
+            ops.transpose(quantized_weight.unpack())
+        )
+
+        codes, scale, zero, g_idx = _reference_gptq(
+            weights_transpose,
+            hessian,
+            bits=bits,
+            blocksize=8,
+            damping=config.hessian_damping,
+            group_size=group_size,
+            activation_order=activation_order,
+            symmetric=symmetric,
+            keras_codes=keras_codes,
+        )
+        self.assertAllEqual(keras_codes, codes)
+        self.assertAllClose(
+            ops.transpose(quantized_weight.scale), scale, rtol=1e-6, atol=0
+        )
+        self.assertAllEqual(ops.transpose(quantized_weight.zero_point), zero)
+        self.assertAllEqual(quantized_weight.g_idx, g_idx)
+        # The dead input's weights land on its group's zero point.
+        self.assertAllEqual(
+            ops.convert_to_numpy(quantized_weight.unpack())[5],
+            zero[:, g_idx[5]],
         )
