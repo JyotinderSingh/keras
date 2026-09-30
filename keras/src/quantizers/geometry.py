@@ -46,15 +46,19 @@ The geometry is a thin adapter, so the strategies still read
 state directly off the layer. Beyond what `Layer` already provides, a
 quantizable layer must define:
 
-- Projections: `_kernel` (the float kernel variable), `units`, `bias` and
-  `activation` (either may be `None`), and, while LoRA is enabled,
-  `lora_enabled`, `lora_kernel_a`, `lora_kernel_b`, `lora_alpha` and
-  `lora_rank`. `EinsumProjectionGeometry` additionally relies on the
-  equation analysis `EinsumDense` prepares in `_set_quantization_info()`.
-- Lookups: `_embeddings`, `input_dim`, `output_dim`, and the
-  `lora_embeddings_a` / `lora_embeddings_b` equivalents. A reversible
+- Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
+  shape, recorded in `build()`), `units`, `bias` and `activation` (either
+  may be `None`). `EinsumProjectionGeometry` additionally relies on the
+  `einsum_axes` record `EinsumDense` derives from its equation in `build()`.
+- Lookups: `_embeddings`, `input_dim` and `output_dim`. A reversible
   lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
   `reverse_embeddings` variables.
+
+LoRA is optional: `Layer` defines `lora_enabled = False`. A layer that
+supports it sets `lora_enabled` in `enable_lora()` and defines
+`lora_kernel_a`, `lora_kernel_b`, `lora_alpha` and `lora_rank` (a lookup
+defines `lora_embeddings_a` and `lora_embeddings_b` in place of the kernel
+factors).
 
 The rest comes from `Layer` itself: strategies read `compute_dtype`,
 `dtype_policy` and `path`, create their quantized variables through
@@ -112,6 +116,9 @@ class QuantizationGeometry:
     # dispatch key: strategies branch on it where the reverse table
     # matters, and the forward handler takes the layer's `reverse` argument.
     reversible = False
+    # Attributes the layer's `build()` records and the strategies read.
+    # `Layer.quantize` checks them before it changes the layer.
+    build_attributes = ()
 
     def __init__(self, layer):
         self.layer = layer
@@ -128,14 +135,16 @@ class ProjectionGeometry(QuantizationGeometry):
     """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul."""
 
     family = "projection"
+    build_attributes = ("kernel_shape",)
 
     @property
     def weight_shape(self):
-        """Shape of the float weight that quantization replaces."""
-        return self.layer._kernel.shape
+        """Shape of the float kernel, as the layer recorded it in `build()`.
 
-    def prepare(self):
-        """Computes any layout analysis the geometry needs (idempotent)."""
+        Quantized storage may be packed or flattened, so this is the
+        logical shape every strategy reads rather than a variable's shape.
+        """
+        return tuple(self.layer.kernel_shape)
 
     def calibration_rows_columns(self, kernel_shape):
         """2D `(rows, columns)` view used by the calibration strategies.
@@ -152,14 +161,6 @@ class ProjectionGeometry(QuantizationGeometry):
     def contract_grad(self, upstream, float_kernel):
         """Gradient of `contract` with respect to its inputs."""
         return ops.matmul(upstream, ops.transpose(float_kernel))
-
-    def record_kernel_shape(self, kernel_shape):
-        """Records the float kernel shape the codes stand for."""
-        self.layer.kernel_shape = kernel_shape
-
-    def recorded_kernel_shape(self):
-        """The float kernel shape recorded when the codes were built."""
-        return self.layer.kernel_shape
 
     def rows_columns(self, kernel_shape):
         """2D `(rows, columns)` shape a plain reshape of the kernel takes.
@@ -267,13 +268,12 @@ def _lora_equations(equation):
 class EinsumProjectionGeometry(ProjectionGeometry):
     """Geometry of an N-D einsum kernel (`EinsumDense`).
 
-    The equation-derived axis analysis (reduced/transpose/expand/squeeze
-    axes, the custom-gradient equation) is the layer's own geometry
-    implementation; this class routes the strategies to it.
+    The equation-derived axis analysis (`EinsumDense.einsum_axes`) is
+    the layer's own geometry implementation; this class routes the
+    strategies to it.
     """
 
-    def prepare(self):
-        self.layer._set_quantization_info()
+    build_attributes = ("kernel_shape", "einsum_axes")
 
     def calibration_rows_columns(self, kernel_shape):
         if len(kernel_shape) == 2:
@@ -297,20 +297,16 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     def contract_grad(self, upstream, float_kernel):
         # From https://stackoverflow.com/a/47609896
         return ops.einsum(
-            self.layer._custom_gradient_equation, upstream, float_kernel
+            self.layer.einsum_axes.custom_gradient_equation,
+            upstream,
+            float_kernel,
         )
-
-    def record_kernel_shape(self, kernel_shape):
-        self.layer.original_kernel_shape = kernel_shape
-
-    def recorded_kernel_shape(self):
-        return self.layer.original_kernel_shape
 
     def rows_columns(self, kernel_shape):
         rows = 1
         columns = 1
         for i, dim in enumerate(kernel_shape):
-            if i in self.layer._kernel_reduced_axes:
+            if i in self.layer.einsum_axes.kernel_reduced_axes:
                 rows *= dim
             else:
                 columns *= dim
@@ -318,11 +314,11 @@ class EinsumProjectionGeometry(ProjectionGeometry):
 
     @property
     def kernel_reduced_axes(self):
-        return self.layer._kernel_reduced_axes
+        return self.layer.einsum_axes.kernel_reduced_axes
 
     @property
     def inputs_quantization_axis(self):
-        return tuple(self.layer._input_reduced_axes)
+        return tuple(self.layer.einsum_axes.input_reduced_axes)
 
     def align_inputs_scale(self, scale):
         return self.layer._adjust_scale_for_quant(scale, "input")
