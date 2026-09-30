@@ -4,13 +4,43 @@ A `CalibrationRun` creates one `Calibrator` per layer of a block, passes
 every input the layer sees during the calibration sweeps to `observe`,
 then calls `quantize`, which solves for the layer's codes and writes them
 back through the mode's strategy. `GPTQCalibrator` (a Hessian) and
-`AWQCalibrator` (activation magnitudes) are the calibrators of the
-built-in modes.
+`AWQCalibrator` (activation magnitudes and a Hessian) are the calibrators
+of the built-in modes.
 """
 
 from keras.src import ops
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.geometry import ProjectionGeometry
+
+
+def accumulate_hessian(hessian, x, num_samples):
+    """Adds a batch of inputs to a running Hessian `2 X^T X / N`.
+
+    GPTQ solves with this Hessian and AWQ scores its searches with it.
+
+    Args:
+        hessian: The Hessian of the `num_samples` rows seen so far, with a
+            leading problem axis when `x` has one.
+        x: The batch laid out by the contraction view, `(rows, features)`
+            or `(batch, rows, features)`.
+        num_samples: The number of rows `hessian` covers.
+
+    Returns:
+        The Hessian of the `num_samples` rows and the rows of `x`.
+    """
+    total_samples = num_samples + int(ops.shape(x)[-2])
+    gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
+    # Ensures numerical stability and symmetry in case of large floating
+    # point activations.
+    gram_matrix = ops.divide(
+        ops.add(gram_matrix, ops.swapaxes(gram_matrix, -1, -2)), 2.0
+    )
+    # Decay the previous mean and add the batch's contribution (2 / N).
+    if num_samples > 0:
+        hessian = ops.multiply(hessian, ops.divide(num_samples, total_samples))
+    return ops.add(
+        hessian, ops.multiply(ops.divide(2.0, total_samples), gram_matrix)
+    )
 
 
 class Calibrator:

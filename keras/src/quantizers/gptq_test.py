@@ -1275,16 +1275,19 @@ class GPTQReferenceTest(testing.TestCase):
         # An explicit group over every input takes its range after the
         # dead input is zeroed, unlike `group_size=-1`.
         ("group_of_all_inputs", 4, 32, False, False),
+        # A width the group size does not divide ends in a short group.
+        ("ragged_grouped", 4, 8, False, False, 30),
+        ("ragged_grouped_act_order", 4, 8, True, False, 30),
     )
     def test_solve_matches_the_reference(
-        self, bits, group_size, activation_order, symmetric
+        self, bits, group_size, activation_order, symmetric, in_features=32
     ):
         # `GPTQCalibrator` reproduces the reference solve code for code,
         # with an input that never fires during calibration. A symmetric
         # group's negative extreme lands on a half-way point, where the
         # port follows Keras's rounding.
         rng = np.random.default_rng(0)
-        in_features, out_features, num_rows = 32, 12, 2048
+        out_features, num_rows = 12, 2048
         mixing = np.eye(in_features) + 0.3 * rng.standard_normal(
             (in_features, in_features)
         )

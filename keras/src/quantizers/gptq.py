@@ -3,6 +3,7 @@ import functools
 from keras.src import ops
 from keras.src.ops import linalg
 from keras.src.quantizers.calibrator import Calibrator
+from keras.src.quantizers.calibrator import accumulate_hessian
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
@@ -325,31 +326,8 @@ class GPTQCalibrator(Calibrator):
     def observe(self, inputs):
         """Updates the running mean of the Hessian `2 X^T X / N`."""
         x = self._inputs_view(inputs)
-        num_new_samples = int(ops.shape(x)[-2])
-        num_prev_samples = self.num_samples
-        total_samples = num_prev_samples + num_new_samples
-
-        # gram_matrix: [features, features], per problem
-        gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
-        # Ensures numerical stability and symmetry in case of large floating
-        # point activations.
-        gram_matrix = ops.divide(
-            ops.add(gram_matrix, ops.swapaxes(gram_matrix, -1, -2)), 2.0
-        )
-
-        # Decay previous mean and add current per-sample contribution
-        # (factor 2/N)
-        if self.num_samples > 0:
-            self.hessian = ops.multiply(
-                self.hessian, ops.divide(num_prev_samples, total_samples)
-            )
-
-        self.hessian = ops.add(
-            self.hessian,
-            ops.multiply(ops.divide(2.0, total_samples), gram_matrix),
-        )
-
-        self.num_samples = total_samples
+        self.hessian = accumulate_hessian(self.hessian, x, self.num_samples)
+        self.num_samples += int(ops.shape(x)[-2])
 
     def _solve(self, weights, index):
         hessian = self._problem(self.hessian, index)
