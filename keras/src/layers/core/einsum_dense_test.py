@@ -17,6 +17,7 @@ from keras.src import random
 from keras.src import saving
 from keras.src import testing
 from keras.src.layers.core.einsum_dense import _analyze_einsum_string
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
@@ -2196,6 +2197,54 @@ class EinsumDenseTest(testing.TestCase):
         )
 
 
+class EinsumDenseCalibrationLoRATest(testing.TestCase):
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_calibrated_layer_enables_lora(self, mode):
+        # The Gemma query projection: the calibration view permutes the
+        # kernel, the LoRA factors keep the kernel's own axes.
+        if mode == "gptq":
+            config = GPTQConfig(dataset=None, tokenizer=None, group_size=4)
+        else:
+            config = AWQConfig(
+                dataset=None, tokenizer=None, group_size=4, num_grid_points=5
+            )
+        layer = layers.EinsumDense(
+            "btd,ndh->btnh", output_shape=(None, 2, 3), bias_axes="nh"
+        )
+        layer.build((None, 5, 8))
+        layer.quantize(mode, config=config)
+        calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
+            layer, config
+        )
+        calibrator.observe(np.random.random((4, 5, 8)).astype("float32"))
+        calibrator.quantize()
+        layer.enable_lora(2)
+        self.assertTrue(layer.lora_enabled)
+        self.assertFalse(hasattr(layer, "_kernel"))
+        self.assertEqual(tuple(layer.lora_kernel_a.shape), (2, 8, 2))
+        self.assertEqual(tuple(layer.lora_kernel_b.shape), (2, 3))
+        self.assertLen(layer.trainable_weights, 3)
+        self.assertLen(layer.non_trainable_weights, 4 if mode == "gptq" else 5)
+        self.assertEqual(tuple(layer.kernel.shape), (2, 8, 3))
+
+    def test_float8_refuses_lora(self):
+        # Refused in either order, before the layer changes.
+        message = "lora is not currently supported with FLOAT8"
+        layer = layers.EinsumDense("ab,bc->ac", output_shape=(4,))
+        layer.build((None, 3))
+        layer.quantize("float8")
+        with self.assertRaisesRegex(NotImplementedError, message):
+            layer.enable_lora(2)
+        self.assertFalse(layer.lora_enabled)
+
+        layer = layers.EinsumDense("ab,bc->ac", output_shape=(4,))
+        layer.build((None, 3))
+        layer.enable_lora(2)
+        with self.assertRaisesRegex(NotImplementedError, message):
+            layer.quantize("float8")
+        self.assertIsNone(layer.quantization_mode)
+
+
 class EinsumDenseLoRAEquationsTest(testing.TestCase):
     @parameterized.named_parameters(
         ("precast_int8", "...b,bc->...c", (4, 3, 8), (8,), "int8"),
@@ -2204,6 +2253,9 @@ class EinsumDenseLoRAEquationsTest(testing.TestCase):
         ("reduced_last_int8", "ibnd,hnd->ibh", (2, 3, 4, 8), (3, 6), "int8"),
         ("postcast_int4", "bc...,cd->bd...", (2, 8, 2, 3), (4,), "int4"),
         ("permuted_int4", "abc,cde->abed", (4, 3, 8), (3, 5, 4), "int4"),
+        # The kernel's last axis is a batch axis, shared with the inputs.
+        ("batch_last_int8", "bce,dce->bde", (2, 3, 6), (4, 6), "int8"),
+        ("batch_last_int4", "bce,dce->bde", (2, 3, 6), (4, 6), "int4"),
     )
     def test_quantized_lora_delta_matches_float(
         self, equation, input_shape, output_shape, mode

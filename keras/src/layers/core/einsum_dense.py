@@ -312,7 +312,11 @@ class EinsumDense(Layer):
             dtype="float32",
             regularizer=self.kernel_regularizer,
         )
-        self._kernel.trainable = False
+        if self._quantized_weight() is None:
+            # The float kernel is the weight only while the layer holds one
+            # (unquantized, or a calibration mode before its pass); a
+            # quantized weight's codes were built non-trainable.
+            self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
         self.lora_rank = rank

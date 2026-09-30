@@ -89,6 +89,7 @@ class PackLayoutTest(testing.TestCase):
         self.assertEqual(
             packed.shape[axis], layout.packed_length(codes.shape[axis])
         )
+        self.assertEqual(layout.unpacked_shape(packed.shape), codes.shape)
         self.assertAllClose(layout.unpack(packed), codes)
 
     def test_ternary_round_trip(self):
@@ -259,6 +260,50 @@ class QuantizedWeightTest(testing.TestCase):
         )
         self.assertAllEqual(view.unpack(), weight)
         self.assertAllClose(view.dequantize("float32"), weight)
+
+    def test_code_image_inverts_dequantize(self):
+        # The calibration modes' view at its most involved: packed 4-bit
+        # codes, an activation-order group index, AWQ input scales and an
+        # einsum permutation. Rounding the code image of the dequantized
+        # weight gives back the stored codes.
+        rng = np.random.default_rng(0)
+        codes = rng.integers(0, 16, (3, 8)).astype("uint8")
+        packed, _, _ = packing.pack_int4(codes, axis=-1, dtype="uint8")
+        view = QuantizedWeight(
+            codes=packed,
+            scale=rng.uniform(0.025, 0.25, (2, 8)).astype("float32"),
+            layout=Int4Pairs(axis=-1, orig_len=8),
+            scheme=GROUPED,
+            shape=(2, 3, 4),
+            axis=0,
+            permutation=(1, 0, 2),
+            zero_point=rng.integers(0, 16, (2, 8)).astype("uint8"),
+            g_idx=np.array([1, 0, 1], "float32"),
+            input_scales=np.array([0.5, 1.0, 2.0], "float32"),
+        )
+        image = view.code_image(view.dequantize("float32"))
+        self.assertAllEqual(ops.round(image), codes.astype("float32"))
+        self.assertAllEqual(view.pack_image(ops.round(image)), packed)
+
+    def test_pack_image_clips_to_the_code_range(self):
+        view = _grouped_view()
+        image = np.array([[-3, 0], [15, 7], [99, 14], [1, 16]], "float32")
+        self.assertAllEqual(
+            view.pack_image(image),
+            np.array([[0, 0], [15, 7], [15, 14], [1, 15]], "uint8"),
+        )
+
+    def test_code_image_needs_a_grouped_multiplier_scheme(self):
+        view = QuantizedWeight(
+            codes=np.zeros((4, 2), "int8"),
+            scale=np.ones((2,), "float32"),
+            layout=NoPack(),
+            scheme=DIVISOR,
+            shape=(4, 2),
+            axis=0,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "grouped"):
+            view.code_image(np.zeros((4, 2), "float32"))
 
 
 def _quantized(layer, build_shape, mode, config=None):

@@ -21,6 +21,8 @@ class Float8Strategy(QuantizationStrategy):
     # The float kernel is kept; only auxiliary variables are added.
     owns_weight_storage = False
     geometry_families = ("projection",)
+    # The fp8 forward has no term for a LoRA update.
+    supports_lora = False
 
     def policy_from_string(self, mode_str, source_name):
         return QuantizedFloat8DTypePolicy(mode_str, source_name)

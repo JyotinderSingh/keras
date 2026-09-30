@@ -367,7 +367,12 @@ def _lora_equations(equation):
     last = kernel_spec[-1]
     rank = next(c for c in string.ascii_letters if c not in equation)
     if last in output_spec:
-        mid = output_spec.replace(last, rank)
+        # A last axis the inputs share too (a batch axis) is carried
+        # through the first einsum rather than replaced by the rank.
+        if last in inputs_spec:
+            mid = f"{output_spec}{rank}"
+        else:
+            mid = output_spec.replace(last, rank)
         return (
             f"{inputs_spec},{kernel_spec[:-1]}{rank}->{mid}",
             f"{mid},{rank}{last}->{output_spec}",

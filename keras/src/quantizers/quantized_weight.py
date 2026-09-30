@@ -4,7 +4,8 @@ A quantization mode stores a weight as integer codes (often packed several
 to a byte), a scale, and for a grouped scheme a zero point and a group
 index. `QuantizedWeight` gathers those variables with a `PackLayout`, which
 says how the codes are packed, and a `WeightScheme`, which says what they
-mean.
+mean. `dequantize` reads the real-valued weight; `code_image` and
+`pack_image` write a real-valued weight back onto the stored grid.
 """
 
 import dataclasses
@@ -17,6 +18,7 @@ from keras.src.quantizers.packing import pack_int4
 from keras.src.quantizers.packing import unpack_int2
 from keras.src.quantizers.packing import unpack_int4
 from keras.src.quantizers.packing import unpack_ternary
+from keras.src.quantizers.quantizers import _take_group_params
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 
 
@@ -69,7 +71,7 @@ class PackLayout:
     One subclass per storage format: `values_per_byte` codes share a
     stored element along the layout's axis, `packed_length` gives the
     stored length of that axis, `unpack` restores one code per element
-    and `pack` stores them.
+    (in `unpacked_shape`) and `pack` stores them.
     """
 
     values_per_byte = 1
@@ -86,6 +88,10 @@ class PackLayout:
     def packed_length(cls, length):
         """Stored length of an axis holding `length` codes."""
         return length
+
+    def unpacked_shape(self, packed_shape):
+        """Shape of the codes a stored tensor of `packed_shape` holds."""
+        return tuple(packed_shape)
 
     def __repr__(self):
         return f"{type(self).__name__}()"
@@ -111,6 +117,11 @@ class _AxisPack(PackLayout):
     @classmethod
     def packed_length(cls, length):
         return math.ceil(length / cls.values_per_byte)
+
+    def unpacked_shape(self, packed_shape):
+        shape = list(packed_shape)
+        shape[self.axis] = self.orig_len
+        return tuple(shape)
 
     def __repr__(self):
         return (
@@ -174,10 +185,10 @@ class QuantizedWeight:
     `QuantizationStrategy.quantized_weight(layer)` builds it on demand.
 
     The codes are stored as the weight transposed and reshaped:
-    `layout.unpack(codes)` is `reshape(transpose(W, permutation), s)`, where
-    `W` is the weight in `shape` and `s` is the unpacked shape of `codes`
-    (an int4, GPTQ or AWQ einsum kernel is stored as 2-D). `axis` and the
-    stored scale refer to these stored coordinates; `unpack()` and
+    `layout.unpack(codes)` is `reshape(transpose(W, permutation),
+    layout.unpacked_shape(codes.shape))`, where `W` is the weight in
+    `shape` (an int4, GPTQ or AWQ einsum kernel is stored as 2-D). `axis`
+    and the stored scale refer to these stored coordinates; `unpack()` and
     `dequantize()` return `shape`.
 
     Args:
@@ -294,10 +305,45 @@ class QuantizedWeight:
             else:
                 weight = ops.divide(codes, self._align(self.scale))
         if self.input_scales is not None:
-            shape = [1] * len(weight.shape)
-            shape[self.axis] = -1
-            weight = ops.divide(weight, ops.reshape(self.input_scales, shape))
+            weight = ops.divide(
+                weight, self._along_axis(self.input_scales, weight)
+            )
         return self._restore_shape(ops.cast(weight, dtype))
+
+    def code_image(self, weight):
+        """Returns the unrounded codes of a real-valued `weight`.
+
+        The inverse of `dequantize` under the stored parameters of a
+        grouped multiplier scheme: `weight`, in `shape`, is laid out in
+        stored coordinates, multiplied by `input_scales`, divided by its
+        group's scale and shifted by its zero point, in `float32`. An entry
+        that rounds outside `scheme.code_range` is a weight the stored
+        parameters do not cover.
+        """
+        if self.g_idx is None or self.scheme.scale_form != "multiplier":
+            raise NotImplementedError(
+                "`code_image` supports grouped multiplier schemes only. "
+                f"Received: scheme={self.scheme!r}"
+            )
+        image = self._as_stored(ops.cast(weight, "float32"))
+        if self.input_scales is not None:
+            input_scales = ops.cast(self.input_scales, "float32")
+            image = ops.multiply(image, self._along_axis(input_scales, image))
+        scales, zeros = _take_group_params(
+            self.scale, self.zero_point, self.g_idx, self.axis
+        )
+        image = ops.divide(image, ops.cast(scales, "float32"))
+        return ops.add(image, ops.cast(zeros, "float32"))
+
+    def pack_image(self, image):
+        """Returns the stored codes of a rounded code image.
+
+        `image` is `code_image(weight)` rounded. It is clipped to
+        `scheme.code_range`, cast to the dtype of `codes` and packed.
+        """
+        low, high = self.scheme.code_range
+        codes = ops.cast(ops.clip(image, low, high), self.codes.dtype)
+        return self.layout.pack(codes)
 
     def _align(self, tensor):
         """Lays a per-channel scale or zero point out against the codes."""
@@ -306,6 +352,18 @@ class QuantizedWeight:
         if self.axis is None:
             return tensor
         return ops.expand_dims(tensor, self.axis)
+
+    def _along_axis(self, tensor, like):
+        """Reshapes a 1-D `tensor` to broadcast along `axis` of `like`."""
+        shape = [1] * len(like.shape)
+        shape[self.axis] = -1
+        return ops.reshape(tensor, shape)
+
+    def _as_stored(self, weight):
+        """Lays `weight`, in `shape`, out in stored coordinates."""
+        if self.permutation is not None:
+            weight = ops.transpose(weight, self.permutation)
+        return ops.reshape(weight, self.layout.unpacked_shape(self.codes.shape))
 
     def _restore_shape(self, tensor):
         """Reshapes and transposes stored coordinates to `shape`."""

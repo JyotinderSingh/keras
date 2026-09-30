@@ -92,8 +92,10 @@ class Calibrator:
 
     def quantize(self):
         """Solves each problem for its codes and writes them back."""
-        # The solve runs in float32 whatever the layer's variable dtype.
-        kernel = ops.cast(self.layer.kernel, "float32")
+        # The base kernel, in float32 whatever the layer's variable dtype. A
+        # LoRA update stays a separate term of the forward pass, as for int8
+        # and int4.
+        kernel = ops.cast(self.layer._kernel, "float32")
         kernel = self.view.kernel_to_view(kernel)
         results = [
             self._solve(ops.transpose(kernel[index]), index)

@@ -41,6 +41,8 @@ This module must stay import-light: it is consulted lazily from
 not pull in layers or policies at module level.
 """
 
+from keras.src import ops
+
 _MODE_TO_STRATEGY = {}  # mode -> QuantizationStrategy, in registration order.
 
 
@@ -52,7 +54,8 @@ class QuantizationStrategy:
     (`Layer._quantization_geometry()`), which describes the layer's
     quantizable structure without the layer knowing about any mode. A
     mode that stores integer codes also implements `quantized_weight`; a
-    mode that supports a LoRA-merged save also implements `encode`.
+    mode that supports a LoRA-merged save also implements `encode`, or
+    overrides `merge_lora_delta`.
     """
 
     # The mode identifier, e.g. `"int8"`. Also the root of the policy-string
@@ -77,7 +80,9 @@ class QuantizationStrategy:
     # (pre-block layers + sequential blocks) before mutating any layer.
     requires_layer_structure = False
 
-    # Whether a layer quantized with this mode can enable LoRA.
+    # Whether a layer quantized with this mode can use LoRA. `enable_lora`
+    # and `Layer.quantize` check it, so a mode that sets it to False refuses
+    # LoRA in either order, before the layer changes.
     supports_lora = True
 
     # The geometry families (`QuantizationGeometry.family`) this mode's math
@@ -243,12 +248,27 @@ class QuantizationStrategy:
 
         Returns `(codes, scale, zero_point)` exactly as the mode's variables
         hold them (packed and oriented for storage), ready to assign.
-        The LoRA-merged save path uses it to re-quantize a merged weight.
+        The default `merge_lora_delta` uses it to re-quantize a merged
+        weight.
         `zero_point` is `None` for a symmetric scheme.
         """
         raise NotImplementedError(
             f"Quantization mode '{self.name}' does not implement `encode`."
         )
+
+    def merge_lora_delta(self, layer, delta):
+        """Folds a LoRA update into `layer`'s stored weight, for saving.
+
+        `delta` is the scaled LoRA update in the weight's shape. Returns
+        `(codes, scale, zero_point)` as `encode` does. The default
+        dequantizes the stored weight in the layer's variable dtype, adds
+        the delta and encodes the sum with a fresh scale.
+        """
+        merged = ops.add(
+            self.quantized_weight(layer).dequantize(layer.variable_dtype),
+            delta,
+        )
+        return self.encode(layer, merged, layer.quantization_config)
 
     # --- Quantized weight view --------------------------------------------
 
