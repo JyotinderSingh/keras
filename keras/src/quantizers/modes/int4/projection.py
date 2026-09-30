@@ -4,30 +4,30 @@ import math
 
 from keras.src import ops
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_grouped
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
-from keras.src.quantizers.packing import unpack_int4
 from keras.src.quantizers.quantization_config import QuantizationConfig
+from keras.src.quantizers.quantized_weight import Int4Pairs
+from keras.src.quantizers.quantized_weight import QuantizedWeight
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.quantizers.quantizers import (
     abs_max_quantize_grouped_with_zero_point,
 )
-from keras.src.quantizers.quantizers import dequantize_with_sz_map
 
 
 class Int4ProjectionHandlers:
-    """`_build_projection` / `_call_projection` / `_quantize_projection`."""
+    """The int4 build, forward, encode and view of a projection kernel.
 
-    # --- Projection (Dense, EinsumDense) ----------------------------------
-    #
-    # One implementation serves every kernel contracted against its inputs.
-    # The kernel is viewed as 2D `[rows, columns]` (rows: the contracted
-    # axes, columns: the rest); codes are packed two per byte along the
-    # columns, and the scale runs per column (per-channel) or per group of
-    # rows (grouped, with a zero point and a group index). Per-channel and
-    # grouped differ only in the variables they build and quantize; the
-    # forward pass is one path: dequantize, then contract in float.
+    The kernel is stored as 2-D `[rows, columns]`, a plain reshape of the
+    kernel (`geometry.rows_columns`), so `rows` are the contracted axes
+    only when those lead the kernel. The codes are packed two per byte
+    along the columns, and the scale runs per column (per-channel) or per
+    group of rows (grouped, with a zero point and a group index). The
+    forward pass dequantizes through the `QuantizedWeight` view and
+    contracts in float.
+    """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
         geometry.prepare()
@@ -38,10 +38,10 @@ class Int4ProjectionHandlers:
         block_size = self.resolve_block_size(layer, config)
         geometry.record_kernel_shape(kernel_shape)
 
-        # Codes packed along the columns: stored as `[rows, ceil(columns/2)]`.
+        # Codes packed two per byte along the columns.
         layer._kernel = layer.add_weight(
             name="kernel",
-            shape=(rows, (columns + 1) // 2),
+            shape=(rows, Int4Pairs.packed_length(columns)),
             initializer="zeros",
             dtype="int8",
             trainable=False,
@@ -74,18 +74,44 @@ class Int4ProjectionHandlers:
             # `g_idx` is stored as `float32` because TF has no GPU kernel for
             # int32 resource variables (would pin the variable to CPU and
             # break jit_compile on GPU); consumers cast to int32 on-device.
+            # Not autocast: bfloat16 holds integers exactly only up to 256.
             layer.g_idx = layer.add_weight(
                 name="g_idx",
                 shape=(rows,),
                 initializer=idx_initializer,
                 dtype="float32",
                 trainable=False,
+                autocast=False,
             )
 
         # Recorded for unpacking and reshaping at runtime.
         layer._int4_block_size = block_size
         layer._orig_input_dim = rows
         layer._orig_output_dim = columns
+
+    def _view(self, layer, geometry, codes, scale, zero_point, g_idx):
+        """The view over the layer's variables or over traced tensors."""
+        return QuantizedWeight(
+            codes=codes,
+            scale=scale,
+            layout=Int4Pairs(axis=-1, orig_len=layer._orig_output_dim),
+            scheme=int4_scheme(layer._int4_block_size),
+            shape=geometry.recorded_kernel_shape(),
+            axis=0,
+            zero_point=zero_point,
+            g_idx=g_idx,
+        )
+
+    def _quantized_weight_projection(self, layer, geometry):
+        grouped = is_grouped(layer._int4_block_size)
+        return self._view(
+            layer,
+            geometry,
+            layer._kernel,
+            layer.kernel_scale,
+            layer.kernel_zero if grouped else None,
+            layer.g_idx if grouped else None,
+        )
 
     def _call_projection(self, layer, inputs, training=None):
         geometry = layer._quantization_geometry()
@@ -102,23 +128,12 @@ class Int4ProjectionHandlers:
             the packed kernel, so the gradient with respect to the inputs is
             taken through the dequantized kernel.
             """
-            unpacked = unpack_int4(kernel, layer._orig_output_dim, axis=-1)
+            kernel_zero, g_idx = group_params if group_params else (None, None)
 
             def dequantize():
-                if group_params:
-                    kernel_zero, g_idx = group_params
-                    # Scale and zero point are `[n_groups, columns]`; the
-                    # group index expands them over the rows.
-                    float_kernel = dequantize_with_sz_map(
-                        unpacked, kernel_scale, kernel_zero, g_idx, group_axis=0
-                    )
-                    float_kernel = ops.cast(float_kernel, layer.compute_dtype)
-                else:
-                    float_kernel = ops.divide(
-                        ops.cast(unpacked, dtype=layer.compute_dtype),
-                        kernel_scale,
-                    )
-                return geometry.reshape_kernel(float_kernel)
+                return self._view(
+                    layer, geometry, kernel, kernel_scale, kernel_zero, g_idx
+                ).dequantize(layer.compute_dtype)
 
             def grad_fn(*args, upstream=None):
                 if upstream is None:
@@ -141,7 +156,9 @@ class Int4ProjectionHandlers:
         params = [
             inputs,
             ops.convert_to_tensor(layer._kernel),
-            ops.convert_to_tensor(layer.kernel_scale),
+            # Read inside the autocast scope: on TensorFlow eager the gradient
+            # runs after it, and the variable itself would then read float32.
+            ops.convert_to_tensor(layer.kernel_scale.value),
         ]
         if grouped:
             params += [
@@ -152,8 +169,7 @@ class Int4ProjectionHandlers:
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 
-    def _quantize_projection(self, layer, geometry, config):
-        kernel_shape = layer._kernel.shape
+    def _encode_projection(self, layer, geometry, weight, config):
         geometry.prepare()
         # `Int4Strategy.resolve_block_size` is the single source of truth for
         # the group size, shared with the build path and the dtype-policy
@@ -163,8 +179,8 @@ class Int4ProjectionHandlers:
         # block_size=128); a `block_size` of `None` or `-1` selects the
         # per-channel escape hatch.
         block_size = self.resolve_block_size(layer, config)
-        rows, columns = geometry.rows_columns(kernel_shape)
-        flat_kernel = ops.reshape(layer._kernel, (rows, columns))
+        rows, columns = geometry.rows_columns(weight.shape)
+        flat_kernel = ops.reshape(weight, (rows, columns))
 
         if is_per_channel(block_size):
             # Symmetric codes with one scale per column.
@@ -190,9 +206,16 @@ class Int4ProjectionHandlers:
 
         # Pack two int4 values per int8 byte along the columns.
         packed_kernel_value, _, _ = pack_int4(kernel_value_int4, axis=-1)
+        return packed_kernel_value, kernel_scale, kernel_zero
+
+    def _quantize_projection(self, layer, geometry, config):
+        kernel_shape = layer._kernel.shape
+        kernel_value, kernel_scale, kernel_zero = self._encode_projection(
+            layer, geometry, layer._kernel, config
+        )
         del layer._kernel
         layer.quantized_build(kernel_shape, "int4", config)
-        layer._kernel.assign(packed_kernel_value)
+        layer._kernel.assign(kernel_value)
         layer.kernel_scale.assign(kernel_scale)
         if kernel_zero is not None:
             layer.kernel_zero.assign(kernel_zero)
