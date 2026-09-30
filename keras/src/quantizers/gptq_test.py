@@ -228,13 +228,6 @@ class GPTQTest(testing.TestCase):
         self.assertEqual(256 * 256, 65536)  # unpacked one value per byte
 
     def test_initialization_errors(self):
-        # A 4-D einsum kernel has no 2-D calibration view.
-        four_d = layers.EinsumDense(
-            "abc,cdef->abdef", output_shape=(3, 2, 3, 2)
-        )
-        four_d.build((None, 3, 4))
-        with self.assertRaisesRegex(ValueError, "only supports 2D or 3D"):
-            GPTQCalibrator(four_d)
         # An unbuilt layer reports the missing kernel, not an unsupported
         # type (the wording of the `AttributeError` varies by backend).
         with self.assertRaisesRegex(AttributeError, "kernel"):
@@ -1227,6 +1220,12 @@ class TestModelQuantization(testing.TestCase):
         block = models.Sequential(
             [
                 layers.Dense(embed_dim, activation="relu"),
+                # Gemma's `[heads, d_model, head_dim]` query projection,
+                # whose contracted axis does not lead the kernel.
+                layers.EinsumDense(
+                    "btd,ndh->btnh", output_shape=(seq_len, 2, 2)
+                ),
+                layers.Reshape((seq_len, embed_dim)),
                 layers.EinsumDense(
                     "abc,cd->abd", output_shape=(seq_len, embed_dim)
                 ),
@@ -1286,4 +1285,8 @@ class TestModelQuantization(testing.TestCase):
         self.assertTrue(hasattr(restored_dense, "quantized_kernel"))
         self.assertIsNone(
             restored_dense.quantization_config.quantization_layer_structure
+        )
+        # Stored by the model width: 4 rows of 4 columns packed to 2 bytes.
+        self.assertEqual(
+            tuple(restored_block.layers[1].quantized_kernel.shape), (4, 2)
         )

@@ -245,6 +245,21 @@ class QuantizedWeightTest(testing.TestCase):
         self.assertEqual(tuple(view.dequantize("float32").shape), (2, 2, 3))
         self.assertIn("shape=(2, 2, 3)", repr(view))
 
+    def test_permutation_restores_the_weight_axes(self):
+        # The codes are the weight transposed by `permutation`, flattened.
+        weight = np.arange(24, dtype="float32").reshape(2, 3, 4)
+        codes = np.transpose(weight, (1, 0, 2)).reshape(3, 8).astype("int8")
+        view = QuantizedWeight(
+            codes=codes,
+            scale=np.float32(1.0),
+            layout=NoPack(),
+            scheme=DIVISOR,
+            shape=(2, 3, 4),
+            permutation=(1, 0, 2),
+        )
+        self.assertAllEqual(view.unpack(), weight)
+        self.assertAllClose(view.dequantize("float32"), weight)
+
 
 def _quantized(layer, build_shape, mode, config=None):
     """Builds `layer`, sets its weight in `[-1, 1]` and quantizes it."""

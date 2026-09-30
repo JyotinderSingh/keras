@@ -721,6 +721,14 @@ class EinsumAxes:
     `output / (inputs_scale * kernel_scale)` broadcasts against
     `einsum(equation, inputs, kernel)`. `custom_gradient_equation` is the
     einsum that produces the inputs gradient.
+
+    The last four fields classify the axes for the geometry's
+    `ContractionView`. `kernel_batch_axes` are shared by the inputs, the
+    kernel and the output; `kernel_free_axes` reach the output from the
+    kernel alone. `input_batch_axes` and `input_contracted_axes` are the
+    input axes with the labels of `kernel_batch_axes` and
+    `kernel_reduced_axes`, in the kernel's order, so both operands flatten
+    the same way.
     """
 
     input_reduced_axes: tuple
@@ -732,6 +740,10 @@ class EinsumAxes:
     input_squeeze_axes: tuple
     kernel_squeeze_axes: tuple
     custom_gradient_equation: str
+    kernel_batch_axes: tuple
+    kernel_free_axes: tuple
+    input_batch_axes: tuple
+    input_contracted_axes: tuple
 
 
 def _analyze_quantization_info(equation, input_shape):
@@ -866,6 +878,27 @@ def _analyze_quantization_info(equation, input_shape):
         weight_transpose_axes.insert(index, ori_index)
     # Prepare equation for `einsum_with_inputs_gradient`
     custom_gradient_equation = f"{output_spec},{weight_spec}->{input_spec}"
+    # Classify the kernel axes for the contraction view. A batch axis is
+    # shared by the inputs, the kernel and the output; a free axis reaches
+    # the output from the kernel alone; the rest are contracted.
+    kernel_batch_axes = []
+    kernel_free_axes = []
+    for i, label in enumerate(weight_spec):
+        if label not in output_spec:
+            continue
+        if label in input_spec:
+            kernel_batch_axes.append(i)
+        else:
+            kernel_free_axes.append(i)
+    # The input axes with the same labels, in the kernel's order.
+    input_batch_axes = [
+        input_spec.index(weight_spec[i]) for i in kernel_batch_axes
+    ]
+    input_contracted_axes = [
+        input_spec.index(weight_spec[i])
+        for i in weight_reduced_axes
+        if weight_spec[i] in input_spec
+    ]
     return EinsumAxes(
         input_reduced_axes=tuple(input_reduced_axes),
         kernel_reduced_axes=tuple(weight_reduced_axes),
@@ -876,4 +909,8 @@ def _analyze_quantization_info(equation, input_shape):
         input_squeeze_axes=tuple(input_squeeze_axes),
         kernel_squeeze_axes=tuple(weight_squeeze_axes),
         custom_gradient_equation=custom_gradient_equation,
+        kernel_batch_axes=tuple(kernel_batch_axes),
+        kernel_free_axes=tuple(kernel_free_axes),
+        input_batch_axes=tuple(input_batch_axes),
+        input_contracted_axes=tuple(input_contracted_axes),
     )
