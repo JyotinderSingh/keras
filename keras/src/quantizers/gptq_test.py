@@ -497,7 +497,9 @@ class GPTQTest(testing.TestCase):
         )
         block.build((None, 8))
 
-        found = find_layers_in_block(block)
+        found = find_layers_in_block(
+            block, strategy_registry.get_strategy("gptq")
+        )
 
         self.assertEqual(len(found), 2)
         for dense in block.layers:

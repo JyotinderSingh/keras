@@ -8,7 +8,6 @@ the undersampling threshold from the calibrator.
 
 import math
 import warnings
-from contextlib import contextmanager
 from contextlib import nullcontext
 
 import numpy as np
@@ -17,8 +16,6 @@ from absl import logging
 from keras.src import backend
 from keras.src import ops
 from keras.src import utils as keras_utils
-from keras.src.layers import Dense
-from keras.src.layers import EinsumDense
 from keras.src.quantizers.capture import calibration_scope
 from keras.src.quantizers.utils import should_quantize_layer
 
@@ -150,123 +147,74 @@ def get_dataloader(
     return samples.astype(np.int32)[:, None, :]
 
 
-def find_layers_in_block(block):
-    """
-    Finds all Dense and EinsumDense layers in a transformer block.
+def find_layers_in_block(block, strategy):
+    """Finds the layers of a block that declare support for a mode.
+
+    Support is read as `Layer.quantize` reads it
+    (`Layer._supports_quantization_mode`), so a third-party layer that
+    lists the mode in its `variable_serialization_spec` is found, as
+    `Dense` and `EinsumDense` are.
 
     Args:
         block: A Keras layer representing a transformer block.
+        strategy: The `CalibrationStrategy` of the mode.
+
     Returns:
-        A dict mapping layer paths to the corresponding Dense or EinsumDense
+        A dict mapping layer paths to the layers.
     """
-    found_layers = {}
-    for sub_layer in block._flatten_layers():
-        # A quantizable layer may own sub-layers (e.g. a `Layer`
-        # activation), so no leaf filtering here — collect every Dense/
-        # EinsumDense reachable inside the block.
-        if isinstance(sub_layer, (Dense, EinsumDense)):
-            found_layers[sub_layer.path] = sub_layer
-    return found_layers
+    # A quantizable layer may own sub-layers (a `Layer` activation), so
+    # this does not filter leaves.
+    return {
+        layer.path: layer
+        for layer in block._flatten_layers()
+        if layer._supports_quantization_mode(strategy)
+    }
 
 
-def _execution_stages(layer_names, execution_trace):
+def _execution_stages(block, layers, batch):
     """Groups a block's layers into sequential quantization stages.
 
     Reference GPTQ implementations quantize a block's sub-layers in
-    topological order ("true sequential"): once an upstream sub-layer is
-    quantized, downstream statistics are re-estimated on the quantized
-    activations. Without this, e.g. an MLP's statistics are captured while the
-    attention sub-layers are still full-precision, and the error
-    corrections it derives are tuned to activations that no longer exist
-    once attention is quantized too — which measurably degrades quality
-    below plain round-to-nearest.
+    topological order ("true sequential"): the statistics of a layer are
+    taken after the layers upstream of it are quantized, so its solve is
+    computed against the activations it sees at inference.
 
-    Stages are derived from the calibration trace: layers are ordered by
-    first invocation, and layers that consumed the *same* input tensor
-    (e.g. the query/key/value projections, or an MLP's gate/up pair) share
-    a stage since quantizing one cannot affect the others' inputs. Layers
-    that never fired during tracing are placed in the first stage,
-    preserving their (empty) statistics.
+    One forward pass of `batch` records the order the layers first run in
+    and the input each consumes. Consecutive layers that consume the same
+    input tensor (the query/key/value projections, an MLP's gate/up pair)
+    share a stage, since quantizing one cannot change the others' inputs.
+    The layers that do not run in that pass form the last stage.
 
     Args:
-        layer_names: Iterable of layer names in the block.
-        execution_trace: Dict of `{name: (call_index, input_tensor)}`
-            recorded by `stream_inputs`.
+        block: The block the layers belong to.
+        layers: The layers to group.
+        batch: One batch of the block's inputs.
 
     Returns:
-        List of lists of layer names, one list per stage, in execution
-        order.
+        List of lists of layers, one list per stage, in execution order.
     """
-    traced = [name for name in layer_names if name in execution_trace]
-    untraced = [name for name in layer_names if name not in execution_trace]
-    traced.sort(key=lambda name: execution_trace[name][0])
+    trace = {}
 
-    stages = []
-    current_stage, current_input_id = [], None
-    for name in traced:
-        input_id = id(execution_trace[name][1])
-        if current_stage and input_id != current_input_id:
-            stages.append(current_stage)
-            current_stage = []
-        current_stage.append(name)
-        current_input_id = input_id
-    if current_stage:
-        stages.append(current_stage)
+    def recorder(layer):
+        def record(inputs):
+            # The first call only. The trace keeps the input alive, so its
+            # identity cannot be reused within the pass.
+            trace.setdefault(id(layer), (layer, inputs))
 
+        return record
+
+    with calibration_scope({layer: recorder(layer) for layer in layers}):
+        block(batch)
+    stages, stage_input = [], None
+    for layer, inputs in trace.values():
+        if not stages or inputs is not stage_input:
+            stages.append([])
+        stages[-1].append(layer)
+        stage_input = inputs
+    untraced = [layer for layer in layers if id(layer) not in trace]
     if untraced:
-        if stages:
-            stages[0] = untraced + stages[0]
-        else:
-            stages = [untraced]
+        stages.append(untraced)
     return stages
-
-
-@contextmanager
-def stream_inputs(layers_map, calibrators, execution_trace=None):
-    """Streams every target layer's inputs into its calibrator.
-
-    Registers a calibration capture (`keras.src.quantizers.capture`) on
-    each layer, which the dispatch machinery runs before each of the
-    layer's forward passes, whichever forward that is, and passes the
-    input to `calibrators[name].observe`, which lays it out through the
-    layer's contraction view.
-    Every capture is removed on exit, even if an exception occurs;
-    nothing on the layers is rebound.
-
-    Args:
-        layers_map: Dict[str, Layer]. Mapping from logical layer names to
-            the layers to observe. Keys must match `calibrators`.
-        calibrators: Dict[str, Calibrator]. Mapping from names to the
-            calibrators that receive the inputs.
-        execution_trace: Optional dict. When provided, each layer's FIRST
-            capture records `{name: (call_index, input_tensor)}` into it:
-            the block-level execution order and the identity of the input
-            each layer consumes, from which `CalibrationRun` derives the
-            within-block quantization stages. The recorded tensors are
-            only kept alive for identity comparison; callers should drop
-            the trace after use.
-
-    Yields:
-        None: The captures are active only within the `with` block.
-    """
-    call_counter = [0]
-
-    def create_capture(name):
-        def capture(inputs):
-            if execution_trace is not None and name not in execution_trace:
-                # Record block-level execution order and the input tensor's
-                # identity on the first call (a live reference is kept so the
-                # id cannot be recycled while tracing).
-                execution_trace[name] = (call_counter[0], inputs)
-                call_counter[0] += 1
-            calibrators[name].observe(inputs)
-
-        return capture
-
-    with calibration_scope(
-        {layer: create_capture(name) for name, layer in layers_map.items()}
-    ):
-        yield
 
 
 class CalibrationRun:
@@ -275,14 +223,15 @@ class CalibrationRun:
     `Model.quantize` resolves the layer structure and the mode's
     `CalibrationStrategy` creates the run for it (`calibrate`). The run
     materializes the activations behind the prefix layers once, then
-    walks the blocks in order. For each block it builds a calibrator per
-    layer this mode left pending, from the layer's own
-    `quantization_config`, streams the block's inputs into them, quantizes
-    the layers in execution-order stages ("true sequential": after a stage
-    is quantized, the later stages' statistics are re-estimated on the
-    quantized upstream activations), and runs the calibrated block to
-    produce the next block's inputs. The activations are kept as the
-    batches the blocks run on. A run with no pending layer does nothing.
+    walks the blocks in order. For each block it groups the layers this
+    mode left pending into execution-order stages ("true sequential").
+    For each stage in turn it builds a calibrator per layer, from the
+    layer's own `quantization_config`, passes the block's inputs through
+    the block to them, and quantizes the stage's layers, so a later
+    stage observes the quantized output of the stages before it. It then
+    runs the calibrated block to produce the next block's inputs. The
+    activations are kept as the batches the blocks run on. A run with no
+    pending layer does nothing.
 
     Args:
         strategy: The `CalibrationStrategy` of the mode. It supplies the
@@ -314,9 +263,10 @@ class CalibrationRun:
         self.num_samples = config.num_samples
         self.batch_size = int(config.calibration_batch_size)
         # Layers whose statistics saw too few calibration tokens relative
-        # to their input width, collected across all blocks for a single
-        # summary warning.
+        # to their input width, and layers that observed no input,
+        # collected across all blocks for one warning each.
         self.undersampled = []
+        self.unreached = []
 
     def run(self, dataloader):
         """Calibrates and quantizes every block, in order.
@@ -338,6 +288,7 @@ class CalibrationRun:
                 inputs = self._next_inputs(block, inputs)
             progbar.update(current=block_idx + 1)
         self._warn_undersampled()
+        self._warn_unreached()
         logging.info("Quantization process complete.")
 
     def _prefix_outputs(self, dataloader):
@@ -356,17 +307,14 @@ class CalibrationRun:
             for start in range(0, self.num_samples, self.batch_size)
         ]
 
-    def _sweep(self, block, layers, calibrators, inputs, execution_trace=None):
-        with stream_inputs(layers, calibrators, execution_trace):
-            for batch in inputs:
-                _ = block(batch)
-
     def _pending_layers(self, block):
         # Only the layers this mode left pending: a layer quantized in
         # another mode, or already calibrated, has no float kernel to solve.
         return {
             name: layer
-            for name, layer in find_layers_in_block(block).items()
+            for name, layer in find_layers_in_block(
+                block, self.strategy
+            ).items()
             if layer.quantization_mode == self.strategy.name
             and layer.calibration_pending
             and should_quantize_layer(layer, self.filters)
@@ -385,36 +333,29 @@ class CalibrationRun:
             )
             return
         logging.info(f"Found layers: {list(layers)}")
-        calibrators = {
-            name: self._calibrator(layer) for name, layer in layers.items()
-        }
-        execution_trace = {}
-        self._sweep(block, layers, calibrators, inputs, execution_trace)
-
         # Quantize the block's layers in execution-order stages ("true
-        # sequential", as in reference GPTQ): after each stage is
-        # quantized, downstream stages' statistics are re-estimated so
-        # their solves are computed against the quantized upstream
-        # activations they will actually see at inference.
-        stages = _execution_stages(layers, execution_trace)
-        del execution_trace
-        for stage_idx, stage_names in enumerate(stages):
-            if stage_idx > 0:
-                for name in stage_names:
-                    # Drop the stale statistics before allocating new ones.
-                    del calibrators[name]
-                    calibrators[name] = self._calibrator(layers[name])
-                self._sweep(
-                    block,
-                    {name: layers[name] for name in stage_names},
-                    {name: calibrators[name] for name in stage_names},
-                    inputs,
-                )
-            for name in stage_names:
-                calibrator = calibrators.pop(name)
+        # sequential", as in reference GPTQ): a stage observes the block
+        # after the stages before it are quantized, so its solves are
+        # computed against the activations the layers see at inference.
+        stages = _execution_stages(block, list(layers.values()), inputs[0])
+        for stage in stages:
+            self._calibrate_stage(block, stage, inputs)
+
+    def _calibrate_stage(self, block, layers, inputs):
+        # The statistics live for this call only, so the run holds those
+        # of one stage at a time.
+        calibrators = [self._calibrator(layer) for layer in layers]
+        with calibration_scope({c.layer: c.observe for c in calibrators}):
+            for batch in inputs:
+                block(batch)
+        for calibrator in calibrators:
+            name = calibrator.layer.path
+            if calibrator.num_samples:
                 self._tally_undersampling(name, calibrator)
-                logging.info(f"Quantizing {name}...")
-                calibrator.quantize()
+            else:
+                self.unreached.append(name)
+            logging.info(f"Quantizing {name}...")
+            calibrator.quantize()
 
     def _tally_undersampling(self, name, calibrator):
         threshold = calibrator.warn_tokens_per_row
@@ -443,5 +384,19 @@ class CalibrationRun:
             self.strategy.calibrator_cls.undersampling_warning(
                 self.undersampled
             ),
+            stacklevel=2,
+        )
+
+    def _warn_unreached(self):
+        if not self.unreached:
+            return
+        warnings.warn(
+            f"{self.strategy.name.upper()} calibration observed no input "
+            f"for {len(self.unreached)} layer(s), so their weights are "
+            "quantized without calibration statistics: "
+            f"{', '.join(self.unreached)}. A layer that the blocks do not "
+            "run on the calibration data, such as a layer that runs only "
+            "in training, is never observed. To keep such a layer in "
+            "float, exclude it with `filters`.",
             stacklevel=2,
         )

@@ -466,11 +466,12 @@ class Model(Trainer, base_trainer.Trainer, Layer):
         use specific quantizers for weights or activations).
 
         For the `"gptq"` and `"awq"` modes, quantization is restricted to
-        the `Dense` and `EinsumDense` layers inside the structure's
-        `"sequential_blocks"` (provided via
-        `config.quantization_layer_structure` or the model's
-        `get_quantization_layer_structure(mode)` hook). All other layers
-        are left in their original precision.
+        the layers inside the structure's `"sequential_blocks"` (provided
+        via `config.quantization_layer_structure` or the model's
+        `get_quantization_layer_structure(mode)` hook) that list the mode
+        in their `variable_serialization_spec`: `Dense`, `EinsumDense` and
+        custom layers that opt in. All other layers are left in their
+        original precision.
 
         The call collects a `QuantizationReport` describing which layers were
         quantized and which were skipped (and why). The report is returned and
@@ -632,7 +633,7 @@ class Model(Trainer, base_trainer.Trainer, Layer):
                 )
             structure_layer_ids = set()
             for block in structure.get("sequential_blocks", []):
-                for sub_layer in find_layers_in_block(block).values():
+                for sub_layer in find_layers_in_block(block, strategy).values():
                     structure_layer_ids.add(id(sub_layer))
 
         report = QuantizationReport(mode=mode)

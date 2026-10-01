@@ -1,10 +1,12 @@
 import math
+import warnings
 from unittest import mock
 
 import numpy as np
 import pytest
 from absl.testing import parameterized
 
+from keras.src import activations
 from keras.src import backend
 from keras.src import layers
 from keras.src import models
@@ -13,15 +15,16 @@ from keras.src import testing
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.calibration_run import _execution_stages
-from keras.src.quantizers.calibration_run import find_layers_in_block
 from keras.src.quantizers.calibration_run import get_dataloader
-from keras.src.quantizers.calibration_run import stream_inputs
+from keras.src.quantizers.capture import calibration_scope
+from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import calibration_statistic
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
 from keras.src.quantizers.quantization_test_utils import token_dataset
+from keras.src.quantizers.report import QuantizationReport
 from keras.src.utils.rng_utils import set_random_seed
 
 VOCAB_SIZE = 100
@@ -252,17 +255,12 @@ class TestCalibrationCore(testing.TestCase):
         samples = ops.convert_to_tensor(samples.astype("float32"))
 
         def accumulate(batch_size):
-            layers_map = find_layers_in_block(block)
-            calibrators = {
-                name: calibrate_layer(
-                    layer, calibration_config(mode), solve=False
-                )
-                for name, layer in layers_map.items()
-            }
-            with stream_inputs(layers_map, calibrators):
+            calibrator = calibrate_layer(
+                block.dense, calibration_config(mode), solve=False
+            )
+            with calibration_scope({block.dense: calibrator.observe}):
                 for start in range(0, num_samples, batch_size):
                     block(samples[start : start + batch_size])
-            (calibrator,) = calibrators.values()
             return calibration_statistic(calibrator), calibrator.num_samples
 
         statistic, rows = accumulate(batch_size=1)
@@ -295,43 +293,149 @@ class TestCalibrationCore(testing.TestCase):
         model.quantize("gptq", config=config)
 
 
+class TrainingOnlyBlock(layers.Layer):
+    """A block whose second layer runs only in training."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.observed = layers.Dense(8, name="observed")
+        self.training_only = layers.Dense(8, name="training_only")
+
+    def build(self, input_shape):
+        self.observed.build(input_shape)
+        self.training_only.build(input_shape[:-1] + (8,))
+
+    def call(self, inputs, training=False):
+        hidden = self.observed(inputs)
+        if training:
+            hidden = self.training_only(hidden)
+        return hidden
+
+
+class RecipeOnlyProjection(layers.Layer):
+    """A projection layer written to the documented recipe only.
+
+    It is not a `Dense`: it defines a geometry, lists the modes in its
+    `variable_serialization_spec`, and runs the quantized build sequence.
+    It has none of the extras of `quantization_test_utils`'s third-party
+    layers (LoRA, a `kernel` property, a config).
+    """
+
+    def __init__(self, units, activation=None, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.activation = activations.get(activation)
+
+    def build(self, input_shape):
+        self.kernel_shape = (input_shape[-1], self.units)
+        if self.quantization_mode:
+            self.quantized_build(
+                self.kernel_shape,
+                mode=self.quantization_mode,
+                config=self.quantization_config,
+            )
+        if not self._strategy_owns_weight_storage():
+            self._kernel = self.add_weight(
+                name="kernel", shape=self.kernel_shape
+            )
+        self.bias = self.add_weight(
+            name="bias", shape=(self.units,), initializer="zeros"
+        )
+
+    def call(self, inputs):
+        outputs = ops.add(ops.matmul(inputs, self._kernel), self.bias)
+        return self.activation(outputs)
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+    @property
+    def variable_serialization_spec(self):
+        return {
+            None: ["kernel", "bias"],
+            "gptq": [
+                "bias",
+                "quantized_kernel",
+                "kernel_scale",
+                "kernel_zero",
+                "g_idx",
+            ],
+            "awq": [
+                "bias",
+                "quantized_kernel",
+                "kernel_scale",
+                "kernel_zero",
+                "awq_scales",
+                "g_idx",
+            ],
+        }
+
+    def save_own_variables(self, store):
+        self._save_serialized_variables(store, "kernel")
+
+    def load_own_variables(self, store):
+        self._load_serialized_variables(store, "kernel")
+
+
+class AttentionLikeBlock(layers.Layer):
+    """Attention-shaped stages, a gated MLP, and a layer that never runs."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.query = layers.Dense(4)
+        self.key = layers.Dense(4)
+        self.value = layers.Dense(4)
+        self.attention_output = layers.Dense(4)
+        self.gate = layers.Dense(8)
+        self.up = layers.Dense(8)
+        self.down = layers.Dense(4)
+        self.unused = layers.Dense(4)
+
+    def call(self, inputs):
+        scores = self.query(inputs) * self.key(inputs) + self.value(inputs)
+        hidden = self.attention_output(scores)
+        return self.down(self.gate(hidden) * self.up(hidden))
+
+
 class TestExecutionStages(testing.TestCase):
     def test_stages_group_by_shared_input_and_order(self):
-        x_attn, x_out, x_mlp, x_down = (
-            object(),
-            object(),
-            object(),
-            object(),
+        block = AttentionLikeBlock()
+        x = ops.ones((2, 4))
+        block(x)
+        stages = _execution_stages(
+            block,
+            [
+                block.down,
+                block.up,
+                block.gate,
+                block.attention_output,
+                block.value,
+                block.key,
+                block.query,
+            ],
+            x,
         )
-        trace = {
-            "query": (0, x_attn),
-            "key": (1, x_attn),
-            "value": (2, x_attn),
-            "attention_output": (3, x_out),
-            "gate": (4, x_mlp),
-            "up": (5, x_mlp),
-            "down": (6, x_down),
-        }
-        stages = _execution_stages(list(trace), trace)
         self.assertEqual(
             stages,
             [
-                ["query", "key", "value"],
-                ["attention_output"],
-                ["gate", "up"],
-                ["down"],
+                [block.query, block.key, block.value],
+                [block.attention_output],
+                [block.gate, block.up],
+                [block.down],
             ],
         )
 
-    def test_untraced_layers_join_first_stage(self):
-        x = object()
-        trace = {"a": (0, x)}
-        stages = _execution_stages(["ghost", "a"], trace)
-        self.assertEqual(stages, [["ghost", "a"]])
-
-    def test_no_trace_single_stage(self):
-        stages = _execution_stages(["a", "b"], {})
-        self.assertEqual(stages, [["a", "b"]])
+    def test_untraced_layers_form_the_last_stage(self):
+        block = AttentionLikeBlock()
+        x = ops.ones((2, 4))
+        block(x)
+        stages = _execution_stages(
+            block, [block.unused, block.attention_output, block.query], x
+        )
+        self.assertEqual(
+            stages,
+            [[block.query], [block.attention_output], [block.unused]],
+        )
 
 
 class TestDataloaderReproducibility(testing.TestCase):
@@ -362,15 +466,21 @@ class TestDataloaderReproducibility(testing.TestCase):
         self.assertAllClose(out[0, 0], np.arange(88, 96))
 
 
-def _tiny_model(mode, num_samples=4, dtype=None, **kwargs):
-    """Embedding -> [Dense(16, relu), Dense(8)] block -> pooled head."""
+def _tiny_model(mode, num_samples=4, dtype=None, block_layers=None, **kwargs):
+    """Embedding -> block -> pooled head.
+
+    The default block is `[Dense(16, relu), Dense(8)]`; given block layers
+    map `(batch, 16, 8)` inputs to `(batch, 16, features)`.
+    """
     set_random_seed(123)
     seq_len, vocab_size, embed_dim = 16, 48, 8
-    model, structure = tiny_calibration_model(
-        [
+    if block_layers is None:
+        block_layers = [
             layers.Dense(16, activation="relu", dtype=dtype),
             layers.Dense(embed_dim, dtype=dtype),
-        ],
+        ]
+    model, structure = tiny_calibration_model(
+        block_layers,
         vocab_size=vocab_size,
         sequence_length=seq_len,
         embed_dim=embed_dim,
@@ -443,6 +553,23 @@ class CalibrationRunTest(testing.TestCase):
                 TypeError, f"Unsupported layer type for {mode.upper()}"
             ):
                 calibrate_layer(layer, calibration_config(mode), solve=False)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_equation_without_a_view_is_refused_before_the_layer_changes(
+        self, mode
+    ):
+        layer = layers.EinsumDense("abc,cd->ad", output_shape=(5,))
+        layer.build((None, 3, 8))
+        weights = [ops.convert_to_numpy(w) for w in layer.weights]
+        with self.assertRaisesRegex(
+            NotImplementedError, "Cannot derive a contraction view"
+        ):
+            layer.quantize(mode, config=calibration_config(mode, group_size=-1))
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertEqual(len(layer.weights), len(weights))
+        for variable, value in zip(layer.weights, weights):
+            self.assertAllEqual(variable, value)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_calibrates_every_block_in_order(self, mode):
@@ -577,17 +704,87 @@ class CalibrationRunModelTest(testing.TestCase):
         self.assertGreater(np.abs(statistic).max(), 0.0)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
-    def test_later_stages_are_observed_again(self, mode):
-        """The chained Dense layers form two stages. The first sweep
-        observes both (two calls per forward pass); once the first layer is
-        quantized, the second is observed again on its quantized output
-        (one more call per forward pass)."""
+    def test_each_stage_is_observed_in_its_own_sweep(self, mode):
+        """The chained Dense layers form two stages. Each stage observes
+        one sweep over the batches, the second after the first is
+        quantized."""
         model, config = _tiny_model(
             mode, num_samples=4, calibration_batch_size=3
         )
+        block = config.quantization_layer_structure["sequential_blocks"][0]
         with _spy_on_observe(mode) as observe:
             model.quantize(mode, config=config)
-        self.assertEqual(observe.call_count, 3 * math.ceil(4 / 3))
+        observed = [call.args[0].layer for call in observe.call_args_list]
+        sweep = math.ceil(4 / 3)
+        self.assertEqual(
+            observed, [block.layers[0]] * sweep + [block.layers[1]] * sweep
+        )
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_layers_without_observations_are_named_in_one_warning(self, mode):
+        block = TrainingOnlyBlock()
+        model, config = _tiny_model(mode, block_layers=[block])
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            model.quantize(mode, config=config)
+        messages = [str(w.message) for w in caught]
+        unreached = [m for m in messages if "observed no input" in m]
+        self.assertLen(unreached, 1)
+        self.assertIn(block.training_only.path, unreached[0])
+        self.assertNotIn(block.observed.path, unreached[0])
+        # A layer that observed nothing is not also undersampled.
+        self.assertFalse([m for m in messages if "undersampled" in m])
+        for layer in (block.observed, block.training_only):
+            self.assertEqual(layer.quantization_mode, mode)
+            self.assertFalse(layer.calibration_pending)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_third_party_projection_in_a_block_is_calibrated(self, mode):
+        """A layer that lists the mode is calibrated, not only `Dense`.
+
+        The third-party layer computes what the `Dense` it replaces
+        computes, so the run must store the same values for both.
+        """
+        reference, reference_config = _tiny_model(mode)
+        custom = RecipeOnlyProjection(16, activation="relu")
+        model, config = _tiny_model(
+            mode, block_layers=[custom, layers.Dense(8)]
+        )
+        block = config.quantization_layer_structure["sequential_blocks"][0]
+        model.set_weights(reference.get_weights())
+        report = model.quantize(mode, config=config)
+        reference.quantize(mode, config=reference_config)
+
+        self.assertIn(custom.path, [path for path, *_ in report.quantized])
+        self.assertEqual(custom.quantization_mode, mode)
+        self.assertFalse(custom.calibration_pending)
+        reference_block = reference_config.quantization_layer_structure[
+            "sequential_blocks"
+        ][0]
+        for layer, reference_layer in zip(block.layers, reference_block.layers):
+            self.assertEqual(len(layer.weights), len(reference_layer.weights))
+            for variable, expected in zip(
+                layer.weights, reference_layer.weights
+            ):
+                self.assertAllEqual(variable, expected)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_equation_without_a_view_is_skipped_and_reported(self, mode):
+        dense = layers.Dense(8)
+        einsum = layers.EinsumDense("abc,bc->abc", output_shape=(16, 8))
+        model, config = _tiny_model(mode, block_layers=[dense, einsum])
+        kernel = ops.convert_to_numpy(einsum.kernel)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            report = model.quantize(mode, config=config)
+        self.assertIn(
+            (einsum.path, QuantizationReport.SKIP_NO_SUPPORT), report.skipped
+        )
+        self.assertIsNone(einsum.quantization_mode)
+        self.assertIsNone(einsum.quantization_config)
+        self.assertAllEqual(einsum.kernel, kernel)
+        self.assertEqual(dense.quantization_mode, mode)
+        self.assertFalse(dense.calibration_pending)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_calibration_runs_without_grad_tracking(self, mode):

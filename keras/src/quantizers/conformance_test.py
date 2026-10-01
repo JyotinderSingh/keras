@@ -590,11 +590,6 @@ class QuantizationConformanceTest(testing.TestCase):
     )
     @pytest.mark.requires_trainable_backend
     def test_calibration_through_model_quantize(self, mode_name, kind):
-        if LAYERS[kind].third_party:
-            self.skipTest(
-                "`Model.quantize` calibrates only `Dense` and `EinsumDense` "
-                "layers, not every layer that lists the mode."
-            )
         case = MODES[mode_name]
         input_shape = LAYERS[kind].input_shape
         sequence_length = input_shape[1] if len(input_shape) == 3 else 3

@@ -18,6 +18,9 @@ import math
 import warnings
 
 from keras.src import ops
+from keras.src.quantizers.calibration_run import CalibrationRun
+from keras.src.quantizers.calibration_run import calibration_no_grad_scope
+from keras.src.quantizers.calibration_run import get_dataloader
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
@@ -46,6 +49,14 @@ class CalibrationStrategy(QuantizationStrategy):
         # A live float layer keeps its float kernel as the weight until
         # `write_back` installs the calibrated codes.
         layer.calibration_pending = True
+
+    def check_quantizable(self, layer):
+        # A layer whose contraction has no view is refused before it
+        # changes, as a layer without support is.
+        try:
+            self.require_geometry(layer).contraction_view()
+        except ValueError as error:
+            raise NotImplementedError(str(error)) from None
 
     # --- Config and policy-string surface ---------------------------------
 
@@ -126,14 +137,6 @@ class CalibrationStrategy(QuantizationStrategy):
                 `"sequential_blocks"`, as `Model.quantize` resolved it.
             filters: Optional filters that exclude layers from quantization.
         """
-        # Imported here to avoid an import cycle: `calibration_run` imports
-        # the layers, which import the strategies.
-        from keras.src.quantizers.calibration_run import CalibrationRun
-        from keras.src.quantizers.calibration_run import (
-            calibration_no_grad_scope,
-        )
-        from keras.src.quantizers.calibration_run import get_dataloader
-
         if config.dataset is None or config.tokenizer is None:
             raise ValueError(
                 f"{self.name.upper()} quantization requires a dataset and a "
