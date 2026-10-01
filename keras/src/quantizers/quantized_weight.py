@@ -194,9 +194,10 @@ class QuantizedWeight:
             axis of a GPTQ or AWQ einsum kernel), the groups restart at
             each problem and are numbered across the problems, so the
             scale holds `batch * n_groups` rows and each problem's last
-            group may be shorter; `g_idx` is authoritative. `None` when
-            the scale broadcasts against the codes as it is (a per-tensor
-            scalar) or `align_scale` lays it out.
+            group may be shorter; `g_idx` is authoritative. An int4 einsum
+            kernel never stacks problems: its batch axes are in the
+            columns. `None` when the scale broadcasts against the codes as
+            it is (a per-tensor scalar) or `align_scale` lays it out.
         permutation: Axis order of `shape` in which the codes are stored,
             or `None` for the weight's own order.
         zero_point: The stored zero point, given exactly when

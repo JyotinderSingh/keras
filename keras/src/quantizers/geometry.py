@@ -17,8 +17,8 @@ Two geometry families exist today:
   `EinsumProjectionGeometry`, whose axis analysis lives on the layer
   itself and is reached through the geometry's hooks), which axes the
   quantizers reduce over, how a scale lines up with the kernel and with
-  the outputs, the 2D `(rows, columns)` reshape of an N-D kernel, and the
-  `ContractionView` the calibration modes derive from the equation.
+  the outputs, the 2D `(contracted, rest)` matrix of an N-D kernel, and
+  the `ContractionView` the calibration modes derive from the equation.
 - Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
   plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
   projection (`ReversibleLookupGeometry`).
@@ -252,8 +252,9 @@ class ProjectionGeometry(QuantizationGeometry):
     def contraction_view(self):
         """The kernel's `ContractionView`, derived from the contraction.
 
-        Unlike `rows_columns`, a plain reshape, the view puts the contracted
-        axes first and splits a batch axis into independent problems.
+        GPTQ and AWQ calibrate on it. Unlike `kernel_matrix`, it stacks the
+        problems of a batch axis along the rows, because act-order `g_idx`
+        and AWQ's input scales differ per problem and lie along the rows.
         """
         return ContractionView(
             self.weight_shape,
@@ -272,14 +273,19 @@ class ProjectionGeometry(QuantizationGeometry):
         """Gradient of `contract` with respect to its inputs."""
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
-    def rows_columns(self, kernel_shape):
-        """2D `(rows, columns)` shape a plain reshape of the kernel takes.
+    def kernel_matrix(self, kernel_shape):
+        """The kernel's 2D `(contracted, rest)` matrix, as int4 stores it.
 
-        `rows` is the product of the contracted axes and `columns` that of
-        the rest, so the reshape is `(contracted, rest)` only when the
-        contracted axes lead the kernel.
+        Returns `(permutation, rows, columns)`: the kernel transposed by
+        `permutation` and reshaped to `(rows, columns)` has its contracted
+        axes as the rows and every other axis, in the kernel's order, as
+        the columns. A batch axis (the experts of a mixture-of-experts down
+        projection) lands in the columns, so every column belongs to one
+        problem. That keeps the released int4 bytes of a layout whose
+        contracted axes lead, and a per-channel scale per problem and
+        column. Without a batch axis it is the `contraction_view` matrix.
         """
-        return kernel_shape[0], kernel_shape[1]
+        return (0, 1), kernel_shape[0], kernel_shape[1]
 
     @property
     def kernel_reduced_axes(self):
@@ -425,15 +431,14 @@ class EinsumProjectionGeometry(ProjectionGeometry):
             float_kernel,
         )
 
-    def rows_columns(self, kernel_shape):
-        rows = 1
-        columns = 1
-        for i, dim in enumerate(kernel_shape):
-            if i in self.layer.einsum_axes.kernel_reduced_axes:
-                rows *= dim
-            else:
-                columns *= dim
-        return rows, columns
+    def kernel_matrix(self, kernel_shape):
+        contracted = self.layer.einsum_axes.kernel_reduced_axes
+        rest = tuple(i for i in range(len(kernel_shape)) if i not in contracted)
+        return (
+            contracted + rest,
+            math.prod(kernel_shape[i] for i in contracted),
+            math.prod(kernel_shape[i] for i in rest),
+        )
 
     @property
     def kernel_reduced_axes(self):
