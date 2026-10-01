@@ -18,7 +18,6 @@ import math
 import warnings
 
 from keras.src import ops
-from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
@@ -102,9 +101,7 @@ class CalibrationStrategy(QuantizationStrategy):
         """
         if isinstance(config, self.config_cls):
             return getattr(config, attr)
-        policy = layer.dtype_policy
-        if isinstance(policy, DTypePolicyMap):
-            policy = policy[layer.path]
+        policy = layer._own_dtype_policy
         if policy.quantization_mode == self.name:
             return getattr(policy, attr)
         raise ValueError(
