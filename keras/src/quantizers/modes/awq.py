@@ -12,16 +12,7 @@ class AWQStrategy(CalibrationStrategy):
 
     name = "awq"
     config_cls = AWQConfig
-
-    def policy_from_string(self, mode_str, source_name):
-        return AWQDTypePolicy(mode_str, source_name)
-
-    def _resolution_error(self, attr):
-        del attr
-        return (
-            "For AWQ quantization, group_size must be specified "
-            "through AWQConfig or AWQDTypePolicy."
-        )
+    policy_cls = AWQDTypePolicy
 
     def _build_extra_variables(self, layer, rows):
         # Per-channel AWQ scales from activation magnitudes. The weights

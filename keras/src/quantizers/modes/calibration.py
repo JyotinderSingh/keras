@@ -9,6 +9,7 @@ in a handful of message fragments. Those differences are the hooks below.
 
 import math
 
+from keras.src import ops
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
@@ -41,6 +42,23 @@ class CalibrationStrategy(QuantizationStrategy):
 
     # --- Config and policy-string surface ---------------------------------
 
+    # The mode's dedicated dtype policy class.
+    policy_cls = None
+
+    def policy_from_string(self, mode_str, source_name):
+        return self.policy_cls(mode_str, source_name)
+
+    def config_from_policy(self, policy):
+        name = self.name.upper()
+        raise ValueError(
+            f"Implicitly enabling {name} quantization by setting "
+            f"`dtype_policy` to '{policy.name}' is not supported. "
+            f"{name} requires a calibration dataset and a config object "
+            f"(`{self.config_cls.__name__}`).\n\n"
+            f"Please use the `.quantize('{self.name}', config=...)` method "
+            "on the layer or model instead."
+        )
+
     def _missing_config_error(self):
         return (
             f"For {self.name.upper()}, the `config` argument must be of "
@@ -71,21 +89,14 @@ class CalibrationStrategy(QuantizationStrategy):
         policy = layer.dtype_policy
         if isinstance(policy, DTypePolicyMap):
             policy = policy[layer.path]
-            if policy.quantization_mode != self.name:
-                self._on_policy_map_mismatch(policy)
         if policy.quantization_mode == self.name:
             return getattr(policy, attr)
-        raise ValueError(self._resolution_error(attr))
-
-    def _on_policy_map_mismatch(self, policy):
-        """Hook for modes that reject a mismatched `DTypePolicyMap` entry.
-
-        Returning lets resolution fall through to `_resolution_error`.
-        """
-
-    def _resolution_error(self, attr):
-        """The error raised when a hyperparameter cannot be resolved."""
-        raise NotImplementedError
+        raise ValueError(
+            f"For {self.name.upper()} quantization, the {attr} must be "
+            "specified either through a `dtype_policy` of type "
+            f"`{self.policy_cls.__name__}` or the `config` argument. "
+            f"Received: dtype_policy={policy!r}"
+        )
 
     # --- Variables --------------------------------------------------------
 
@@ -101,11 +112,6 @@ class CalibrationStrategy(QuantizationStrategy):
         # marks a live float layer pending after this returns.
         layer.calibration_pending = False
 
-        if len(input_shape) not in (2, 3):
-            raise ValueError(
-                f"{self.name.upper()} quantization only supports 2D or 3D "
-                "kernels."
-            )
         rows, columns = geometry.calibration_rows_columns(input_shape)
 
         bits = self.resolve_weight_bits(layer, config)
@@ -161,8 +167,15 @@ class CalibrationStrategy(QuantizationStrategy):
     # --- Calibration state ------------------------------------------------
 
     def write_back(self, layer, codes, scale, zero_point, g_idx, **extra):
-        """Installs the calibrated values and retires the float kernel."""
+        """Installs the calibrated values and retires the float kernel.
+
+        `codes` are the unpacked codes in the kernel's `[in, out]`
+        orientation; they are packed here as `build` laid out the variable.
+        """
         self.require_geometry(layer)
+        bits = self.resolve_weight_bits(layer, layer.quantization_config)
+        codes = ops.cast(codes, layer.quantized_kernel.dtype)
+        codes = self._pack_layout(bits, codes.shape[-1]).pack(codes)
         del layer._kernel
         layer.quantized_kernel.assign(codes)
         layer.kernel_scale.assign(scale)

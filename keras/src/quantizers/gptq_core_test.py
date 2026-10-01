@@ -6,7 +6,7 @@ from keras.src import layers
 from keras.src import models
 from keras.src import ops
 from keras.src import testing
-from keras.src.quantizers.gptq import GPTQ
+from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.gptq_core import _stack_calibration_batch
 from keras.src.quantizers.gptq_core import find_layers_in_block
@@ -267,7 +267,7 @@ class TestGPTQCore(testing.TestCase):
     def test_calibration_batching_produces_identical_hessian(self):
         """The Hessian accumulated during calibration must be identical
         whether calibration samples are streamed one at a time or in
-        batches. `update_hessian_with_batch` flattens activations to
+        batches. `GPTQCalibrator.observe` flattens activations to
         `[-1, features]`, so batching only changes the number of forward
         passes, not the math."""
         d_model = 16
@@ -289,7 +289,8 @@ class TestGPTQCore(testing.TestCase):
         def accumulate(batch_size):
             layers_map = find_layers_in_block(block)
             gptq_objects = {
-                name: GPTQ(layer) for name, layer in layers_map.items()
+                name: GPTQCalibrator(layer)
+                for name, layer in layers_map.items()
             }
             with stream_hessians(layers_map, gptq_objects):
                 for start in range(0, num_samples, batch_size):
