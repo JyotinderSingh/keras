@@ -294,7 +294,7 @@ class Int4LookupHandlers:
             )
             del layer.reverse_embeddings
 
-        layer.quantized_build(embeddings_shape, "int4", config)
+        layer.quantized_build(embeddings_shape, self.name, config)
         layer._embeddings.assign(packed_embeddings_value)
         layer.embeddings_scale.assign(embeddings_scale)
         if grouped:

@@ -212,7 +212,7 @@ class Int4ProjectionHandlers:
             layer, geometry, layer._kernel, config
         )
         del layer._kernel
-        layer.quantized_build(kernel_shape, "int4", config)
+        layer.quantized_build(kernel_shape, self.name, config)
         layer._kernel.assign(kernel_value)
         layer.kernel_scale.assign(kernel_scale)
         if kernel_zero is not None:

@@ -8,12 +8,16 @@ from keras.src import dtype_policies
 from keras.src import layers
 from keras.src import models
 from keras.src import ops
+from keras.src import saving
 from keras.src import testing
 from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.awq_config import AWQConfig
+from keras.src.quantizers.geometry import LookupGeometry
+from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
+from keras.src.quantizers.quantizers import ternarize
 
 
 class StrategyRegistryTest(testing.TestCase):
@@ -33,7 +37,7 @@ class StrategyRegistryTest(testing.TestCase):
 
     def test_register_requires_name(self):
         class Nameless(strategy_registry.QuantizationStrategy):
-            requires_config = True
+            pass
 
         with self.assertRaisesRegex(ValueError, "non-empty string `name`"):
             strategy_registry.register_quantization_strategy(Nameless)
@@ -41,7 +45,6 @@ class StrategyRegistryTest(testing.TestCase):
     def test_register_rejects_duplicates(self):
         class Duplicate(strategy_registry.QuantizationStrategy):
             name = "int8"
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, "already registered"):
             strategy_registry.register_quantization_strategy(Duplicate)
@@ -57,7 +60,6 @@ class StrategyRegistryTest(testing.TestCase):
 
         class Colliding(strategy_registry.QuantizationStrategy):
             name = colliding_name
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, "collides"):
             strategy_registry.register_quantization_strategy(Colliding)
@@ -68,11 +70,9 @@ class StrategyRegistryTest(testing.TestCase):
         # share a prefix without ambiguity.
         class Custom(strategy_registry.QuantizationStrategy):
             name = "custom"
-            requires_config = True
 
         class CustomTwo(strategy_registry.QuantizationStrategy):
             name = "custom2"
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(Custom)
         try:
@@ -97,7 +97,6 @@ class StrategyRegistryTest(testing.TestCase):
 
         class Reserved(strategy_registry.QuantizationStrategy):
             name = reserved_name
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, error):
             strategy_registry.register_quantization_strategy(Reserved)
@@ -109,7 +108,6 @@ class StrategyRegistryTest(testing.TestCase):
         # "mixed" prefixing "mixed_bfloat16") must not hijack them.
         class MixedMode(strategy_registry.QuantizationStrategy):
             name = "mixed"
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(MixedMode)
         try:
@@ -125,7 +123,6 @@ class StrategyRegistryTest(testing.TestCase):
         @strategy_registry.register_quantization_strategy
         class Decorated(strategy_registry.QuantizationStrategy):
             name = "decorated"
-            requires_config = True
 
         try:
             self.assertIsInstance(Decorated, type)
@@ -137,16 +134,6 @@ class StrategyRegistryTest(testing.TestCase):
             self.assertIsInstance(Sub, type)
         finally:
             strategy_registry.unregister_quantization_strategy("decorated")
-
-    def test_register_requires_config_source(self):
-        # A mode must be able to produce a config: via config_cls, via
-        # requires_config (explicit config mandatory), or by overriding
-        # default_config. Registration fails otherwise, not first use.
-        class NoConfig(strategy_registry.QuantizationStrategy):
-            name = "noconfig"
-
-        with self.assertRaisesRegex(ValueError, "must define `config_cls`"):
-            strategy_registry.register_quantization_strategy(NoConfig)
 
 
 class PolicyCodecCorpusTest(testing.TestCase):
@@ -290,6 +277,7 @@ class PolicyCodecCorpusTest(testing.TestCase):
         )
 
 
+@saving.register_keras_serializable(package="strategy_registry_test")
 class ToyModeConfig(QuantizationConfig):
     """Config for the toy float16-storage mode used in the test below."""
 
@@ -311,17 +299,14 @@ class ToyModeConfig(QuantizationConfig):
 class ToyHalfStrategy(strategy_registry.QuantizationStrategy):
     """A toy quantization mode: store the kernel in float16.
 
-    This is the "add a mode is a registration, not a treasure hunt"
-    demonstration: the strategy implements build/call/quantize directly
-    against the layer's geometry (`_quantization_geometry()`), so no
-    layer class needs editing and no dispatch chain exists to extend.
+    The strategy implements build/call/quantize directly against the
+    layer's geometry (`_quantization_geometry()`); `ToyDense` declares the
+    mode in its `variable_serialization_spec`.
     """
 
     name = "demo_half"
     config_cls = ToyModeConfig
-
-    def supports_layer(self, layer):
-        return isinstance(layer, layers.Dense)
+    geometry_families = ("projection",)
 
     def build(self, layer, input_shape, config):
         del config
@@ -349,8 +334,22 @@ class ToyHalfStrategy(strategy_registry.QuantizationStrategy):
         return x
 
 
+@saving.register_keras_serializable(package="strategy_registry_test")
+class ToyDense(layers.Dense):
+    """A `Dense` that lists the toy mode among the modes it supports."""
+
+    @property
+    def variable_serialization_spec(self):
+        spec = super().variable_serialization_spec
+        spec["demo_half"] = ["kernel", "bias"]
+        return spec
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+
 class ToyModeRegistrationTest(testing.TestCase):
-    """End-to-end test that a new mode is just a registry entry."""
+    """End-to-end test of a new mode: a strategy and a spec entry."""
 
     def setUp(self):
         super().setUp()
@@ -361,7 +360,7 @@ class ToyModeRegistrationTest(testing.TestCase):
         super().tearDown()
 
     def test_toy_mode_end_to_end(self):
-        layer = layers.Dense(units=3)
+        layer = ToyDense(units=3)
         layer.build((None, 4))
         reference_kernel = ops.convert_to_numpy(layer._kernel)
 
@@ -388,7 +387,7 @@ class ToyModeRegistrationTest(testing.TestCase):
 
     def test_toy_mode_through_model_quantize(self):
         model = models.Sequential(
-            [layers.Input((4,)), layers.Dense(3, name="target")]
+            [layers.Input((4,)), ToyDense(3, name="target")]
         )
         report = model.quantize("demo_half", verbose=False)
         self.assertEqual(
@@ -399,13 +398,39 @@ class ToyModeRegistrationTest(testing.TestCase):
             "target", "".join(path for path, _, _ in report.quantized)
         )
 
-    def test_toy_mode_rejects_unsupported_layer(self):
-        # `supports_layer` only claims Dense; an Embedding must be skipped
-        # with NotImplementedError, like any unsupported (layer, mode) pair.
-        layer = layers.Embedding(5, 3)
-        layer.build()
-        with self.assertRaises(NotImplementedError):
-            layer.quantize("demo_half")
+    def test_toy_mode_saves_and_loads(self):
+        model = models.Sequential(
+            [layers.Input((4,)), ToyDense(3, name="target")]
+        )
+        model.quantize("demo_half", verbose=False)
+        x = np.random.uniform(-1, 1, size=(2, 4)).astype("float32")
+        path = self.get_temp_dir() + "/toy.keras"
+        model.save(path)
+        revived = saving.load_model(path)
+        self.assertEqual(
+            revived.get_layer("target").dtype_policy.name,
+            "demo_half_from_float32",
+        )
+        self.assertAllClose(revived(x), model(x))
+
+    def test_toy_mode_rejects_a_layer_that_does_not_list_it(self):
+        for layer in (layers.Dense(3), layers.Embedding(5, 3)):
+            layer.build((None, 4))
+            with self.assertRaises(NotImplementedError):
+                layer.quantize("demo_half")
+            self.assertIsNone(layer.quantization_mode)
+
+    def test_a_mode_handles_only_the_families_it_declares(self):
+        layer = ToyDense(3)
+        layer.build((None, 4))
+        strategy = strategy_registry.get_strategy("demo_half")
+        with mock.patch.object(strategy, "geometry_families", ()):
+            with self.assertRaisesRegex(
+                NotImplementedError, "'projection' quantization geometry"
+            ):
+                layer.quantize("demo_half")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertFalse(layer._is_quantized)
 
 
 class ToyNoneConfig(ToyModeConfig):
@@ -415,13 +440,10 @@ class ToyNoneConfig(ToyModeConfig):
 
 
 class ToyUnsupportedStrategy(ToyHalfStrategy):
-    """A registered mode that claims no layer at all."""
+    """A registered mode that no layer lists."""
 
     name = "demo_none"
     config_cls = ToyNoneConfig
-
-    def supports_layer(self, layer):
-        return False
 
 
 class QuantizeTransactionTest(testing.TestCase):
@@ -449,8 +471,35 @@ class QuantizeTransactionTest(testing.TestCase):
         self.assertEqual(layer.quantization_mode, "int8")
 
 
+class ListsEveryModeEmbedding(layers.Embedding):
+    """An `Embedding` that lists modes a lookup geometry cannot carry."""
+
+    @property
+    def variable_serialization_spec(self):
+        spec = super().variable_serialization_spec
+        for mode in ("float8", "ternary", "gptq", "awq"):
+            spec[mode] = ["embeddings"]
+        return spec
+
+    def _quantization_geometry(self):
+        return LookupGeometry(self)
+
+
+class ListsTernaryEinsumDense(layers.EinsumDense):
+    """An `EinsumDense` that lists the ternary mode."""
+
+    @property
+    def variable_serialization_spec(self):
+        spec = super().variable_serialization_spec
+        spec["ternary"] = ["kernel", "bias", "kernel_scale"]
+        return spec
+
+    def _quantization_geometry(self):
+        return super()._quantization_geometry()
+
+
 class ProjectionOnlyModeTest(testing.TestCase):
-    """A mode written for projections refuses a lookup layer it claims."""
+    """A mode written for projections refuses a lookup layer that lists it."""
 
     @parameterized.named_parameters(
         ("float8", "float8"),
@@ -458,58 +507,239 @@ class ProjectionOnlyModeTest(testing.TestCase):
         ("gptq", "gptq"),
         ("awq", "awq"),
     )
-    def test_claimed_lookup_layer_is_refused(self, mode):
+    def test_listing_lookup_layer_is_refused(self, mode):
         config = None
         if mode == "gptq":
             config = GPTQConfig(dataset=None, tokenizer=None)
         elif mode == "awq":
             config = AWQConfig(dataset=None, tokenizer=None)
-        layer = layers.Embedding(10, 8)
+        layer = ListsEveryModeEmbedding(10, 8)
         layer.build()
-        strategy = strategy_registry.get_strategy(mode)
-        with mock.patch.object(strategy, "supports_layer", return_value=True):
-            with self.assertRaisesRegex(
-                NotImplementedError, "'lookup' quantization geometry"
-            ):
-                layer.quantize(mode, config=config)
+        with self.assertRaisesRegex(
+            NotImplementedError, "'lookup' quantization geometry"
+        ):
+            layer.quantize(mode, config=config)
         # Refused before the layer changes.
         self.assertIsNone(layer.quantization_mode)
         self.assertIsNone(layer.quantization_config)
         self.assertFalse(layer._is_quantized)
 
-    def test_ternary_refuses_a_claimed_einsum_layer(self):
-        layer = layers.EinsumDense("ab,bc->ac", output_shape=4)
+    def test_ternary_refuses_a_listing_einsum_layer(self):
+        layer = ListsTernaryEinsumDense("ab,bc->ac", output_shape=4)
         layer.build((None, 3))
-        strategy = strategy_registry.get_strategy("ternary")
-        with mock.patch.object(strategy, "supports_layer", return_value=True):
-            with self.assertRaisesRegex(
-                NotImplementedError, "only a `Dense` kernel"
-            ):
-                layer.quantize("ternary")
+        with self.assertRaisesRegex(
+            NotImplementedError, "only a `Dense` kernel"
+        ):
+            layer.quantize("ternary")
         self.assertIsNone(layer.quantization_mode)
         self.assertIsNone(layer.quantization_config)
 
-    def test_float8_build_refuses_a_claimed_lookup_layer(self):
+    def test_float8_build_refuses_a_listing_lookup_layer(self):
         # A layer built from a float8 policy, as on load.
-        strategy = strategy_registry.get_strategy("float8")
-        with mock.patch.object(strategy, "supports_layer", return_value=True):
-            layer = layers.Embedding(10, 8, dtype="float8_from_float32")
-            with self.assertRaisesRegex(
-                NotImplementedError, "'lookup' quantization geometry"
-            ):
-                layer.build()
+        layer = ListsEveryModeEmbedding(10, 8, dtype="float8_from_float32")
+        with self.assertRaisesRegex(
+            NotImplementedError, "'lookup' quantization geometry"
+        ):
+            layer.build()
 
-    def test_model_quantize_skips_claimed_lookup_layer(self):
+    def test_model_quantize_skips_listing_lookup_layer(self):
         model = models.Sequential(
             [
                 layers.Input((3,), dtype="int32"),
-                layers.Embedding(10, 8, name="emb"),
+                ListsEveryModeEmbedding(10, 8, name="emb"),
                 layers.Dense(4, name="proj"),
             ]
         )
-        strategy = strategy_registry.get_strategy("float8")
-        with mock.patch.object(strategy, "supports_layer", return_value=True):
-            model.quantize("float8")
+        model.quantize("float8")
         self.assertIsNone(model.get_layer("emb").quantization_mode)
         self.assertEqual(model.get_layer("proj").quantization_mode, "float8")
         model(np.array([[1, 2, 3]]))
+
+
+RECIPE_PROJECTION_SPEC = {
+    None: ["kernel"],
+    "int8": ["kernel", "kernel_scale"],
+    "int4": ["kernel", "kernel_scale", "kernel_zero", "g_idx"],
+    "float8": [
+        "kernel",
+        "inputs_scale",
+        "inputs_amax_history",
+        "kernel_scale",
+        "kernel_amax_history",
+        "outputs_grad_scale",
+        "outputs_grad_amax_history",
+    ],
+    "ternary": ["kernel", "kernel_scale"],
+}
+
+
+class RecipeProjection(layers.Layer):
+    """A third-party projection written per the `geometry.py` recipe.
+
+    It has no `units` attribute and no bias; the subclasses supply the
+    kernel shape and the geometry.
+    """
+
+    def __init__(self, features, **kwargs):
+        super().__init__(**kwargs)
+        self.features = features
+        self.activation = None
+
+    def kernel_shape_for(self, input_shape):
+        raise NotImplementedError
+
+    def build(self, input_shape):
+        self.kernel_shape = self.kernel_shape_for(input_shape)
+        if self.quantization_mode:
+            self.quantized_build(
+                self.kernel_shape,
+                mode=self.quantization_mode,
+                config=self.quantization_config,
+            )
+        if not self._strategy_owns_weight_storage():
+            self._kernel = self.add_weight(
+                name="kernel", shape=self.kernel_shape
+            )
+        self.bias = None
+
+    @property
+    def kernel(self):
+        quantized_weight = self._quantized_weight()
+        if quantized_weight is None:
+            return self._kernel
+        return quantized_weight.unpack()
+
+    def call(self, inputs):
+        return self._quantization_geometry().contract(inputs, self._kernel)
+
+    @property
+    def variable_serialization_spec(self):
+        return RECIPE_PROJECTION_SPEC
+
+    def save_own_variables(self, store):
+        self._save_serialized_variables(store, "kernel")
+
+    def load_own_variables(self, store):
+        self._load_serialized_variables(store, "kernel")
+
+
+class ReversedInputsGeometry(ProjectionGeometry):
+    """A 2-D projection that reads its input features in reverse order."""
+
+    def contract(self, inputs, kernel):
+        return ops.matmul(ops.flip(inputs, axis=-1), kernel)
+
+
+class ReversedInputsDense(RecipeProjection):
+    def kernel_shape_for(self, input_shape):
+        return (input_shape[-1], self.features)
+
+    def _quantization_geometry(self):
+        return ReversedInputsGeometry(self)
+
+
+class PointwiseGeometry(ProjectionGeometry):
+    """A 3-D `(1, input_dim, features)` kernel, as a pointwise convolution."""
+
+    def contract(self, inputs, kernel):
+        return ops.einsum("btc,kcd->btd", inputs, kernel)
+
+
+class PointwiseProjection(RecipeProjection):
+    def kernel_shape_for(self, input_shape):
+        return (1, input_shape[-1], self.features)
+
+    def _quantization_geometry(self):
+        return PointwiseGeometry(self)
+
+
+class CustomProjectionTest(testing.TestCase):
+    """Third-party projections stay quantizable with the built-in modes."""
+
+    @parameterized.named_parameters(
+        ("int8", "int8"),
+        ("int4", "int4"),
+        ("float8", "float8"),
+        ("ternary", "ternary"),
+    )
+    def test_quantizes_saves_and_loads(self, mode):
+        layer = ReversedInputsDense(4)
+        layer.build((None, 6))
+        x = np.random.uniform(-1, 1, size=(3, 6)).astype("float32")
+        layer.quantize(mode)
+        self.assertEqual(layer.quantization_mode, mode)
+        y = layer(x)
+        store = {}
+        layer.save_own_variables(store)
+        restored = ReversedInputsDense(4, dtype=layer.dtype_policy.name)
+        restored.build((None, 6))
+        restored.load_own_variables(store)
+        self.assertAllClose(restored(x), y)
+
+    def test_ternary_contracts_through_the_geometry(self):
+        layer = ReversedInputsDense(4)
+        layer.build((None, 6))
+        x = np.random.uniform(-1, 1, size=(3, 6)).astype("float32")
+        ternary_kernel, scale = ternarize(layer._kernel)
+        expected = ops.multiply(
+            ops.matmul(ops.flip(x, axis=-1), ternary_kernel), scale
+        )
+        layer.quantize("ternary")
+        self.assertAllClose(layer(x), expected)
+
+    def test_ternary_refuses_a_kernel_that_is_not_2d(self):
+        layer = PointwiseProjection(4)
+        layer.build((None, 5, 6))
+        kernel = ops.convert_to_numpy(layer._kernel)
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.quantize("ternary")
+        # Refused before the layer changes.
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+        self.assertAllEqual(layer._kernel, kernel)
+
+    def test_ternary_build_refuses_a_kernel_that_is_not_2d(self):
+        # A layer built from a ternary policy, as on load.
+        layer = PointwiseProjection(4, dtype="ternary_from_float32")
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.build((None, 5, 6))
+
+    def test_model_quantize_skips_a_kernel_that_is_not_2d(self):
+        model = models.Sequential(
+            [
+                layers.Input((5, 6)),
+                PointwiseProjection(4, name="pointwise"),
+                layers.Dense(3, name="dense"),
+            ]
+        )
+        model.quantize("ternary")
+        self.assertIsNone(model.get_layer("pointwise").quantization_mode)
+        self.assertEqual(model.get_layer("dense").quantization_mode, "ternary")
+        model(np.ones((2, 5, 6), "float32"))
+
+    def test_missing_build_attributes_are_refused_before_the_change(self):
+        class WithoutActivation(layers.Layer):
+            def build(self, input_shape):
+                self.kernel_shape = (input_shape[-1], 4)
+                self._kernel = self.add_weight(
+                    name="kernel", shape=self.kernel_shape
+                )
+                self.bias = None
+
+            def call(self, inputs):
+                return ops.matmul(inputs, self._kernel)
+
+            def _quantization_geometry(self):
+                return ProjectionGeometry(self)
+
+            @property
+            def variable_serialization_spec(self):
+                return RECIPE_PROJECTION_SPEC
+
+        layer = WithoutActivation()
+        layer.build((None, 6))
+        with self.assertRaisesRegex(ValueError, "did not set activation"):
+            layer.quantize("int8")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertEqual(tuple(layer._kernel.shape), (6, 4))

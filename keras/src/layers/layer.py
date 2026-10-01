@@ -1389,8 +1389,7 @@ class Layer(BackendLayer, Operation):
         """Whether this layer declares support for `strategy`'s mode.
 
         A layer declares support by listing the mode name in its
-        `variable_serialization_spec`; an externally registered mode can
-        also claim a layer through its `supports_layer` hook.
+        `variable_serialization_spec`.
 
         Args:
             strategy: The `QuantizationStrategy` registered for the mode.
@@ -1399,9 +1398,7 @@ class Layer(BackendLayer, Operation):
             A boolean.
         """
         spec = self.variable_serialization_spec
-        if spec is not None and strategy.name in spec:
-            return True
-        return strategy.supports_layer(self)
+        return spec is not None and strategy.name in spec
 
     def _strategy_owns_weight_storage(self):
         """Whether the quantization strategy creates the weight storage.

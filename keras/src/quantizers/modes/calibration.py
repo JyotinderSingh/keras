@@ -36,7 +36,6 @@ class CalibrationStrategy(QuantizationStrategy):
     """A post-training strategy whose values arrive from a calibration pass."""
 
     geometry_families = ("projection",)
-    requires_config = True
     requires_layer_structure = True
 
     def quantize(self, layer, config):
@@ -67,11 +66,20 @@ class CalibrationStrategy(QuantizationStrategy):
             "on the layer or model instead."
         )
 
-    def _missing_config_error(self):
-        return (
+    def default_config(self):
+        # The calibration dataset comes only from an explicit config.
+        raise ValueError(
             f"For {self.name.upper()}, the `config` argument must be of "
             f"type `{self.config_cls.__name__}`."
         )
+
+    def validate_config(self, config):
+        if not isinstance(config, self.config_cls):
+            raise ValueError(
+                f"Mode '{self.name}' requires a valid `config` argument "
+                f"of type `{self.config_cls.__name__}`. "
+                f"Received: {type(config)}"
+            )
 
     def policy_suffix(self, layer, config):
         del layer
@@ -228,7 +236,6 @@ class CalibrationStrategy(QuantizationStrategy):
         `codes` are the unpacked codes in the kernel's `[in, out]`
         orientation; they are packed here as `build` laid out the variable.
         """
-        self.require_geometry(layer)
         bits = self.resolve_weight_bits(layer, layer.quantization_config)
         codes = ops.cast(codes, layer.quantized_kernel.dtype)
         codes = self._pack_layout(bits, codes.shape[-1]).pack(codes)
@@ -270,7 +277,6 @@ class CalibrationStrategy(QuantizationStrategy):
         # completes the transition and retires the float kernel a live
         # `quantize()` left in place.
         if layer.calibration_pending:
-            self.require_geometry(layer)
             del layer._kernel
             layer.calibration_pending = False
 

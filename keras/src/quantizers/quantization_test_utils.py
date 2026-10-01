@@ -221,7 +221,7 @@ class ThirdPartyProjection(Layer):
 
     A subclass gives the float kernel's shape and the geometry. This
     class holds the rest of the protocol: the attributes the strategies
-    read (`kernel_shape`, `units`, `bias`, `activation`), a `build` that
+    read (`kernel_shape`, `bias`, `activation`), a `build` that
     lets a mode create the weight storage, the `kernel` property, LoRA,
     the variable serialization spec, the two save/load one-liners and the
     `quantization_config` in the layer config.

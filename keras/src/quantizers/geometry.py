@@ -43,13 +43,18 @@ class MyProjection(Layer):
         }
 ```
 
+A mode refuses a layer whose geometry family it does not handle
+(`QuantizationStrategy.geometry_families`): int8 and int4 handle
+projections and lookups; float8, ternary, GPTQ and AWQ handle projections
+only, and ternary only a 2-D kernel.
+
 The geometry is a thin adapter, so the strategies still read
 state directly off the layer. Beyond what `Layer` already provides, a
 quantizable layer must define:
 
 - Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
-  shape, recorded in `build()`), `units`, `bias` and `activation` (either
-  may be `None`). `EinsumProjectionGeometry` additionally relies on the
+  shape, recorded in `build()`), `bias` and `activation` (either may be
+  `None`). `EinsumProjectionGeometry` additionally relies on the
   `einsum_axes` record `EinsumDense` derives from its equation in `build()`.
 - Lookups: `_embeddings`, `input_dim` and `output_dim`. A reversible
   lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
@@ -86,12 +91,12 @@ knowledge of the layer.
 Two things this protocol deliberately does not offer. A layer cannot
 override one strategy's math for itself alone, because that surface lives
 on the strategy; a layer that contracts its kernel differently overrides
-the geometry hooks, and anything beyond that means replacing the strategy (by
-subclassing it, overriding the one handler, and registering it under a
-new mode name). A new geometry family, on the other hand, needs no dispatcher
-change at all: declare its `family` and implement the strategy's
+the geometry hooks, and anything beyond that is a change to the mode itself.
+A layer also cannot bring a new geometry family: each mode lists the
+families it handles in `geometry_families` and implements their
 `_<verb>_<family>` handlers, which `GeometryDispatchStrategy`
-(`keras.src.quantizers.modes.common`) lists.
+(`keras.src.quantizers.modes.common`) lists, so a new family is a change
+to the built-in modes.
 """
 
 import math
@@ -207,9 +212,9 @@ class QuantizationGeometry:
 
     A geometry names the *family* it belongs to. A strategy built on
     `GeometryDispatchStrategy` implements one `_<verb>_<family>` handler
-    per verb for each family it supports, so introducing a family is a
-    declaration plus those handlers, with no dispatch chain to edit
-    anywhere.
+    per verb for each family it lists in `geometry_families`, so
+    introducing a family is a declaration plus those handlers, with no
+    dispatch chain to edit anywhere.
     """
 
     # Dispatch key: each `GeometryDispatchStrategy` verb resolves to
@@ -238,7 +243,7 @@ class ProjectionGeometry(QuantizationGeometry):
     """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul."""
 
     family = "projection"
-    build_attributes = ("kernel_shape",)
+    build_attributes = ("kernel_shape", "bias", "activation")
 
     @property
     def weight_shape(self):
@@ -394,7 +399,7 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     strategies to it.
     """
 
-    build_attributes = ("kernel_shape", "einsum_axes")
+    build_attributes = ("kernel_shape", "einsum_axes", "bias", "activation")
 
     def contraction_view(self):
         axes = self.layer.einsum_axes
