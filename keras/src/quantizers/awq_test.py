@@ -13,13 +13,19 @@ from keras.src import ops
 from keras.src import saving
 from keras.src import testing
 from keras.src.quantizers import awq
-from keras.src.quantizers.awq import AWQCalibrator
 from keras.src.quantizers.awq import _fake_quantize_weights
 from keras.src.quantizers.awq import _get_weight_scale
 from keras.src.quantizers.awq import awq_quantize_matrix
 from keras.src.quantizers.awq import awq_search_best_clip
 from keras.src.quantizers.awq import awq_search_optimal_scales
 from keras.src.quantizers.awq_config import AWQConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
+from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
+from keras.src.quantizers.quantization_test_utils import (
+    tiny_transformer_classifier,
+)
+from keras.src.quantizers.quantization_test_utils import token_dataset
 
 # Shared RNG instance for reproducible tests
 RNG = np.random.default_rng(seed=42)
@@ -172,11 +178,12 @@ class AWQLayerTest(testing.TestCase):
         )
 
         layer.quantize(config=config)
-        calibrator = AWQCalibrator(layer, config)
 
         # Simulate activation capture
         calibration_data = RNG.standard_normal((64, 16)).astype("float32")
-        calibrator.observe(calibration_data)
+        calibrator = calibrate_layer(
+            layer, config, calibration_data, solve=False
+        )
 
         self.assertEqual(calibrator.num_samples, 64)
         # Activation magnitudes should be non-negative
@@ -198,15 +205,12 @@ class AWQLayerTest(testing.TestCase):
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=10
         )
         layer.quantize(config=config)
-        calibrator = AWQCalibrator(layer, config)
 
-        # First batch.
+        # A second batch with a different row count exercises the
+        # weighting.
         batch1 = RNG.standard_normal((10, 16)).astype("float32")
-        calibrator.observe(batch1)
-
-        # Second batch with a different row count to exercise the weighting.
         batch2 = ops.add(RNG.standard_normal((30, 16)).astype("float32"), 1.0)
-        calibrator.observe(batch2)
+        calibrator = calibrate_layer(layer, config, batch1, batch2, solve=False)
 
         # Running mean must equal the mean of |x| over all rows.
         combined = ops.concatenate([ops.abs(batch1), ops.abs(batch2)], axis=0)
@@ -228,7 +232,7 @@ class AWQLayerTest(testing.TestCase):
             layer = layers.Dense(32)
             layer.build(input_shape=(None, 16))
             layer.quantize(config=config)
-            return AWQCalibrator(layer, config)
+            return calibrate_layer(layer, config, solve=False)
 
         whole = calibrator()
         whole.observe(x)
@@ -262,10 +266,7 @@ class AWQLayerTest(testing.TestCase):
                 apply_clip=apply_clip,
                 **kwargs,
             )
-            layer.quantize("awq", config=config)
-            calibrator = AWQCalibrator(layer, config)
-            calibrator.observe(x)
-            calibrator.quantize()
+            calibrate_layer(layer, config, x)
             return ops.convert_to_numpy(layer.quantized_kernel)
 
         unclipped = codes("dense", apply_clip=False)
@@ -354,11 +355,7 @@ class AWQIntegrationTest(testing.TestCase):
         the predictions are preserved exactly.
         """
         vocab_size, seq_len, embed_dim = 32, 8, 4
-
-        inputs = layers.Input(shape=(seq_len,), dtype="int32")
-        embedding = layers.Embedding(vocab_size, embed_dim)
-        x = embedding(inputs)
-        block = models.Sequential(
+        model, structure = tiny_calibration_model(
             [
                 layers.Dense(embed_dim, activation="relu"),
                 # Gemma's `[heads, d_model, head_dim]` query projection,
@@ -370,30 +367,25 @@ class AWQIntegrationTest(testing.TestCase):
                 layers.EinsumDense(
                     "abc,cd->abd", output_shape=(seq_len, embed_dim)
                 ),
-            ]
+            ],
+            vocab_size=vocab_size,
+            sequence_length=seq_len,
+            embed_dim=embed_dim,
+            head_units=2,
         )
-        x = block(x)
-        x = layers.GlobalAveragePooling1D()(x)
-        head = layers.Dense(2)
-        outputs = head(x)
-        model = models.Model(inputs, outputs)
+        (embedding,) = structure["pre_block_layers"]
+        head = model.layers[-1]
 
         rng = np.random.default_rng(seed=21)
-        dataset = [
-            rng.integers(0, vocab_size, size=(1, seq_len)).astype("int32")
-            for _ in range(3)
-        ]
-        config = AWQConfig(
-            dataset=dataset,
+        config = calibration_config(
+            "awq",
+            dataset=token_dataset(3, seq_len, vocab_size, rng),
             tokenizer=lambda text: text,
             num_samples=2,
             sequence_length=seq_len,
             group_size=4,
             num_grid_points=5,
-            quantization_layer_structure={
-                "pre_block_layers": [embedding],
-                "sequential_blocks": [block],
-            },
+            quantization_layer_structure=structure,
         )
 
         # Layers outside the structure (embedding, pooling, head) are not
@@ -472,41 +464,6 @@ def _top1_match_rate(a_logits, b_logits):
     )
 
 
-def _get_sequence_classifier():
-    """Create a transformer-based sequence classifier for testing."""
-    embed_dim = 32
-    num_heads = 4
-    ff_dim = 32
-
-    class SimpleTransformerBlock(layers.Layer):
-        def __init__(self, embed_dim, num_heads, ff_dim, **kwargs):
-            super().__init__(**kwargs)
-            self.att = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=embed_dim // num_heads
-            )
-            self.ffn = models.Sequential(
-                [
-                    layers.Dense(ff_dim, activation="relu"),
-                    layers.Dense(embed_dim),
-                ]
-            )
-            self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-            self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-
-        def call(self, inputs):
-            attention_output = self.att(inputs, inputs)
-            out1 = self.layernorm1(inputs + attention_output)
-            ffn_output = self.ffn(out1)
-            return self.layernorm2(out1 + ffn_output)
-
-    inputs = layers.Input(shape=(SEQ_LEN,), dtype="int32")
-    x = layers.Embedding(VOCAB_SIZE, embed_dim)(inputs)
-    x = SimpleTransformerBlock(embed_dim, num_heads, ff_dim)(x)
-    x = layers.GlobalAveragePooling1D(data_format="channels_last")(x)
-    outputs = layers.Dense(NUM_CLASSES)(x)
-    return models.Model(inputs, outputs)
-
-
 def _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN):
     """Character-based tokenizer for testing."""
 
@@ -571,7 +528,7 @@ class AWQAccuracyTest(testing.TestCase):
         self.assertNotEmpty(calibration_set)
 
         # Build model and tokenizer
-        model = _get_sequence_classifier()
+        model = tiny_transformer_classifier(VOCAB_SIZE, SEQ_LEN, NUM_CLASSES)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Build eval batch from same distribution as calibration
@@ -672,11 +629,7 @@ class AWQAccuracyTest(testing.TestCase):
             group_size=group_size,
             num_grid_points=5,
         )
-        layer.quantize(config=config)
-
-        calibrator = AWQCalibrator(layer, config)
-        calibrator.observe(calibration_data)
-        calibrator.quantize()
+        calibrate_layer(layer, config, calibration_data)
 
         # Verify layer variables have correct shapes for grouped quantization
         if group_size > 0:
@@ -732,41 +685,31 @@ class AWQAccuracyTest(testing.TestCase):
         vocab = 48
         num_classes = 4
         embed_dim = 8
-
-        block = models.Sequential(
+        model, structure = tiny_calibration_model(
             [
                 layers.Dense(16, activation="relu"),
                 layers.Dense(embed_dim),
-            ]
+            ],
+            vocab_size=vocab,
+            sequence_length=seq_len,
+            embed_dim=embed_dim,
+            head_units=num_classes,
         )
-
-        inputs = layers.Input(shape=(seq_len,), dtype="int32")
-        embedding = layers.Embedding(vocab, embed_dim)
-        x = embedding(inputs)
-        x = block(x)
-        x = layers.GlobalAveragePooling1D()(x)
-        head = layers.Dense(num_classes)
-        outputs = head(x)
-        model = models.Model(inputs, outputs)
+        (embedding,) = structure["pre_block_layers"]
+        (block,) = structure["sequential_blocks"]
+        head = model.layers[-1]
 
         rng = np.random.default_rng(seed=7)
-        dataset = [
-            rng.integers(0, vocab, size=(1, seq_len), dtype=np.int32)
-            for _ in range(4)
-        ]
         tokenizer = _char_tokenizer(vocab_size=vocab, seq_len=seq_len)
-
-        config = AWQConfig(
-            dataset=dataset,
+        config = calibration_config(
+            "awq",
+            dataset=token_dataset(4, seq_len, vocab, rng),
             tokenizer=tokenizer,
             group_size=8,
             num_samples=4,
             sequence_length=seq_len,
             num_grid_points=5,
-            quantization_layer_structure={
-                "pre_block_layers": [embedding],
-                "sequential_blocks": [block],
-            },
+            quantization_layer_structure=structure,
         )
 
         model.quantize("awq", config=config)

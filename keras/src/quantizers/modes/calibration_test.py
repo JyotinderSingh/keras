@@ -12,21 +12,19 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
-from keras.src.quantizers import strategy_registry
-from keras.src.quantizers.awq_config import AWQConfig
-from keras.src.quantizers.gptq import GPTQCalibrator
-from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
+from keras.src.quantizers.quantization_test_utils import calibration_statistic
 from keras.src.testing.test_utils import named_product
 
 MODES = ["gptq", "awq"]
 
 
 def _config(mode, **kwargs):
-    if mode == "gptq":
-        return GPTQConfig(dataset=None, tokenizer=None, **kwargs)
-    kwargs.setdefault("num_grid_points", 5)
-    kwargs.setdefault("apply_clip", False)
-    return AWQConfig(dataset=None, tokenizer=None, **kwargs)
+    if mode == "awq":
+        kwargs.setdefault("num_grid_points", 5)
+        kwargs.setdefault("apply_clip", False)
+    return calibration_config(mode, **kwargs)
 
 
 def _calibrate(layer, mode, x, **kwargs):
@@ -34,21 +32,7 @@ def _calibrate(layer, mode, x, **kwargs):
 
     Returns the calibrator.
     """
-    config = _config(mode, **kwargs)
-    layer.quantize(mode, config=config)
-    calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
-        layer, config
-    )
-    calibrator.observe(x)
-    calibrator.quantize()
-    return calibrator
-
-
-def _statistic(calibrator):
-    """The statistic a calibrator accumulates from the layer's inputs."""
-    if isinstance(calibrator, GPTQCalibrator):
-        return calibrator.hessian
-    return calibrator.activation_magnitudes
+    return calibrate_layer(layer, _config(mode, **kwargs), x)
 
 
 def _einsum(equation, output_shape, input_shape, kernel=None):
@@ -116,9 +100,11 @@ class CalibrationEinsumLayoutTest(testing.TestCase):
 
         # One statistic over the model width, shared by every head or
         # expert, and the same weights up to the transpose.
-        statistic = _statistic(calibrator)
+        statistic = calibration_statistic(calibrator)
         self.assertEqual(ops.shape(statistic)[0], 8)
-        self.assertAllClose(statistic, _statistic(reference_calibrator))
+        self.assertAllClose(
+            statistic, calibration_statistic(reference_calibrator)
+        )
         self.assertAllClose(
             _dequantized(layer),
             np.transpose(_dequantized(reference), (1, 0, 2)),
@@ -166,7 +152,8 @@ class CalibrationEinsumLayoutTest(testing.TestCase):
         dense_calibrator = _calibrate(dense, mode, x_dense, group_size=4)
 
         self.assertAllClose(
-            _statistic(calibrator), _statistic(dense_calibrator)
+            calibration_statistic(calibrator),
+            calibration_statistic(dense_calibrator),
         )
         self.assertAllClose(
             _dequantized(layer).reshape(8, 8), _dequantized(dense)
@@ -205,7 +192,7 @@ class CalibrationEinsumLayoutTest(testing.TestCase):
         kernel = ops.convert_to_numpy(layer.kernel)
         x = rng.standard_normal((2, 5, experts, inner)).astype("float32")
         calibrator = _calibrate(layer, mode, x, **kwargs)
-        statistic = ops.convert_to_numpy(_statistic(calibrator))
+        statistic = ops.convert_to_numpy(calibration_statistic(calibrator))
         self.assertEqual(statistic.shape[:2], (experts, inner))
 
         dequantized = _dequantized(layer)
@@ -218,7 +205,9 @@ class CalibrationEinsumLayoutTest(testing.TestCase):
             dense_calibrator = _calibrate(
                 dense, mode, x_expert.reshape(-1, inner), **kwargs
             )
-            self.assertAllClose(statistic[expert], _statistic(dense_calibrator))
+            self.assertAllClose(
+                statistic[expert], calibration_statistic(dense_calibrator)
+            )
             self.assertAllClose(dequantized[expert], _dequantized(dense))
             self.assertAllClose(outputs[:, :, expert, :], dense(x_expert))
             # The experts stack along the rows, each with its own groups.
@@ -591,11 +580,7 @@ class CalibrationLoRATest(testing.TestCase):
 
         twin.quantize(mode, config=config)
         for target in (layer, twin):
-            calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
-                target, config
-            )
-            calibrator.observe(x)
-            calibrator.quantize()
+            calibrate_layer(target, config, x)
         self.assertFalse(hasattr(layer, "_kernel"))
         self.assertAllEqual(layer.quantized_kernel, twin.quantized_kernel)
         twin.enable_lora(2)

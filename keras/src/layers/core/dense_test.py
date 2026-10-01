@@ -18,11 +18,11 @@ from keras.src import random
 from keras.src import saving
 from keras.src import testing
 from keras.src.backend.common import keras_tensor
-from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.testing import test_utils
 
@@ -1014,11 +1014,9 @@ class DenseTest(testing.TestCase):
         layer.build((None, 8))
         layer.quantize(mode, config=config)
         if calibrated:
-            calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
-                layer, config
+            calibrate_layer(
+                layer, config, np.random.random((16, 8)).astype("float32")
             )
-            calibrator.observe(np.random.random((16, 8)).astype("float32"))
-            calibrator.quantize()
         layer.enable_lora(2)
         self.assertTrue(layer.lora_enabled)
         # bias + the two LoRA factors.

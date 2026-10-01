@@ -17,11 +17,11 @@ from keras.src import random
 from keras.src import saving
 from keras.src import testing
 from keras.src.layers.core.einsum_dense import _analyze_einsum_string
-from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.saving.saving_api import load_model
 from keras.src.testing import test_utils
@@ -2212,12 +2212,9 @@ class EinsumDenseCalibrationLoRATest(testing.TestCase):
             "btd,ndh->btnh", output_shape=(None, 2, 3), bias_axes="nh"
         )
         layer.build((None, 5, 8))
-        layer.quantize(mode, config=config)
-        calibrator = strategy_registry.get_strategy(mode).calibrator_cls(
-            layer, config
+        calibrate_layer(
+            layer, config, np.random.random((4, 5, 8)).astype("float32")
         )
-        calibrator.observe(np.random.random((4, 5, 8)).astype("float32"))
-        calibrator.quantize()
         layer.enable_lora(2)
         self.assertTrue(layer.lora_enabled)
         self.assertFalse(hasattr(layer, "_kernel"))

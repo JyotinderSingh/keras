@@ -11,14 +11,17 @@ from keras.src import models
 from keras.src import ops
 from keras.src import testing
 from keras.src.quantizers import strategy_registry
-from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.calibration_run import _execution_stages
 from keras.src.quantizers.calibration_run import find_layers_in_block
 from keras.src.quantizers.calibration_run import get_dataloader
 from keras.src.quantizers.calibration_run import stream_inputs
-from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
+from keras.src.quantizers.quantization_test_utils import calibration_statistic
+from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
+from keras.src.quantizers.quantization_test_utils import token_dataset
 from keras.src.utils.rng_utils import set_random_seed
 
 VOCAB_SIZE = 100
@@ -247,19 +250,20 @@ class TestCalibrationCore(testing.TestCase):
         rng = np.random.default_rng(0)
         samples = rng.standard_normal((num_samples, seq_len, d_model))
         samples = ops.convert_to_tensor(samples.astype("float32"))
-        calibrator_cls = strategy_registry.get_strategy(mode).calibrator_cls
 
         def accumulate(batch_size):
             layers_map = find_layers_in_block(block)
             calibrators = {
-                name: calibrator_cls(layer, _config(mode))
+                name: calibrate_layer(
+                    layer, calibration_config(mode), solve=False
+                )
                 for name, layer in layers_map.items()
             }
             with stream_inputs(layers_map, calibrators):
                 for start in range(0, num_samples, batch_size):
                     block(samples[start : start + batch_size])
             (calibrator,) = calibrators.values()
-            return _statistic(calibrator), calibrator.num_samples
+            return calibration_statistic(calibrator), calibrator.num_samples
 
         statistic, rows = accumulate(batch_size=1)
         batched_statistic, batched_rows = accumulate(batch_size=4)
@@ -358,52 +362,33 @@ class TestDataloaderReproducibility(testing.TestCase):
         self.assertAllClose(out[0, 0], np.arange(88, 96))
 
 
-def _config(mode, **kwargs):
-    if mode == "gptq":
-        return GPTQConfig(dataset=None, tokenizer=None, **kwargs)
-    return AWQConfig(dataset=None, tokenizer=None, **kwargs)
-
-
-def _statistic(calibrator):
-    """The statistic a calibrator accumulates from the layer's inputs."""
-    if isinstance(calibrator, GPTQCalibrator):
-        return calibrator.hessian
-    return calibrator.activation_magnitudes
-
-
 def _tiny_model(mode, num_samples=4, dtype=None, **kwargs):
     """Embedding -> [Dense(16, relu), Dense(8)] block -> pooled head."""
     set_random_seed(123)
     seq_len, vocab_size, embed_dim = 16, 48, 8
-    block = models.Sequential(
+    model, structure = tiny_calibration_model(
         [
             layers.Dense(16, activation="relu", dtype=dtype),
             layers.Dense(embed_dim, dtype=dtype),
-        ]
+        ],
+        vocab_size=vocab_size,
+        sequence_length=seq_len,
+        embed_dim=embed_dim,
+        dtype=dtype,
     )
-    inputs = layers.Input((seq_len,), dtype="int32")
-    embedding = layers.Embedding(vocab_size, embed_dim, dtype=dtype)
-    x = layers.GlobalAveragePooling1D(dtype=dtype)(block(embedding(inputs)))
-    model = models.Model(inputs, layers.Dense(4, dtype=dtype)(x))
     if mode == "awq":
         kwargs["num_grid_points"] = 5
-    config = _config(
+    rng = np.random.default_rng(7)
+    config = calibration_config(
         mode,
+        dataset=token_dataset(num_samples, seq_len, vocab_size, rng),
+        tokenizer=lambda text: text,
         num_samples=num_samples,
         sequence_length=seq_len,
         group_size=8,
+        quantization_layer_structure=structure,
         **kwargs,
     )
-    rng = np.random.default_rng(7)
-    config.dataset = [
-        rng.integers(0, vocab_size, (1, seq_len), dtype=np.int32)
-        for _ in range(num_samples)
-    ]
-    config.tokenizer = lambda text: text
-    config.quantization_layer_structure = {
-        "pre_block_layers": [embedding],
-        "sequential_blocks": [block],
-    }
     return model, config
 
 
@@ -435,7 +420,9 @@ class CalibrationRunTest(testing.TestCase):
     def test_requires_sequential_blocks(self):
         strategy = strategy_registry.get_strategy("gptq")
         with self.assertRaisesRegex(ValueError, "No sequential blocks"):
-            CalibrationRun(strategy, _config("gptq"), {"pre_block_layers": []})
+            CalibrationRun(
+                strategy, calibration_config("gptq"), {"pre_block_layers": []}
+            )
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_calibrate_requires_a_dataset(self, mode):
@@ -443,18 +430,19 @@ class CalibrationRunTest(testing.TestCase):
         with self.assertRaisesRegex(
             ValueError, f"{mode.upper()} quantization requires a dataset"
         ):
-            strategy.calibrate(_config(mode), {"sequential_blocks": [1]})
+            strategy.calibrate(
+                calibration_config(mode), {"sequential_blocks": [1]}
+            )
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_calibrator_refuses_unsupported_layers(self, mode):
-        calibrator_cls = strategy_registry.get_strategy(mode).calibrator_cls
         ternary = layers.TernaryDense(4)
         ternary.build((None, 3))
         for layer in (layers.Layer(), ternary):
             with self.assertRaisesRegex(
                 TypeError, f"Unsupported layer type for {mode.upper()}"
             ):
-                calibrator_cls(layer, _config(mode))
+                calibrate_layer(layer, calibration_config(mode), solve=False)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_calibrates_every_block_in_order(self, mode):
@@ -483,7 +471,7 @@ class CalibrationRunTest(testing.TestCase):
         )
         if mode == "awq":
             kwargs["num_grid_points"] = 3
-        config = _config(mode, **kwargs)
+        config = calibration_config(mode, **kwargs)
         config.quantization_layer_structure = structure
         rng = np.random.default_rng(0)
         dataset = [
@@ -516,7 +504,7 @@ class CalibrationRunTest(testing.TestCase):
             "pre_block_layers": [embedding],
             "sequential_blocks": blocks,
         }
-        config = _config(
+        config = calibration_config(
             mode, num_samples=2, sequence_length=seq_len, group_size=-1
         )
         if mode == "awq":
@@ -545,7 +533,7 @@ class CalibrationRunTest(testing.TestCase):
             "pre_block_layers": [embedding],
             "sequential_blocks": [empty, block],
         }
-        config = _config(
+        config = calibration_config(
             mode, num_samples=2, sequence_length=seq_len, group_size=-1
         )
         if mode == "awq":
@@ -582,7 +570,7 @@ class CalibrationRunModelTest(testing.TestCase):
         with _spy_on_observe(mode) as observe:
             model.quantize(mode, config=config)
         calibrator = observe.call_args.args[0]
-        statistic = ops.convert_to_numpy(_statistic(calibrator))
+        statistic = ops.convert_to_numpy(calibration_statistic(calibrator))
         if mode == "gptq":
             # Real activations are correlated across input features.
             statistic = statistic - np.diag(np.diag(statistic))
@@ -630,7 +618,7 @@ class CalibrationRunModelTest(testing.TestCase):
         )
         model = models.Model(inputs, second(first(embedding(inputs))))
         kwargs = {"num_grid_points": 3} if mode == "awq" else {}
-        config = _config(
+        config = calibration_config(
             mode,
             num_samples=6,
             calibration_batch_size=4,
