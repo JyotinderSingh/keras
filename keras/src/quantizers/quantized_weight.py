@@ -181,6 +181,29 @@ class TernaryTrits(_AxisPack):
         return packed
 
 
+def lay_out_scale(scale, source, target):
+    """Lays a scale with the axes `source` out against the axes `target`.
+
+    `source` and `target` give one label per axis of the scale and of the
+    tensor it broadcasts against. An axis of `source` whose label is not
+    in `target` has size one and is dropped (`None` marks such an axis).
+    The other axes take the order of `target`, and an axis of `target`
+    that is not in `source` becomes a broadcast axis of size one.
+    """
+    source, target = list(source), list(target)
+    kept = [label for label in source if label in target]
+    dropped = [i for i, label in enumerate(source) if label not in target]
+    if dropped:
+        scale = ops.squeeze(scale, axis=dropped)
+    order = [kept.index(label) for label in target if label in kept]
+    if order != sorted(order):
+        scale = ops.transpose(scale, order)
+    added = [i for i, label in enumerate(target) if label not in source]
+    if added:
+        scale = ops.expand_dims(scale, axis=added)
+    return scale
+
+
 class QuantizedWeight:
     """A read-only view over the stored variables of one quantized weight.
 
@@ -192,9 +215,13 @@ class QuantizedWeight:
     The codes are stored as the weight transposed and reshaped:
     `layout.unpack(codes)` is `reshape(transpose(W, permutation),
     layout.unpacked_shape(codes.shape))`, where `W` is the weight in
-    `shape` (an int4, GPTQ or AWQ einsum kernel is stored as 2-D). `axis`
-    and the stored scale refer to these stored coordinates; `unpack()` and
-    `dequantize()` return `shape`.
+    `shape` (an int4, GPTQ or AWQ einsum kernel is stored as 2-D). `axis`,
+    `scale_axes` and the stored scale refer to these stored coordinates;
+    `unpack()` and `dequantize()` return `shape`.
+
+    The scheme sets how the stored scale lines up with the codes. A
+    grouped weight gives the one `axis` its groups run along. Any other
+    weight gives `scale_axes`.
 
     Args:
         codes: The stored codes, packed as `layout` describes.
@@ -202,18 +229,16 @@ class QuantizedWeight:
         layout: The `PackLayout` of `codes`.
         scheme: The `WeightScheme` of the weight.
         shape: Shape of the weight the codes stand for.
-        axis: Axis of the unpacked codes that a scale entry is shared
-            along. A per-channel scale has the codes' shape without this
-            axis. A grouped scale and zero point have one entry per group
-            along it, and `g_idx` maps each position on it to its group.
-            When the stored rows stack independent problems (the batch
-            axis of a GPTQ or AWQ einsum kernel), the groups restart at
-            each problem and are numbered across the problems, so the
-            scale holds `batch * n_groups` rows and each problem's last
-            group may be shorter; `g_idx` is authoritative. An int4 einsum
-            kernel never stacks problems: its batch axes are in the
-            columns. `None` when the scale broadcasts against the codes as
-            it is (a per-tensor scalar) or `align_scale` lays it out.
+        axis: For a grouped weight only: the axis of the unpacked codes
+            its groups run along. The scale and zero point have one entry
+            per group along it, and `g_idx` maps each position on it to
+            its group. When the stored rows stack independent problems
+            (the batch axis of a GPTQ or AWQ einsum kernel), the groups
+            restart at each problem and are numbered across the problems,
+            so the scale holds `batch * n_groups` rows and each problem's
+            last group may be shorter; `g_idx` is authoritative. An int4
+            einsum kernel never stacks problems: its batch axes are in the
+            columns.
         permutation: Axis order of `shape` in which the codes are stored,
             or `None` for the weight's own order.
         zero_point: The stored zero point, given exactly when
@@ -224,11 +249,11 @@ class QuantizedWeight:
             `axis`, divided out of the weight (AWQ's `awq_scales`). The
             codes, scale and zero point describe the weight multiplied by
             them.
-        align_scale: Optional callable that lays the stored scale out
-            against the codes, for a scale stored in another layout (an
-            int8 einsum kernel's scale is stored for the outputs). Needs
-            `axis=None` and an ungrouped scheme; `scale` stays the stored
-            variable.
+        scale_axes: For a weight that is not grouped only: for each axis
+            of the stored scale, the axis of the unpacked codes it runs
+            along, or `None` for an axis of size one. `()` is a per-tensor
+            scalar. A per-channel scale of a matmul kernel is `(1,)`; an
+            int8 einsum kernel's scale is stored in the outputs' layout.
     """
 
     def __init__(
@@ -244,7 +269,7 @@ class QuantizedWeight:
         zero_point=None,
         g_idx=None,
         input_scales=None,
-        align_scale=None,
+        scale_axes=None,
     ):
         if scheme.has_zero_point != (zero_point is not None):
             raise ValueError(
@@ -258,18 +283,18 @@ class QuantizedWeight:
                 f"Received: scheme={scheme!r}, "
                 f"g_idx={'given' if g_idx is not None else None}"
             )
-        if g_idx is not None and not isinstance(axis, int):
+        if g_idx is not None:
+            if not isinstance(axis, int) or scale_axes is not None:
+                raise ValueError(
+                    "A grouped weight needs the one `axis` its groups run "
+                    "along, and no `scale_axes`. Received: "
+                    f"axis={axis}, scale_axes={scale_axes}"
+                )
+        elif axis is not None or scale_axes is None:
             raise ValueError(
-                "A grouped weight needs the one `axis` its groups run along. "
-                f"Received: axis={axis}"
-            )
-        if align_scale is not None and (
-            axis is not None or scheme.group_size is not None
-        ):
-            raise ValueError(
-                "`align_scale` lays the stored scale out itself, so it "
-                "needs `axis=None` and an ungrouped scheme. Received: "
-                f"axis={axis}, scheme={scheme!r}"
+                "A weight that is not grouped lines its scale up by "
+                "`scale_axes` (`()` for a scalar), and takes no `axis`. "
+                f"Received: axis={axis}, scale_axes={scale_axes}"
             )
         self.codes = codes
         self.scale = scale
@@ -285,7 +310,7 @@ class QuantizedWeight:
         self.zero_point = zero_point
         self.g_idx = g_idx
         self.input_scales = input_scales
-        self.align_scale = align_scale
+        self.scale_axes = None if scale_axes is None else tuple(scale_axes)
 
     def unpack(self):
         """Returns the integer codes in `shape`."""
@@ -356,12 +381,10 @@ class QuantizedWeight:
         return self.layout.pack(codes)
 
     def _align(self, tensor):
-        """Lays a per-channel scale or zero point out against the codes."""
-        if self.align_scale is not None:
-            return self.align_scale(tensor)
-        if self.axis is None:
-            return tensor
-        return ops.expand_dims(tensor, self.axis)
+        """Lays a scale or zero point out against the unpacked codes."""
+        return lay_out_scale(
+            tensor, self.scale_axes, range(len(self.codes.shape))
+        )
 
     def _along_axis(self, tensor, like):
         """Reshapes a 1-D `tensor` to broadcast along `axis` of `like`."""
@@ -390,6 +413,7 @@ class QuantizedWeight:
     def __repr__(self):
         return (
             f"{type(self).__name__}(shape={self.shape}, axis={self.axis}, "
+            f"scale_axes={self.scale_axes}, "
             f"permutation={self.permutation}, layout={self.layout!r}, "
             f"scheme={self.scheme!r})"
         )

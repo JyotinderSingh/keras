@@ -19,6 +19,7 @@ from keras.src.quantizers.quantized_weight import NoPack
 from keras.src.quantizers.quantized_weight import QuantizedWeight
 from keras.src.quantizers.quantized_weight import TernaryTrits
 from keras.src.quantizers.quantized_weight import WeightScheme
+from keras.src.quantizers.quantized_weight import lay_out_scale
 
 DIVISOR = WeightScheme(code_range=(-127, 127), scale_form="divisor")
 MULTIPLIER = WeightScheme(code_range=(-127, 127), scale_form="multiplier")
@@ -121,7 +122,7 @@ class QuantizedWeightTest(testing.TestCase):
                 layout=NoPack(),
                 scheme=DIVISOR,
                 shape=(4, 2),
-                axis=0,
+                scale_axes=(1,),
                 zero_point=np.zeros((2,), "int8"),
             )
         with self.assertRaisesRegex(ValueError, "g_idx"):
@@ -134,21 +135,25 @@ class QuantizedWeightTest(testing.TestCase):
                 axis=0,
                 zero_point=np.zeros((2,), "int8"),
             )
-        with self.assertRaisesRegex(ValueError, "align_scale"):
-            QuantizedWeight(
-                codes=codes,
-                scale=scale,
-                layout=NoPack(),
-                scheme=DIVISOR,
-                shape=(4, 2),
-                axis=0,
-                align_scale=ops.transpose,
-            )
+
+    def test_ungrouped_view_lays_out_its_scale_by_scale_axes(self):
+        # One encoding per scheme kind: `axis` belongs to grouped weights.
+        for axis, scale_axes in ((0, None), (None, None), (0, (1,))):
+            with self.assertRaisesRegex(ValueError, "scale_axes"):
+                QuantizedWeight(
+                    codes=np.zeros((4, 2), "int8"),
+                    scale=np.ones((2,), "float32"),
+                    layout=NoPack(),
+                    scheme=DIVISOR,
+                    shape=(4, 2),
+                    axis=axis,
+                    scale_axes=scale_axes,
+                )
 
     def test_grouped_view_needs_one_integer_axis(self):
         # `g_idx` maps the positions along one axis to their groups.
         view = _grouped_view()
-        for axis in (None, (0,)):
+        for axis, scale_axes in ((None, None), ((0,), None), (0, (1,))):
             with self.assertRaisesRegex(ValueError, "axis"):
                 QuantizedWeight(
                     codes=view.codes,
@@ -159,22 +164,23 @@ class QuantizedWeightTest(testing.TestCase):
                     axis=axis,
                     zero_point=view.zero_point,
                     g_idx=view.g_idx,
+                    scale_axes=scale_axes,
                 )
 
     @parameterized.named_parameters(
-        ("shared_along_rows", 0, [[1.0, 1.0], [3.0, 2.0]]),
-        ("shared_along_columns", -1, [[1.0, 2.0], [1.5, 2.0]]),
+        ("along_columns", (1,), [[1.0, 1.0], [3.0, 2.0]]),
+        ("along_rows", (0,), [[1.0, 2.0], [1.5, 2.0]]),
     )
-    def test_divisor_scale(self, axis, expected):
-        # Scale `[2, 4]`: along rows it divides each column, along columns
-        # each row.
+    def test_divisor_scale(self, scale_axes, expected):
+        # Scale `[2, 4]`: along the columns it divides each column, along
+        # the rows each row.
         view = QuantizedWeight(
             codes=np.array([[2, 4], [6, 8]], "int8"),
             scale=np.array([2.0, 4.0], "float32"),
             layout=NoPack(),
             scheme=DIVISOR,
             shape=(2, 2),
-            axis=axis,
+            scale_axes=scale_axes,
         )
         self.assertAllClose(view.dequantize("float32"), expected)
 
@@ -189,18 +195,19 @@ class QuantizedWeightTest(testing.TestCase):
             layout=NoPack(),
             scheme=WeightScheme(code_range=(-1, 1), scale_form=scale_form),
             shape=(1, 3),
+            scale_axes=(),
         )
         self.assertAllClose(view.dequantize("float32"), expected)
 
-    def test_align_scale_lays_out_a_stored_scale(self):
-        # Stored as a column; the layer's rule turns it into a row.
+    def test_scale_axes_lay_out_a_stored_scale(self):
+        # Stored as a column: its first axis runs along the codes' columns.
         view = QuantizedWeight(
             codes=np.array([[2, 4, 6], [8, 10, 12]], "int8"),
             scale=np.array([[2.0], [4.0], [6.0]], "float32"),
             layout=NoPack(),
             scheme=DIVISOR,
             shape=(2, 3),
-            align_scale=ops.transpose,
+            scale_axes=(1, None),
         )
         self.assertAllClose(
             view.dequantize("float32"), [[1.0, 1.0, 1.0], [4.0, 2.5, 2.0]]
@@ -227,7 +234,7 @@ class QuantizedWeightTest(testing.TestCase):
             "divisor",
             "scalar",
             "scalar_multiplier",
-            "align_scale",
+            "scale_axes",
             "grouped",
             "input_scales",
         ),
@@ -247,13 +254,14 @@ class QuantizedWeightTest(testing.TestCase):
                     "divisor": np.ones((2,), "float32"),
                     "scalar": np.float32(2.0),
                     "scalar_multiplier": np.float32(2.0),
-                    "align_scale": np.ones((2, 1), "float32"),
+                    "scale_axes": np.ones((2, 1), "float32"),
                 }[case],
                 layout=NoPack(),
                 scheme=MULTIPLIER if case == "scalar_multiplier" else DIVISOR,
                 shape=(4, 2),
-                axis=0 if case == "divisor" else None,
-                align_scale=ops.transpose if case == "align_scale" else None,
+                scale_axes={"divisor": (1,), "scale_axes": (1, None)}.get(
+                    case, ()
+                ),
             )
         self.assertDType(view.dequantize(dtype), dtype)
 
@@ -264,7 +272,8 @@ class QuantizedWeightTest(testing.TestCase):
             layout=NoPack(),
             scheme=DIVISOR,
             shape=(2, 2, 3),
-            axis=0,
+            # The stored coordinates: the codes' columns.
+            scale_axes=(1,),
         )
         self.assertEqual(tuple(view.unpack().shape), (2, 2, 3))
         self.assertEqual(tuple(view.dequantize("float32").shape), (2, 2, 3))
@@ -281,6 +290,7 @@ class QuantizedWeightTest(testing.TestCase):
             scheme=DIVISOR,
             shape=(2, 3, 4),
             permutation=(1, 0, 2),
+            scale_axes=(),
         )
         self.assertAllEqual(view.unpack(), weight)
         self.assertAllClose(view.dequantize("float32"), weight)
@@ -324,10 +334,39 @@ class QuantizedWeightTest(testing.TestCase):
             layout=NoPack(),
             scheme=DIVISOR,
             shape=(4, 2),
-            axis=0,
+            scale_axes=(1,),
         )
         with self.assertRaisesRegex(NotImplementedError, "grouped"):
             view.code_image(np.zeros((4, 2), "float32"))
+
+
+class LayOutScaleTest(testing.TestCase):
+    @parameterized.named_parameters(
+        # A scale reduced over the inputs' `d` lines up with `btnh`.
+        (
+            "drop_and_add",
+            (2, 5, 1),
+            "btd",
+            "btnh",
+            lambda s: s.reshape(2, 5, 1, 1),
+        ),
+        # Drop the axis of size one, swap the others, add a leading axis.
+        (
+            "transpose",
+            (4, 1, 3),
+            (2, None, 1),
+            range(3),
+            lambda s: s[:, 0, :].T[None],
+        ),
+        ("scalar", (), (), range(2), lambda s: s.reshape(1, 1)),
+        ("unchanged", (3,), (1,), (1,), lambda s: s),
+    )
+    def test_layout(self, shape, source, target, expected):
+        scale = np.arange(1, 1 + np.prod(shape), dtype="float32")
+        scale = scale.reshape(shape)
+        laid_out = lay_out_scale(scale, source, target)
+        self.assertEqual(tuple(laid_out.shape), expected(scale).shape)
+        self.assertAllEqual(laid_out, expected(scale))
 
 
 def _quantized(layer, build_shape, mode, config=None):
@@ -401,21 +440,57 @@ class LayerViewTest(testing.TestCase):
         else:
             self.assertAllClose(zero, layer.kernel_zero)
 
-    def test_int8_projection_scale_layout(self):
-        # A matmul kernel's scale is shared along its input axis; an einsum
-        # kernel's is stored for the outputs and the geometry lays it out.
-        layer, _ = _quantized(layers.Dense(5), (None, 7), "int8")
+    @parameterized.named_parameters(
+        # A matmul kernel's scale runs along its columns.
+        ("dense_int8", "dense", "int8", -1, (1,), None),
+        # An einsum kernel's is stored in the outputs' layout.
+        ("einsum_int8", "einsum", "int8", -1, (None, None, 1, 2), None),
+        # int4 stores the `(rows, columns)` matrix of the kernel.
+        ("einsum_int4_per_channel", "einsum", "int4", -1, (1,), None),
+        ("einsum_int4_grouped", "einsum", "int4", 2, None, 0),
+        # A table's scale runs per row, or per row and group of columns.
+        ("embedding_int8", "embedding", "int8", -1, (0,), None),
+        ("embedding_int4_per_channel", "embedding", "int4", -1, (0,), None),
+        ("embedding_int4_grouped", "embedding", "int4", 2, None, -1),
+    )
+    def test_scale_layout(self, kind, mode, block_size, scale_axes, axis):
+        # A grouped weight gives its group axis, any other its
+        # `scale_axes`.
+        if kind == "dense":
+            layer, build_shape = layers.Dense(5), (None, 7)
+        elif kind == "einsum":
+            layer = layers.EinsumDense(
+                "btd,dnh->btnh", output_shape=(None, 2, 3), bias_axes=None
+            )
+            build_shape = (None, 4, 6)
+        else:
+            layer, build_shape = layers.Embedding(9, 4), None
+        config = None
+        if mode == "int4":
+            config = Int4QuantizationConfig(block_size=block_size)
+        layer, _ = _quantized(layer, build_shape, mode, config)
         view = layer._quantized_weight()
-        self.assertEqual(view.axis, 0)
-        self.assertIsNone(view.align_scale)
+        self.assertEqual(view.scale_axes, scale_axes)
+        self.assertEqual(view.axis, axis)
 
-        layer = layers.EinsumDense(
-            "btd,dnh->btnh", output_shape=(None, 2, 3), bias_axes=None
-        )
-        layer, _ = _quantized(layer, (None, 4, 6), "int8")
-        view = layer._quantized_weight()
-        self.assertIsNone(view.axis)
-        self.assertIsNotNone(view.align_scale)
+    @parameterized.named_parameters(
+        ("int8", "int8", None, (1,), None),
+        ("int4_per_channel", "int4", -1, (1,), None),
+        ("int4_grouped", "int4", 2, None, 0),
+    )
+    def test_reverse_scale_layout(self, mode, block_size, scale_axes, axis):
+        # The reverse table is `(output_dim, input_dim)`: a per-channel
+        # scale runs along its columns, a grouped one in groups of rows.
+        config = None
+        if mode == "int4":
+            config = Int4QuantizationConfig(block_size=block_size)
+        for tie_weights in (True, False):
+            layer = layers.ReversibleEmbedding(9, 4, tie_weights=tie_weights)
+            layer, _ = _quantized(layer, None, mode, config)
+            strategy = strategy_registry.get_strategy(mode)
+            reverse = strategy._reverse_quantized_weight_lookup(layer, None)
+            self.assertEqual(reverse.scale_axes, scale_axes)
+            self.assertEqual(reverse.axis, axis)
 
     @parameterized.named_parameters(
         ("int8", "int8", None),

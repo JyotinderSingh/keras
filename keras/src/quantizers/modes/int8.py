@@ -7,6 +7,7 @@ from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantized_weight import NoPack
 from keras.src.quantizers.quantized_weight import QuantizedWeight
 from keras.src.quantizers.quantized_weight import WeightScheme
+from keras.src.quantizers.quantized_weight import lay_out_scale
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 
 # Symmetric int8 codes with a per-channel divisor scale.
@@ -17,11 +18,12 @@ class Int8Strategy(LookupHandlers, GeometryDispatchStrategy):
     """W8A8 dynamic quantization (int8 weights times int8 activations).
 
     One projection implementation serves every kernel contracted against
-    its inputs: the geometry says how to contract, which axes the
-    quantizers reduce over, and how a scale lines up with the kernel and
-    with the outputs. An embeddings table goes through `LookupHandlers`,
-    which this mode gives its scheme, its encoding and the default
-    activation quantizer of the reverse projection.
+    its inputs: the geometry says how to contract, which kernel axes the
+    weight quantizer reduces over (`kernel_axes.contracted`), and the
+    layout of the stored scale (`kernel_scale_axes`). An embeddings table
+    goes through `LookupHandlers`, which this mode gives its scheme, its
+    encoding and the default activation quantizer of the reverse
+    projection.
     """
 
     name = "int8"
@@ -45,7 +47,10 @@ class Int8Strategy(LookupHandlers, GeometryDispatchStrategy):
         )
         layer.kernel_scale = layer.add_weight(
             name="kernel_scale",
-            shape=geometry.kernel_scale_shape(kernel_shape),
+            shape=[
+                1 if axis is None else kernel_shape[axis]
+                for axis in geometry.kernel_scale_axes
+            ],
             initializer="ones",
             trainable=False,
         )
@@ -104,31 +109,28 @@ class Int8Strategy(LookupHandlers, GeometryDispatchStrategy):
 
     def _encode_projection(self, layer, geometry, weight, config):
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
-            config, AbsMaxQuantizer(axis=geometry.kernel_reduced_axes)
+            config, AbsMaxQuantizer(axis=geometry.kernel_axes.contracted)
         )
         kernel_value, kernel_scale = weight_quantizer(weight, to_numpy=True)
         return (
             kernel_value,
-            geometry.kernel_scale_for_storage(kernel_scale),
+            lay_out_scale(
+                kernel_scale,
+                range(len(weight.shape)),
+                geometry.kernel_scale_axes,
+            ),
             None,
         )
 
     def _projection_view(self, geometry, codes, scale):
         """The view over the layer's variables or over traced tensors."""
-        # A matmul kernel's scale is shared along its input axis. An einsum
-        # kernel's is stored in the outputs' layout, and the geometry lays
-        # it back out against the kernel.
-        axis = geometry.kernel_scale_axis
         return QuantizedWeight(
             codes=codes,
             scale=scale,
             layout=NoPack(),
             scheme=_INT8_SCHEME,
             shape=geometry.weight_shape,
-            axis=axis,
-            align_scale=(
-                None if axis is not None else geometry.kernel_scale_for_dequant
-            ),
+            scale_axes=geometry.kernel_scale_axes,
         )
 
     def _quantized_weight_projection(self, layer, geometry):

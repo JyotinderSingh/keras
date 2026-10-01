@@ -2,8 +2,6 @@ import dataclasses
 import re
 import string
 
-import numpy as np
-
 from keras.src import activations
 from keras.src import constraints
 from keras.src import initializers
@@ -14,6 +12,7 @@ from keras.src.initializers.random_initializers import VarianceScaling
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers.geometry import EinsumProjectionGeometry
+from keras.src.quantizers.geometry import KernelAxes
 from keras.src.saving import serialization_lib
 
 
@@ -181,8 +180,8 @@ class EinsumDense(Layer):
         # The float kernel's N-D shape, whatever a quantization mode stores,
         # and the equation's axis bookkeeping the quantization modes read.
         self.kernel_shape = tuple(kernel_shape)
-        self.einsum_axes = _analyze_quantization_info(
-            self.equation, input_shape
+        self.einsum_axes = EinsumAxes.from_equation(
+            self.equation, len(input_shape)
         )
 
         kernel_initializer = self.kernel_initializer
@@ -425,93 +424,6 @@ class EinsumDense(Layer):
     def _quantization_geometry(self):
         return EinsumProjectionGeometry(self)
 
-    def _get_kernel_scale_shape(self, kernel_shape):
-        """Get the shape of the kernel scale tensor.
-
-        The kernel scale tensor is used to scale the kernel tensor.
-        The shape of the kernel scale tensor is the same as the shape of the
-        kernel tensor, but with the reduced axes set to 1, and the transpose
-        axes set to the original axes.
-
-        Args:
-            kernel_shape: The shape of the kernel tensor.
-
-        Returns:
-            The shape of the kernel scale tensor.
-        """
-        axes = self.einsum_axes
-        kernel_scale_shape = np.array(kernel_shape)
-        kernel_scale_shape[list(axes.kernel_reduced_axes)] = 1
-
-        kernel_scale_shape = kernel_scale_shape[
-            list(axes.kernel_transpose_axes)
-        ]
-        kernel_scale_shape = kernel_scale_shape.tolist()
-        for a in sorted(axes.kernel_expand_axes):
-            kernel_scale_shape.insert(a, 1)
-        for a in sorted(axes.kernel_squeeze_axes, reverse=True):
-            kernel_scale_shape.pop(a)
-        return kernel_scale_shape
-
-    def _adjust_scale_for_dequant(self, scale):
-        """Adjusts scale tensor layout for dequantization.
-
-        Helper method to handle scale adjustments before dequantization.
-        This is the reverse order of operations used when building the layer.
-
-        Args:
-            scale: The scale tensor to adjust.
-
-        Returns:
-            The adjusted scale tensor.
-        """
-        axes = self.einsum_axes
-        if axes.kernel_squeeze_axes:
-            scale = ops.expand_dims(scale, axis=axes.kernel_squeeze_axes)
-        if axes.kernel_expand_axes:
-            scale = ops.squeeze(scale, axis=axes.kernel_expand_axes)
-        if axes.kernel_transpose_axes:
-            # We need to reverse the transpose operation.
-            reverse_transpose = sorted(
-                range(len(axes.kernel_transpose_axes)),
-                key=axes.kernel_transpose_axes.__getitem__,
-            )
-            scale = ops.transpose(scale, axes=reverse_transpose)
-        return scale
-
-    def _adjust_scale_for_quant(self, scale, tensor_type="kernel"):
-        """Adjusts scale tensor layout after quantization.
-
-        Helper method to handle scale adjustments after re-quantization.
-        This is the forward order of operations used when building the layer.
-
-        Args:
-            scale: The scale tensor to adjust.
-            tensor_type: The type of tensor to adjust the scale for.
-                "kernel" or "input".
-        Returns:
-            The adjusted scale tensor.
-        """
-        axes = self.einsum_axes
-        if tensor_type == "kernel":
-            transpose_axes = axes.kernel_transpose_axes
-            expand_axes = axes.kernel_expand_axes
-            squeeze_axes = axes.kernel_squeeze_axes
-        elif tensor_type == "input":
-            transpose_axes = axes.input_transpose_axes
-            expand_axes = axes.input_expand_axes
-            squeeze_axes = axes.input_squeeze_axes
-        else:
-            raise ValueError(f"Invalid tensor type: {tensor_type}")
-
-        if transpose_axes:
-            scale = ops.transpose(scale, transpose_axes)
-        if expand_axes:
-            scale = ops.expand_dims(scale, axis=expand_axes)
-        if squeeze_axes:
-            scale = ops.squeeze(scale, axis=squeeze_axes)
-        return scale
-
 
 def _analyze_einsum_string(equation, bias_axes, input_shape, output_shape):
     """Parses an einsum string to determine the shapes of the weights.
@@ -543,35 +455,37 @@ def _analyze_einsum_string(equation, bias_axes, input_shape, output_shape):
         ValueError: If the einsum `equation` is not in a supported format.
     """
 
+    *specs, ellipsis = _split_equation(equation)
+    return _analyze_split_string(
+        specs,
+        bias_axes,
+        input_shape,
+        output_shape,
+        left_elided=ellipsis == "left",
+    )
+
+
+# The accepted forms, with "..." replaced by "0", and the side each elides.
+_EQUATION_FORMS = (
+    ("([a-zA-Z]+),([a-zA-Z]+)->([a-zA-Z]+)", None),
+    ("0([a-zA-Z]+),([a-zA-Z]+)->0([a-zA-Z]+)", "left"),
+    ("([a-zA-Z]{2,})0,([a-zA-Z]+)->([a-zA-Z]+)0", "right"),
+)
+
+
+def _split_equation(equation):
+    """Splits an equation into its inputs, kernel and output labels.
+
+    Returns:
+        `(input_spec, weight_spec, output_spec, ellipsis)`, where
+        `ellipsis` is the side the equation elides: `"left"`, `"right"`
+        or `None`.
+    """
     dot_replaced_string = re.sub(r"\.\.\.", "0", equation)
-
-    # This is the case where no ellipses are present in the string.
-    split_string = re.match(
-        "([a-zA-Z]+),([a-zA-Z]+)->([a-zA-Z]+)", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape
-        )
-
-    # This is the case where ellipses are present on the left.
-    split_string = re.match(
-        "0([a-zA-Z]+),([a-zA-Z]+)->0([a-zA-Z]+)", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape, left_elided=True
-        )
-
-    # This is the case where ellipses are present on the right.
-    split_string = re.match(
-        "([a-zA-Z]{2,})0,([a-zA-Z]+)->([a-zA-Z]+)0", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape
-        )
-
+    for pattern, ellipsis in _EQUATION_FORMS:
+        split_string = re.match(pattern, dot_replaced_string)
+        if split_string:
+            return (*split_string.groups(), ellipsis)
     raise ValueError(
         f"Invalid einsum equation '{equation}'. Equations must be in the form "
         "[X],[Y]->[Z], ...[X],[Y]->...[Z], or [X]...,[Y]->[Z]...."
@@ -587,8 +501,7 @@ def _analyze_split_string(
     and calculates the required shapes for the kernel and bias weights.
 
     Args:
-        split_string: A regex match object containing the input, weight, and
-            output specifications.
+        split_string: The input, weight and output specifications.
         bias_axes: A string indicating which output axes to apply a bias to.
         input_shape: The shape of the input tensor.
         output_shape: The user-specified partial shape of the output tensor.
@@ -605,9 +518,7 @@ def _analyze_split_string(
         ValueError: If there are inconsistencies between the input and output
             shapes or if the equation specifications are invalid.
     """
-    input_spec = split_string.group(1)
-    weight_spec = split_string.group(2)
-    output_spec = split_string.group(3)
+    input_spec, weight_spec, output_spec = split_string
     elided = len(input_shape) - len(input_spec)
 
     if isinstance(output_shape, int):
@@ -717,204 +628,63 @@ def _analyze_split_string(
 
 @dataclasses.dataclass(frozen=True)
 class EinsumAxes:
-    """Axis bookkeeping an `EinsumDense` derives from its equation.
+    """The labels of an `EinsumDense` equation, any ellipsis spelled out.
 
-    `*_reduced_axes` are the input and kernel axes the equation contracts.
-    The transpose, expand and squeeze axes map a per-axis scale of the
-    inputs or kernel onto the output layout, so that
-    `output / (inputs_scale * kernel_scale)` broadcasts against
-    `einsum(equation, inputs, kernel)`. `custom_gradient_equation` is the
-    einsum that produces the inputs gradient.
-
-    The last four fields classify the axes for the geometry's
-    `ContractionView`. `kernel_batch_axes` are shared by the inputs, the
-    kernel and the output; `kernel_free_axes` reach the output from the
-    kernel alone. `input_batch_axes` and `input_contracted_axes` are the
-    input axes with the labels of `kernel_batch_axes` and
-    `kernel_reduced_axes`, in the kernel's order, so both operands flatten
-    the same way.
+    Every axis fact the quantization modes read derives from the three
+    label strings. An input or kernel axis is reduced (contracted) when
+    its label is not in the output. `kernel_axes` gives the roles of the
+    kernel's axes, and `input_axes` finds the input axes with the same
+    labels.
     """
 
-    input_reduced_axes: tuple
-    kernel_reduced_axes: tuple
-    input_transpose_axes: tuple
-    kernel_transpose_axes: tuple
-    input_expand_axes: tuple
-    kernel_expand_axes: tuple
-    input_squeeze_axes: tuple
-    kernel_squeeze_axes: tuple
-    custom_gradient_equation: str
-    kernel_batch_axes: tuple
-    kernel_free_axes: tuple
-    input_batch_axes: tuple
-    input_contracted_axes: tuple
+    inputs: str
+    kernel: str
+    output: str
 
-
-def _analyze_quantization_info(equation, input_shape):
-    """Analyzes an einsum equation to derive information for quantization.
-
-    This function canonicalizes the einsum equation (handling ellipses) and
-    determines the necessary tensor manipulations (reduction, transposition,
-    expansion, squeezing) required to correctly apply per-axis quantization
-    to the inputs and kernel. It also derives the einsum equation needed for
-    the custom gradient.
-
-    Args:
-        equation: The einsum equation string.
-        input_shape: The shape of the input tensor.
-
-    Returns:
-        An `EinsumAxes` record.
-    """
-
-    def get_specs(equation, input_shape):
-        possible_labels = string.ascii_letters
-        dot_replaced_string = re.sub(r"\.\.\.", "0", equation)
-
-        # This is the case where no ellipses are present in the string.
-        split_string = re.match(
-            "([a-zA-Z]+),([a-zA-Z]+)->([a-zA-Z]+)", dot_replaced_string
-        )
-        if split_string is not None:
-            input_spec = split_string.group(1)
-            weight_spec = split_string.group(2)
-            output_spec = split_string.group(3)
-            return input_spec, weight_spec, output_spec
-
-        # This is the case where ellipses are present on the left.
-        split_string = re.match(
-            "0([a-zA-Z]+),([a-zA-Z]+)->0([a-zA-Z]+)", dot_replaced_string
-        )
-        if split_string is not None:
-            input_spec = split_string.group(1)
-            weight_spec = split_string.group(2)
-            output_spec = split_string.group(3)
-            elided = len(input_shape) - len(input_spec)
-            possible_labels = sorted(
-                set(possible_labels)
-                - set(input_spec)
-                - set(weight_spec)
-                - set(output_spec)
+    @classmethod
+    def from_equation(cls, equation, input_rank):
+        inputs, kernel, output, ellipsis = _split_equation(equation)
+        if ellipsis is not None:
+            # Give the elided axes labels of their own.
+            unused = sorted(
+                set(string.ascii_letters) - set(inputs + kernel + output)
             )
-            # Pad labels on the left to `input_spec` and `output_spec`
-            for i in range(elided):
-                input_spec = possible_labels[i] + input_spec
-                output_spec = possible_labels[i] + output_spec
-            return input_spec, weight_spec, output_spec
+            elided = "".join(unused[: input_rank - len(inputs)])
+            if ellipsis == "left":
+                inputs, output = elided + inputs, elided + output
+            else:
+                inputs, output = inputs + elided, output + elided
+        return cls(inputs, kernel, output)
 
-        # This is the case where ellipses are present on the right.
-        split_string = re.match(
-            "([a-zA-Z]{2,})0,([a-zA-Z]+)->([a-zA-Z]+)0", dot_replaced_string
-        )
-        if split_string is not None:
-            input_spec = split_string.group(1)
-            weight_spec = split_string.group(2)
-            output_spec = split_string.group(3)
-            elided = len(input_shape) - len(input_spec)
-            possible_labels = sorted(
-                set(possible_labels)
-                - set(input_spec)
-                - set(weight_spec)
-                - set(output_spec)
-            )
-            # Pad labels on the right to `input_spec` and `output_spec`
-            for i in range(elided):
-                input_spec = input_spec + possible_labels[i]
-                output_spec = output_spec + possible_labels[i]
-            return input_spec, weight_spec, output_spec
-
-        raise ValueError(
-            f"Invalid einsum equation '{equation}'. Equations must be in the "
-            "form [X],[Y]->[Z], ...[X],[Y]->...[Z], or [X]...,[Y]->[Z]...."
+    @property
+    def input_reduced_axes(self):
+        """The input axes the equation contracts."""
+        return tuple(
+            i for i, label in enumerate(self.inputs) if label not in self.output
         )
 
-    input_spec, weight_spec, output_spec = get_specs(equation, input_shape)
+    @property
+    def kernel_axes(self):
+        """The roles of the kernel's axes, as a `KernelAxes`."""
+        roles = {"contracted": [], "free": [], "batch": []}
+        for i, label in enumerate(self.kernel):
+            if label not in self.output:
+                roles["contracted"].append(i)
+            elif label in self.inputs:
+                roles["batch"].append(i)
+            else:
+                roles["free"].append(i)
+        return KernelAxes(**roles)
 
-    # Determine the axes that should be reduced by the quantizer
-    input_reduced_axes = []
-    weight_reduced_axes = []
-    for i, label in enumerate(input_spec):
-        index = output_spec.find(label)
-        if index == -1:
-            input_reduced_axes.append(i)
-    for i, label in enumerate(weight_spec):
-        index = output_spec.find(label)
-        if index == -1:
-            weight_reduced_axes.append(i)
+    def input_axes(self, kernel_axes):
+        """The input axes with the labels of `kernel_axes`, in their order."""
+        return tuple(
+            self.inputs.index(self.kernel[i])
+            for i in kernel_axes
+            if self.kernel[i] in self.inputs
+        )
 
-    # Determine the axes of `ops.expand_dims`
-    input_expand_axes = []
-    weight_expand_axes = []
-    for i, label in enumerate(output_spec):
-        index_input = input_spec.find(label)
-        index_weight = weight_spec.find(label)
-        if index_input == -1:
-            input_expand_axes.append(i)
-        if index_weight == -1:
-            weight_expand_axes.append(i)
-
-    # Determine the axes of `ops.transpose`
-    input_transpose_axes = []
-    weight_transpose_axes = []
-    for i, label in enumerate(output_spec):
-        index_input = input_spec.find(label)
-        index_weight = weight_spec.find(label)
-        if index_input != -1:
-            input_transpose_axes.append(index_input)
-        if index_weight != -1:
-            weight_transpose_axes.append(index_weight)
-    # Postprocess the information:
-    # 1. Add dummy axes (1) to transpose_axes
-    # 2. Add axis to squeeze_axes if 1. failed
-    input_squeeze_axes = []
-    weight_squeeze_axes = []
-    for ori_index in input_reduced_axes:
-        try:
-            index = input_expand_axes.pop(0)
-        except IndexError:
-            input_squeeze_axes.append(ori_index)
-        input_transpose_axes.insert(index, ori_index)
-    for ori_index in weight_reduced_axes:
-        try:
-            index = weight_expand_axes.pop(0)
-        except IndexError:
-            weight_squeeze_axes.append(ori_index)
-        weight_transpose_axes.insert(index, ori_index)
-    # Prepare equation for `einsum_with_inputs_gradient`
-    custom_gradient_equation = f"{output_spec},{weight_spec}->{input_spec}"
-    # Classify the kernel axes for the contraction view. A batch axis is
-    # shared by the inputs, the kernel and the output; a free axis reaches
-    # the output from the kernel alone; the rest are contracted.
-    kernel_batch_axes = []
-    kernel_free_axes = []
-    for i, label in enumerate(weight_spec):
-        if label not in output_spec:
-            continue
-        if label in input_spec:
-            kernel_batch_axes.append(i)
-        else:
-            kernel_free_axes.append(i)
-    # The input axes with the same labels, in the kernel's order.
-    input_batch_axes = [
-        input_spec.index(weight_spec[i]) for i in kernel_batch_axes
-    ]
-    input_contracted_axes = [
-        input_spec.index(weight_spec[i])
-        for i in weight_reduced_axes
-        if weight_spec[i] in input_spec
-    ]
-    return EinsumAxes(
-        input_reduced_axes=tuple(input_reduced_axes),
-        kernel_reduced_axes=tuple(weight_reduced_axes),
-        input_transpose_axes=tuple(input_transpose_axes),
-        kernel_transpose_axes=tuple(weight_transpose_axes),
-        input_expand_axes=tuple(input_expand_axes),
-        kernel_expand_axes=tuple(weight_expand_axes),
-        input_squeeze_axes=tuple(input_squeeze_axes),
-        kernel_squeeze_axes=tuple(weight_squeeze_axes),
-        custom_gradient_equation=custom_gradient_equation,
-        kernel_batch_axes=tuple(kernel_batch_axes),
-        kernel_free_axes=tuple(kernel_free_axes),
-        input_batch_axes=tuple(input_batch_axes),
-        input_contracted_axes=tuple(input_contracted_axes),
-    )
+    @property
+    def gradient_equation(self):
+        """The einsum that produces the inputs gradient."""
+        return f"{self.output},{self.kernel}->{self.inputs}"

@@ -21,19 +21,21 @@ class Int4ProjectionHandlers:
     """The int4 build, forward, encode and view of a projection kernel.
 
     The kernel is stored as its 2-D `[rows, columns]` matrix
-    (`geometry.kernel_matrix`): the contracted axes are the rows, and
-    every other axis, in the kernel's order, makes up the columns. The
-    codes are packed two per byte along the columns, and the scale runs
-    per column (per-channel) or per group of rows (grouped, with a zero
-    point and a group index). The forward pass dequantizes through the
-    `QuantizedWeight` view and contracts in float.
+    (`KernelAxes.matrix` with `batch_in="columns"`): the contracted axes
+    are the rows, and every other axis, in the kernel's order, makes up
+    the columns. The codes are packed two per byte along the columns, and
+    the scale runs per column (per-channel) or per group of rows (grouped,
+    with a zero point and a group index). The forward pass dequantizes
+    through the `QuantizedWeight` view and contracts in float.
     """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(config, None)
         )
-        _, rows, columns = geometry.kernel_matrix(kernel_shape)
+        _, rows, columns = geometry.kernel_axes.matrix(
+            kernel_shape, batch_in="columns"
+        )
         block_size = self.resolve_block_size(layer, config)
 
         # Codes packed two per byte along the columns.
@@ -76,7 +78,9 @@ class Int4ProjectionHandlers:
 
     def _view(self, layer, geometry, codes, scale, zero_point, g_idx):
         """The view over the layer's variables or over traced tensors."""
-        permutation, _, columns = geometry.kernel_matrix(geometry.weight_shape)
+        permutation, _, columns = geometry.kernel_axes.matrix(
+            geometry.weight_shape, batch_in="columns"
+        )
         return QuantizedWeight(
             codes=codes,
             scale=scale,
@@ -85,7 +89,10 @@ class Int4ProjectionHandlers:
                 self.resolve_block_size(layer, layer.quantization_config)
             ),
             shape=geometry.weight_shape,
-            axis=0,
+            # A grouped scale runs per group of rows, a per-channel scale
+            # per column.
+            axis=None if g_idx is None else 0,
+            scale_axes=(1,) if g_idx is None else None,
             permutation=permutation,
             zero_point=zero_point,
             g_idx=g_idx,
@@ -165,7 +172,9 @@ class Int4ProjectionHandlers:
         # block_size=128); a `block_size` of `None` or `-1` selects the
         # per-channel escape hatch.
         block_size = self.resolve_block_size(layer, config)
-        permutation, rows, columns = geometry.kernel_matrix(weight.shape)
+        permutation, rows, columns = geometry.kernel_axes.matrix(
+            weight.shape, batch_in="columns"
+        )
         flat_kernel = ops.reshape(
             ops.transpose(weight, permutation), (rows, columns)
         )

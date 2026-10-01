@@ -126,7 +126,10 @@ class LookupHandlers:
             layout=self._lookup_layout(-1, layer.output_dim),
             scheme=self._lookup_scheme(layer, layer.quantization_config),
             shape=(layer.input_dim, layer.output_dim),
-            axis=-1,
+            # A grouped scale runs per row and group of columns, a
+            # per-channel scale per row.
+            axis=None if layer.g_idx is None else -1,
+            scale_axes=(0,) if layer.g_idx is None else None,
         )
 
     def _reverse_quantized_weight_lookup(self, layer, geometry):
@@ -151,7 +154,8 @@ class LookupHandlers:
             layout=self._lookup_layout(0, layer.output_dim),
             scheme=self._lookup_scheme(layer, layer.quantization_config),
             shape=(layer.output_dim, layer.input_dim),
-            axis=0,
+            axis=None if layer.g_idx is None else 0,
+            scale_axes=(1,) if layer.g_idx is None else None,
         )
 
     # --- Forward passes ---------------------------------------------------

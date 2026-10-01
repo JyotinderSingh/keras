@@ -24,6 +24,7 @@ from keras.src import ops
 from keras.src.layers.layer import Layer
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.geometry import ContractionView
+from keras.src.quantizers.geometry import KernelAxes
 from keras.src.quantizers.geometry import LookupGeometry
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.saving import serialization_lib
@@ -350,8 +351,8 @@ class ThirdPartyProjection(Layer):
 class _PermutedInputsView(ContractionView):
     """A contraction view whose inputs go through a fixed permutation."""
 
-    def __init__(self, permutation, kernel_shape, **axes):
-        super().__init__(kernel_shape, **axes)
+    def __init__(self, permutation, kernel_shape, kernel_axes, **axes):
+        super().__init__(kernel_shape, kernel_axes, **axes)
         self.permutation = permutation
 
     def inputs_to_view(self, inputs):
@@ -380,9 +381,7 @@ class PermutedGeometry(ProjectionGeometry):
         return _PermutedInputsView(
             self.layer.permutation,
             self.weight_shape,
-            kernel_batch_axes=(),
-            kernel_contracted_axes=(0,),
-            kernel_free_axes=(1,),
+            self.kernel_axes,
             input_batch_axes=(),
             input_contracted_axes=(-1,),
         )
@@ -404,45 +403,20 @@ class PermutedDense(ThirdPartyProjection):
 class PointwiseGeometry(ProjectionGeometry):
     """The `(1, in, out)` kernel of a pointwise convolution.
 
-    A kernel of another rank than 2 overrides every hook that reads the
-    kernel's axes.
+    A kernel of another layout than `(input_dim, units)` describes its
+    axes in `kernel_axes`; the stored scale layout and the calibration
+    view derive from it.
     """
+
+    @property
+    def kernel_axes(self):
+        return KernelAxes(contracted=(0, 1), free=(2,))
 
     def contract(self, inputs, kernel):
         return ops.einsum("btc,kcd->btd", inputs, kernel)
 
     def contract_grad(self, upstream, float_kernel):
         return ops.einsum("btd,kcd->btc", upstream, float_kernel)
-
-    def contraction_view(self):
-        return ContractionView(
-            self.weight_shape,
-            kernel_batch_axes=(),
-            kernel_contracted_axes=(0, 1),
-            kernel_free_axes=(2,),
-            input_batch_axes=(),
-            input_contracted_axes=(-1,),
-        )
-
-    def kernel_matrix(self, kernel_shape):
-        return (0, 1, 2), kernel_shape[0] * kernel_shape[1], kernel_shape[2]
-
-    @property
-    def kernel_reduced_axes(self):
-        return (0, 1)
-
-    def kernel_scale_shape(self, kernel_shape):
-        return (kernel_shape[2],)
-
-    @property
-    def kernel_scale_axis(self):
-        return None
-
-    def kernel_scale_for_storage(self, scale):
-        return ops.reshape(scale, (-1,))
-
-    def kernel_scale_for_dequant(self, scale):
-        return scale
 
     def add_lora_delta(self, inputs, x):
         layer = self.layer

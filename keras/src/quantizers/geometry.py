@@ -14,11 +14,10 @@ Two geometry families exist today:
   one projection implementation and the geometry supplies what differs per
   layer: how to contract (a plain matmul for `Dense` and `TernaryDense`,
   `ProjectionGeometry`; an einsum for `EinsumDense`,
-  `EinsumProjectionGeometry`, whose axis analysis lives on the layer
-  itself and is reached through the geometry's hooks), which axes the
-  quantizers reduce over, how a scale lines up with the kernel and with
-  the outputs, the 2D `(contracted, rest)` matrix of an N-D kernel, and
-  the `ContractionView` the calibration modes derive from the equation.
+  `EinsumProjectionGeometry`, which reads the equation's labels), the
+  roles of the kernel's axes (`KernelAxes`), from which every mode lays
+  the kernel out, how an activation scale lines up with the outputs, and
+  the layout of a stored per-channel scale.
 - Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
   plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
   projection (`ReversibleLookupGeometry`).
@@ -56,6 +55,11 @@ quantizable layer must define:
   shape, recorded in `build()`), `bias` and `activation` (either may be
   `None`). `EinsumProjectionGeometry` additionally relies on the
   `einsum_axes` record `EinsumDense` derives from its equation in `build()`.
+  `ProjectionGeometry` describes a 2D `(input_dim, units)` kernel. A
+  kernel of another layout overrides `kernel_axes`, plus `contract`,
+  `contract_grad` and `add_lora_delta` for its own contraction; the
+  stored scale layout and the calibration view derive from
+  `kernel_axes` (see `ProjectionGeometry`).
 - Lookups: `_embeddings`, `input_dim` and `output_dim`. A reversible
   lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
   `reverse_embeddings` variables.
@@ -99,55 +103,106 @@ families it handles in `geometry_families` and implements their
 to the built-in modes.
 """
 
+import dataclasses
 import math
 import string
 
 from keras.src import ops
+from keras.src.quantizers.quantized_weight import lay_out_scale
 from keras.src.quantizers.quantizers import ternarize
 
 
+@dataclasses.dataclass(frozen=True)
+class KernelAxes:
+    """The roles of a projection kernel's axes.
+
+    *Contracted* axes are summed against the inputs and *free* axes reach
+    the output from the kernel alone. A *batch* axis is shared by the
+    inputs, the kernel and the output (the experts of a
+    mixture-of-experts down projection): each of its indices is an
+    independent problem with its own slice of the inputs.
+
+    The modes lay the kernel out from this record. With `B`, `K` and `N`
+    the sizes of the batch, contracted and free axes:
+
+    - int8 keeps the N-D kernel and reduces its scale over `contracted`.
+    - int4 stores `matrix(shape, batch_in="columns")`, `(K, B * N)`: every
+      column belongs to one problem, which keeps the released bytes of a
+      kernel whose contracted axes lead.
+    - GPTQ and AWQ store `matrix(shape, batch_in="rows")`, `(B * K, N)`:
+      act-order `g_idx` and AWQ's input scales differ per problem and lie
+      along the rows.
+
+    Without a batch axis the two matrices are the same.
+    """
+
+    contracted: tuple
+    free: tuple
+    batch: tuple = ()
+
+    def __post_init__(self):
+        for name in ("contracted", "free", "batch"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
+    def sizes(self, kernel_shape):
+        """`(B, K, N)`: the sizes of the batch, contracted and free axes."""
+        return tuple(
+            math.prod(kernel_shape[i] for i in axes)
+            for axes in (self.batch, self.contracted, self.free)
+        )
+
+    def matrix(self, kernel_shape, batch_in):
+        """`(permutation, rows, columns)` of the kernel as a 2D matrix.
+
+        The kernel transposed by `permutation` and reshaped to
+        `(rows, columns)` has its contracted axes along the rows. The
+        batch axes lead the rows (`batch_in="rows"`) or keep their place
+        among the free axes in the columns (`batch_in="columns"`).
+        """
+        problems, rows, columns = self.sizes(kernel_shape)
+        if batch_in == "rows":
+            permutation = self.batch + self.contracted + self.free
+            return permutation, problems * rows, columns
+        if batch_in == "columns":
+            rest = tuple(sorted(self.batch + self.free))
+            return self.contracted + rest, rows, problems * columns
+        raise ValueError(
+            "`batch_in` must be 'rows' or 'columns'. "
+            f"Received: batch_in={batch_in!r}"
+        )
+
+
 class ContractionView:
-    """A projection kernel as independent `(rows, columns)` matrices.
+    """A projection kernel and its inputs as independent problems.
 
-    The rows are the kernel's contracted axes and the columns the axes
-    that reach the output from the kernel alone, each flattened in the
-    kernel's order. An axis shared by the inputs, the kernel and the
-    output (the expert axis of a mixture-of-experts down projection) is a
-    batch axis: each of its `batch` indices is an independent problem with
-    its own slice of the inputs.
-
-    `kernel_to_view` lays the kernel out as `(batch, rows, columns)`, which
-    is the kernel transposed by `kernel_permutation` and reshaped, and
-    `inputs_to_view` lays the inputs out as `(batch, samples, rows)`, or
-    `(samples, rows)` when `batch` is 1, so a row index means the same
-    contracted position on both sides.
+    The calibration modes solve one `(rows, columns)` matrix per batch
+    index of the kernel (see `KernelAxes`). `kernel_to_view` lays the
+    kernel out as `(batch, rows, columns)`, the kernel transposed by
+    `kernel_permutation` and reshaped, and `inputs_to_view` lays the
+    inputs out as `(batch, samples, rows)`, or `(samples, rows)` when
+    `batch` is 1, so a row index means the same contracted position on
+    both sides.
 
     Args:
         kernel_shape: The kernel's own shape.
-        kernel_batch_axes: Kernel axes shared with the inputs and output.
-        kernel_contracted_axes: Kernel axes contracted with the inputs.
-        kernel_free_axes: Kernel axes that reach the output alone.
-        input_batch_axes: Input axes matching `kernel_batch_axes`, in the
+        kernel_axes: The kernel's `KernelAxes`.
+        input_batch_axes: Input axes matching `kernel_axes.batch`, in the
             same order.
         input_contracted_axes: Input axes matching
-            `kernel_contracted_axes`, in the same order.
+            `kernel_axes.contracted`, in the same order.
     """
 
     def __init__(
         self,
         kernel_shape,
+        kernel_axes,
         *,
-        kernel_batch_axes,
-        kernel_contracted_axes,
-        kernel_free_axes,
         input_batch_axes,
         input_contracted_axes,
     ):
         self.kernel_shape = tuple(int(d) for d in kernel_shape)
-        self.kernel_permutation = (
-            tuple(kernel_batch_axes)
-            + tuple(kernel_contracted_axes)
-            + tuple(kernel_free_axes)
+        self.kernel_permutation, _, _ = kernel_axes.matrix(
+            self.kernel_shape, batch_in="rows"
         )
         if sorted(self.kernel_permutation) != list(
             range(len(self.kernel_shape))
@@ -155,26 +210,17 @@ class ContractionView:
             raise ValueError(
                 "The batch, contracted and free axes must partition the "
                 f"kernel axes. Received: kernel_shape={self.kernel_shape}, "
-                f"kernel_batch_axes={tuple(kernel_batch_axes)}, "
-                f"kernel_contracted_axes={tuple(kernel_contracted_axes)}, "
-                f"kernel_free_axes={tuple(kernel_free_axes)}"
+                f"kernel_axes={kernel_axes}"
             )
-        self.batch = math.prod(self.kernel_shape[i] for i in kernel_batch_axes)
-        self.rows = math.prod(
-            self.kernel_shape[i] for i in kernel_contracted_axes
+        self.batch, self.rows, self.columns = kernel_axes.sizes(
+            self.kernel_shape
         )
-        self.columns = math.prod(self.kernel_shape[i] for i in kernel_free_axes)
         self.input_batch_axes = tuple(input_batch_axes)
         self.input_contracted_axes = tuple(input_contracted_axes)
 
-    @property
-    def permuted(self):
-        """Whether the view reorders the kernel axes."""
-        return self.kernel_permutation != tuple(range(len(self.kernel_shape)))
-
     def kernel_to_view(self, kernel):
         """Lays the kernel out as `(batch, rows, columns)`."""
-        if self.permuted:
+        if self.kernel_permutation != tuple(range(len(self.kernel_shape))):
             kernel = ops.transpose(kernel, self.kernel_permutation)
         return ops.reshape(kernel, (self.batch, self.rows, self.columns))
 
@@ -239,11 +285,44 @@ class QuantizationGeometry:
         )
 
 
+# Projection hooks that no mode reads, and the hook that describes the
+# same fact. A geometry that defines one of them is refused when its class
+# is created: the override would have no effect.
+_REPLACED_PROJECTION_HOOKS = {
+    "kernel_matrix": "kernel_axes",
+    "kernel_reduced_axes": "kernel_axes",
+    "kernel_scale_shape": "kernel_scale_axes",
+    "kernel_scale_axis": "kernel_scale_axes",
+    "kernel_scale_for_storage": "kernel_scale_axes",
+    "kernel_scale_for_dequant": "kernel_scale_axes",
+}
+
+
 class ProjectionGeometry(QuantizationGeometry):
-    """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul."""
+    """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul.
+
+    A kernel of another layout overrides `kernel_axes`, plus `contract`,
+    `contract_grad` and `add_lora_delta` for its own contraction. The
+    defaults of `kernel_scale_axes` and `contraction_view` derive from
+    `kernel_axes`; their docstrings say when a layer overrides them too.
+    """
 
     family = "projection"
     build_attributes = ("kernel_shape", "bias", "activation")
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        replaced = sorted(set(vars(cls)) & set(_REPLACED_PROJECTION_HOOKS))
+        if replaced:
+            raise TypeError(
+                f"`{cls.__name__}` defines geometry hooks that no "
+                "quantization mode reads. Replace "
+                + ", ".join(
+                    f"`{name}` with `{_REPLACED_PROJECTION_HOOKS[name]}`"
+                    for name in replaced
+                )
+                + "."
+            )
 
     @property
     def weight_shape(self):
@@ -254,18 +333,21 @@ class ProjectionGeometry(QuantizationGeometry):
         """
         return tuple(self.layer.kernel_shape)
 
-    def contraction_view(self):
-        """The kernel's `ContractionView`, derived from the contraction.
+    @property
+    def kernel_axes(self):
+        """The roles of the kernel's axes, as a `KernelAxes`."""
+        return KernelAxes(contracted=(0,), free=(1,))
 
-        GPTQ and AWQ calibrate on it. Unlike `kernel_matrix`, it stacks the
-        problems of a batch axis along the rows, because act-order `g_idx`
-        and AWQ's input scales differ per problem and lie along the rows.
+    def contraction_view(self):
+        """The `ContractionView` GPTQ and AWQ calibrate on.
+
+        The default reads every contracted position from the last axis of
+        the inputs. A kernel with batch axes, or inputs laid out another
+        way, overrides it.
         """
         return ContractionView(
             self.weight_shape,
-            kernel_batch_axes=(),
-            kernel_contracted_axes=(0,),
-            kernel_free_axes=(1,),
+            self.kernel_axes,
             input_batch_axes=(),
             input_contracted_axes=(-1,),
         )
@@ -278,25 +360,6 @@ class ProjectionGeometry(QuantizationGeometry):
         """Gradient of `contract` with respect to its inputs."""
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
-    def kernel_matrix(self, kernel_shape):
-        """The kernel's 2D `(contracted, rest)` matrix, as int4 stores it.
-
-        Returns `(permutation, rows, columns)`: the kernel transposed by
-        `permutation` and reshaped to `(rows, columns)` has its contracted
-        axes as the rows and every other axis, in the kernel's order, as
-        the columns. A batch axis (the experts of a mixture-of-experts down
-        projection) lands in the columns, so every column belongs to one
-        problem. That keeps the released int4 bytes of a layout whose
-        contracted axes lead, and a per-channel scale per problem and
-        column. Without a batch axis it is the `contraction_view` matrix.
-        """
-        return (0, 1), kernel_shape[0], kernel_shape[1]
-
-    @property
-    def kernel_reduced_axes(self):
-        """Kernel axes a weight quantizer reduces over."""
-        return 0
-
     @property
     def inputs_quantization_axis(self):
         """Input axes an activation quantizer reduces over."""
@@ -306,26 +369,19 @@ class ProjectionGeometry(QuantizationGeometry):
         """Aligns an activation scale with the contraction's outputs."""
         return scale
 
-    def kernel_scale_shape(self, kernel_shape):
-        """Shape of a per-channel scale stored alongside the kernel."""
-        return (kernel_shape[1],)
-
     @property
-    def kernel_scale_axis(self):
-        """Kernel axis a per-channel scale is shared along.
+    def kernel_scale_axes(self):
+        """Layout of a per-channel scale stored with the kernel (int8).
 
-        `None` when the stored scale is laid out for the outputs and
-        `kernel_scale_for_dequant` lays it out against the kernel instead.
+        For each axis of the stored scale, the kernel axis it runs along,
+        or `None` for an axis of size one. int8 divides the contraction's
+        outputs by the stored scale, so the scale follows the outputs'
+        trailing axes. The default is the free and batch axes in the
+        kernel's order: a layer whose outputs end with them in another
+        order overrides it.
         """
-        return 0
-
-    def kernel_scale_for_storage(self, scale):
-        """Aligns a freshly computed kernel scale with its stored layout."""
-        return ops.squeeze(scale, axis=0)
-
-    def kernel_scale_for_dequant(self, scale):
-        """Aligns the stored kernel scale with the kernel for dequantization."""
-        return scale
+        axes = self.kernel_axes
+        return tuple(sorted(axes.free + axes.batch))
 
     def add_lora_delta(self, inputs, x):
         """Adds the LoRA update to the contraction's output, when enabled."""
@@ -394,24 +450,28 @@ def _lora_equations(equation):
 class EinsumProjectionGeometry(ProjectionGeometry):
     """Geometry of an N-D einsum kernel (`EinsumDense`).
 
-    The equation-derived axis analysis (`EinsumDense.einsum_axes`) is
-    the layer's own geometry implementation; this class routes the
-    strategies to it.
+    Every hook derives from the labels of the equation, which
+    `EinsumDense` records in `build()` (`einsum_axes`).
     """
 
     build_attributes = ("kernel_shape", "einsum_axes", "bias", "activation")
 
+    @property
+    def kernel_axes(self):
+        return self.layer.einsum_axes.kernel_axes
+
     def contraction_view(self):
         axes = self.layer.einsum_axes
+        kernel_axes = axes.kernel_axes
+        input_contracted_axes = axes.input_axes(kernel_axes.contracted)
         # The equation analysis already refuses a kernel axis absent from
         # both the inputs and the output; what is left to check is that the
         # kernel has something to contract and something to output, and
         # that the inputs are not summed over an axis on their own.
         if (
-            not axes.kernel_reduced_axes
-            or not axes.kernel_free_axes
-            or sorted(axes.input_contracted_axes)
-            != sorted(axes.input_reduced_axes)
+            not kernel_axes.contracted
+            or not kernel_axes.free
+            or sorted(input_contracted_axes) != sorted(axes.input_reduced_axes)
         ):
             raise ValueError(
                 "Cannot derive a contraction view for the `EinsumDense` "
@@ -423,11 +483,9 @@ class EinsumProjectionGeometry(ProjectionGeometry):
             )
         return ContractionView(
             self.weight_shape,
-            kernel_batch_axes=axes.kernel_batch_axes,
-            kernel_contracted_axes=axes.kernel_reduced_axes,
-            kernel_free_axes=axes.kernel_free_axes,
-            input_batch_axes=axes.input_batch_axes,
-            input_contracted_axes=axes.input_contracted_axes,
+            kernel_axes,
+            input_batch_axes=axes.input_axes(kernel_axes.batch),
+            input_contracted_axes=input_contracted_axes,
         )
 
     def contract(self, inputs, kernel):
@@ -436,45 +494,27 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     def contract_grad(self, upstream, float_kernel):
         # From https://stackoverflow.com/a/47609896
         return ops.einsum(
-            self.layer.einsum_axes.custom_gradient_equation,
-            upstream,
-            float_kernel,
+            self.layer.einsum_axes.gradient_equation, upstream, float_kernel
         )
-
-    def kernel_matrix(self, kernel_shape):
-        contracted = self.layer.einsum_axes.kernel_reduced_axes
-        rest = tuple(i for i in range(len(kernel_shape)) if i not in contracted)
-        return (
-            contracted + rest,
-            math.prod(kernel_shape[i] for i in contracted),
-            math.prod(kernel_shape[i] for i in rest),
-        )
-
-    @property
-    def kernel_reduced_axes(self):
-        return self.layer.einsum_axes.kernel_reduced_axes
 
     @property
     def inputs_quantization_axis(self):
-        return tuple(self.layer.einsum_axes.input_reduced_axes)
+        return self.layer.einsum_axes.input_reduced_axes
 
     def align_inputs_scale(self, scale):
-        return self.layer._adjust_scale_for_quant(scale, "input")
-
-    def kernel_scale_shape(self, kernel_shape):
-        return self.layer._get_kernel_scale_shape(kernel_shape)
+        axes = self.layer.einsum_axes
+        return lay_out_scale(scale, axes.inputs, axes.output)
 
     @property
-    def kernel_scale_axis(self):
-        # The equation analysis may transpose or expand the stored scale
-        # even for a 2-D kernel; `kernel_scale_for_dequant` lays it out.
-        return None
-
-    def kernel_scale_for_storage(self, scale):
-        return self.layer._adjust_scale_for_quant(scale, "kernel")
-
-    def kernel_scale_for_dequant(self, scale):
-        return self.layer._adjust_scale_for_dequant(scale)
+    def kernel_scale_axes(self):
+        # In the outputs' layout: the kernel's free and batch axes in the
+        # order of the output, and an axis of size one for every output
+        # axis the kernel does not have.
+        axes = self.layer.einsum_axes
+        return tuple(
+            axes.kernel.index(label) if label in axes.kernel else None
+            for label in axes.output
+        )
 
     def add_lora_delta(self, inputs, x):
         layer = self.layer
