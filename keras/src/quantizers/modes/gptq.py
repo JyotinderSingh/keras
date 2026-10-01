@@ -1,4 +1,5 @@
 from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
+from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.calibration import CalibrationStrategy
 
@@ -13,9 +14,4 @@ class GPTQStrategy(CalibrationStrategy):
     name = "gptq"
     config_cls = GPTQConfig
     policy_cls = GPTQDTypePolicy
-
-    def finalize_model_quantization(self, model, config, structure, filters):
-        from keras.src.quantizers.gptq_core import gptq_quantize
-
-        del model
-        gptq_quantize(config, structure, filters=filters)
+    calibrator_cls = GPTQCalibrator

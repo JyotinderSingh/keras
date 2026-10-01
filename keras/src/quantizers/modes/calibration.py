@@ -3,8 +3,9 @@
 GPTQ and AWQ allocate the same family of variables, run the same
 dequantize-and-contract forward pass, and speak the same three-part policy
 grammar; they differ only in the code bit-width (which fixes how the
-kernel is packed), in one extra AWQ variable and its inverse scaling, and
-in a handful of message fragments. Those differences are the hooks below.
+kernel is packed), in one extra AWQ variable and its inverse scaling, in
+a handful of message fragments and, for the calibration run, in the
+calibrator class. Those differences are the hooks below.
 """
 
 import math
@@ -97,6 +98,47 @@ class CalibrationStrategy(QuantizationStrategy):
             f"`{self.policy_cls.__name__}` or the `config` argument. "
             f"Received: dtype_policy={policy!r}"
         )
+
+    # --- Calibration run --------------------------------------------------
+
+    # The `Calibrator` class that solves this mode for one layer.
+    calibrator_cls = None
+
+    def calibrate(self, config, structure, filters=None):
+        """Runs this mode's calibration over `structure` and writes back.
+
+        Args:
+            config: The mode's config, with its dataset and tokenizer.
+            structure: Dict with keys `"pre_block_layers"` and
+                `"sequential_blocks"`, as `Model.quantize` resolved it.
+            filters: Optional filters that exclude layers from quantization.
+        """
+        # Imported here to avoid an import cycle: `calibration_run` imports
+        # the layers, which import the strategies.
+        from keras.src.quantizers.calibration_run import CalibrationRun
+        from keras.src.quantizers.calibration_run import (
+            calibration_no_grad_scope,
+        )
+        from keras.src.quantizers.calibration_run import get_dataloader
+
+        if config.dataset is None or config.tokenizer is None:
+            raise ValueError(
+                f"{self.name.upper()} quantization requires a dataset and a "
+                "tokenizer. Please provide them in the "
+                f"`{self.config_cls.__name__}`."
+            )
+        dataloader = get_dataloader(
+            config.tokenizer,
+            config.sequence_length,
+            config.dataset,
+            num_samples=config.num_samples,
+        )
+        with calibration_no_grad_scope():
+            CalibrationRun(self, config, structure, filters).run(dataloader)
+
+    def finalize_model_quantization(self, model, config, structure, filters):
+        del model
+        self.calibrate(config, structure, filters)
 
     # --- Variables --------------------------------------------------------
 

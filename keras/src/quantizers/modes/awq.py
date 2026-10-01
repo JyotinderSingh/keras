@@ -1,4 +1,5 @@
 from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
+from keras.src.quantizers.awq import AWQCalibrator
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.modes.calibration import CalibrationStrategy
 
@@ -13,6 +14,7 @@ class AWQStrategy(CalibrationStrategy):
     name = "awq"
     config_cls = AWQConfig
     policy_cls = AWQDTypePolicy
+    calibrator_cls = AWQCalibrator
 
     def _build_extra_variables(self, layer, rows):
         # Per-channel AWQ scales from activation magnitudes. The weights
@@ -30,9 +32,3 @@ class AWQStrategy(CalibrationStrategy):
 
     def _assign_extra_variables(self, layer, awq_scales):
         layer.awq_scales.assign(awq_scales)
-
-    def finalize_model_quantization(self, model, config, structure, filters):
-        from keras.src.quantizers.awq_core import awq_quantize
-
-        del model
-        awq_quantize(config, structure, filters=filters)
