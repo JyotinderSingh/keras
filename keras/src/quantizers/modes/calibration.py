@@ -18,6 +18,7 @@ import math
 import warnings
 
 from keras.src import ops
+from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
@@ -204,18 +205,7 @@ class CalibrationStrategy(QuantizationStrategy):
             trainable=False,
         )
         self._build_extra_variables(layer, rows)
-        # `g_idx` is stored as `float32` because TF has no GPU kernel for
-        # int32 resource variables (would pin the variable to CPU and break
-        # jit_compile on GPU); consumers cast to int32 on-device.
-        # Not autocast: bfloat16 holds integers exactly only up to 256.
-        layer.g_idx = layer.add_weight(
-            name="g_idx",
-            shape=(rows,),
-            initializer="zeros",
-            dtype="float32",
-            trainable=False,
-            autocast=False,
-        )
+        layer.g_idx = add_group_index(layer, rows)
 
     def _build_extra_variables(self, layer, rows):
         """Creates any mode-specific variables, after the zero point."""

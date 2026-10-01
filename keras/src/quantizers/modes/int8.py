@@ -1,13 +1,7 @@
 from keras.src import ops
 from keras.src.quantizers.modes.common import GeometryDispatchStrategy
-from keras.src.quantizers.modes.common import add_lookup_lora_delta
-from keras.src.quantizers.modes.common import add_reverse_lookup_lora_delta
 from keras.src.quantizers.modes.common import apply_bias_activation
-from keras.src.quantizers.modes.common import apply_logit_soft_cap
-from keras.src.quantizers.modes.common import cast_lookup_inputs
-from keras.src.quantizers.modes.common import encode_reverse_lookup
-from keras.src.quantizers.modes.common import reverse_lookup_dtype
-from keras.src.quantizers.modes.common import reverse_lookup_params
+from keras.src.quantizers.modes.lookup import LookupHandlers
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantized_weight import NoPack
@@ -19,13 +13,15 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 _INT8_SCHEME = WeightScheme(code_range=(-127, 127), scale_form="divisor")
 
 
-class Int8Strategy(GeometryDispatchStrategy):
+class Int8Strategy(LookupHandlers, GeometryDispatchStrategy):
     """W8A8 dynamic quantization (int8 weights times int8 activations).
 
     One projection implementation serves every kernel contracted against
     its inputs: the geometry says how to contract, which axes the
     quantizers reduce over, and how a scale lines up with the kernel and
-    with the outputs.
+    with the outputs. An embeddings table goes through `LookupHandlers`,
+    which this mode gives its scheme, its encoding and the default
+    activation quantizer of the reverse projection.
     """
 
     name = "int8"
@@ -54,9 +50,7 @@ class Int8Strategy(GeometryDispatchStrategy):
             trainable=False,
         )
 
-    def _call_projection(self, layer, inputs, training=None):
-        geometry = layer._quantization_geometry()
-
+    def _call_projection(self, layer, geometry, inputs, training=None):
         @ops.custom_gradient
         def contract_with_inputs_gradient(inputs, kernel, kernel_scale):
             """Contracts against the int8 kernel with a custom gradient.
@@ -153,77 +147,13 @@ class Int8Strategy(GeometryDispatchStrategy):
         layer.kernel_scale.assign(kernel_scale)
 
     # --- Embeddings lookup (Embedding, ReversibleEmbedding) ---------------
+    # The build, forward passes, views and conversion are `LookupHandlers`.
 
-    def _build_lookup(self, layer, geometry, embeddings_shape, config):
-        layer._embeddings = layer.add_weight(
-            name="embeddings",
-            shape=embeddings_shape,
-            initializer="zeros",
-            dtype="int8",
-            trainable=False,
-        )
-        # We choose to reduce the axis of `output_dim` because, typically,
-        # `input_dim` is larger than `output_dim`. This reduces quantization
-        # error.
-        layer.embeddings_scale = layer.add_weight(
-            name="embeddings_scale",
-            shape=(layer.input_dim,),
-            initializer="ones",
-            trainable=False,
-        )
-        if geometry.reversible:
-            layer.inputs_quantizer = (
-                QuantizationConfig.activation_quantizer_or_default(
-                    config, AbsMaxQuantizer(axis=-1)
-                )
-            )
-            if not layer.tie_weights:
-                layer.reverse_embeddings = layer.add_weight(
-                    name="reverse_embeddings",
-                    shape=(layer.output_dim, layer.input_dim),
-                    initializer="zeros",
-                    dtype="int8",
-                    trainable=False,
-                )
-                layer.reverse_embeddings_scale = layer.add_weight(
-                    name="reverse_embeddings_scale",
-                    shape=(layer.input_dim,),
-                    initializer="ones",
-                    trainable=False,
-                )
+    def _lookup_scheme(self, layer, config):
+        return _INT8_SCHEME
 
-    def _call_lookup(self, layer, inputs, reverse=False):
-        if reverse:
-            return self._reverse_lookup(layer, inputs)
-        # We cannot update quantized layer._embeddings, so the custom
-        # gradient is not needed
-        inputs = cast_lookup_inputs(inputs)
-        embeddings_scale = ops.take(layer.embeddings_scale, inputs, axis=0)
-        outputs = ops.take(layer._embeddings, inputs, axis=0)
-        # De-scale outputs
-        outputs = ops.divide(
-            ops.cast(outputs, dtype=layer.compute_dtype),
-            ops.expand_dims(embeddings_scale, axis=-1),
-        )
-        return add_lookup_lora_delta(layer, inputs, outputs)
-
-    def _reverse_lookup(self, layer, inputs):
-        dtype = reverse_lookup_dtype(layer)
-        inputs = ops.cast(inputs, dtype)
-        kernel, scale, _ = reverse_lookup_params(layer)
-        if layer.inputs_quantizer:
-            inputs_q, inputs_scale = layer.inputs_quantizer(inputs)
-        else:
-            inputs_q, inputs_scale = inputs, ops.ones((1,), dtype=dtype)
-        logits = ops.matmul(inputs_q, kernel)
-        # De-scale outputs
-        logits = ops.cast(logits, dtype)
-        logits = ops.divide(logits, ops.multiply(inputs_scale, scale))
-        # The scale is a float32 variable; the projection reports its own
-        # dtype, as the float layer does.
-        logits = ops.cast(logits, dtype)
-        logits = add_reverse_lookup_lora_delta(layer, inputs, logits)
-        return apply_logit_soft_cap(layer, logits)
+    def _default_reverse_inputs_quantizer(self):
+        return AbsMaxQuantizer(axis=-1)
 
     def _encode_lookup(self, layer, geometry, weight, config):
         weight_quantizer = QuantizationConfig.weight_quantizer_or_default(
@@ -234,44 +164,3 @@ class Int8Strategy(GeometryDispatchStrategy):
             weight, to_numpy=True
         )
         return embeddings_value, ops.squeeze(embeddings_scale, axis=-1), None
-
-    def _quantized_weight_lookup(self, layer, geometry):
-        return QuantizedWeight(
-            codes=layer._embeddings,
-            scale=layer.embeddings_scale,
-            layout=NoPack(),
-            scheme=_INT8_SCHEME,
-            shape=(layer.input_dim, layer.output_dim),
-            axis=-1,
-        )
-
-    def _reverse_quantized_weight_lookup(self, layer, geometry):
-        # A tied layer's reverse table is its forward table transposed.
-        codes, scale, _ = reverse_lookup_params(layer)
-        return QuantizedWeight(
-            codes=codes,
-            scale=scale,
-            layout=NoPack(),
-            scheme=_INT8_SCHEME,
-            shape=(layer.output_dim, layer.input_dim),
-            axis=0,
-        )
-
-    def _quantize_lookup(self, layer, geometry, config):
-        embeddings_shape = geometry.weight_shape
-        embeddings_value, embeddings_scale, _ = self._encode_lookup(
-            layer, geometry, layer._embeddings, config
-        )
-        del layer._embeddings
-        untied = geometry.reversible and not layer.tie_weights
-        if untied:
-            reverse_value, reverse_scale, _ = encode_reverse_lookup(
-                self, layer, geometry, config
-            )
-            del layer.reverse_embeddings
-        layer.quantized_build(embeddings_shape, self.name, config)
-        layer._embeddings.assign(embeddings_value)
-        layer.embeddings_scale.assign(embeddings_scale)
-        if untied:
-            layer.reverse_embeddings.assign(reverse_value)
-            layer.reverse_embeddings_scale.assign(reverse_scale)

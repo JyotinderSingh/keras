@@ -15,6 +15,7 @@ from keras.src import backend
 from keras.src import ops
 from keras.src.quantizers.packing import pack_int2
 from keras.src.quantizers.packing import pack_int4
+from keras.src.quantizers.packing import pack_ternary
 from keras.src.quantizers.packing import unpack_int2
 from keras.src.quantizers.packing import unpack_int4
 from keras.src.quantizers.packing import unpack_ternary
@@ -175,6 +176,10 @@ class TernaryTrits(_AxisPack):
     def unpack(self, codes):
         return unpack_ternary(codes, self.orig_len, axis=self.axis)
 
+    def pack(self, codes):
+        packed, _, _ = pack_ternary(codes, axis=self.axis)
+        return packed
+
 
 class QuantizedWeight:
     """A read-only view over the stored variables of one quantized weight.
@@ -252,6 +257,11 @@ class QuantizedWeight:
                 "`g_idx` must be given exactly when the scheme is grouped. "
                 f"Received: scheme={scheme!r}, "
                 f"g_idx={'given' if g_idx is not None else None}"
+            )
+        if g_idx is not None and not isinstance(axis, int):
+            raise ValueError(
+                "A grouped weight needs the one `axis` its groups run along. "
+                f"Received: axis={axis}"
             )
         if align_scale is not None and (
             axis is not None or scheme.group_size is not None

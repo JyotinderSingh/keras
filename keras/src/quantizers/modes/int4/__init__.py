@@ -51,14 +51,6 @@ class Int4Strategy(
         # A legacy bare "int4" policy (no `Int4DTypePolicy`) is per-channel.
         return None
 
-    def block_size(self, layer):
-        """The block size `layer`'s int4 variables were built with.
-
-        Resolved, as `build` resolved it, from the config the layer
-        recorded or from its dtype policy.
-        """
-        return self.resolve_block_size(layer, layer.quantization_config)
-
     def policy_from_string(self, mode_str, source_name):
         # Legacy bare "int4" policies carry no block size and stay generic
         # (they resolve to per-channel quantization on reload).

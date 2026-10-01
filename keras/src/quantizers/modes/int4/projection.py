@@ -3,9 +3,9 @@
 import math
 
 from keras.src import ops
+from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.modes.int4.block_size import int4_scheme
-from keras.src.quantizers.modes.int4.block_size import is_grouped
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
 from keras.src.quantizers.quantization_config import QuantizationConfig
@@ -54,14 +54,11 @@ class Int4ProjectionHandlers:
             initializer="ones",
             trainable=False,
         )
-        if is_grouped(block_size):
+        layer.kernel_zero = None
+        layer.g_idx = None
+        if not is_per_channel(block_size):
             # Grouped quantization is asymmetric: a zero point per group and
             # the row-to-group index.
-            def idx_initializer(shape, dtype):
-                return ops.floor_divide(
-                    ops.arange(rows, dtype=dtype), block_size
-                )
-
             layer.kernel_zero = layer.add_weight(
                 name="zero_point",
                 shape=scale_shape,
@@ -69,21 +66,13 @@ class Int4ProjectionHandlers:
                 dtype="int8",
                 trainable=False,
             )
-            # `g_idx` is stored as `float32` because TF has no GPU kernel for
-            # int32 resource variables (would pin the variable to CPU and
-            # break jit_compile on GPU); consumers cast to int32 on-device.
-            # Not autocast: bfloat16 holds integers exactly only up to 256.
-            layer.g_idx = layer.add_weight(
-                name="g_idx",
-                shape=(rows,),
-                initializer=idx_initializer,
-                dtype="float32",
-                trainable=False,
-                autocast=False,
+            layer.g_idx = add_group_index(
+                layer,
+                rows,
+                lambda shape, dtype: ops.floor_divide(
+                    ops.arange(rows, dtype=dtype), block_size
+                ),
             )
-        else:
-            layer.kernel_zero = None
-            layer.g_idx = None
 
     def _view(self, layer, geometry, codes, scale, zero_point, g_idx):
         """The view over the layer's variables or over traced tensors."""
@@ -92,7 +81,9 @@ class Int4ProjectionHandlers:
             codes=codes,
             scale=scale,
             layout=Int4Pairs(axis=-1, orig_len=columns),
-            scheme=int4_scheme(self.block_size(layer)),
+            scheme=int4_scheme(
+                self.resolve_block_size(layer, layer.quantization_config)
+            ),
             shape=geometry.weight_shape,
             axis=0,
             permutation=permutation,
@@ -110,9 +101,8 @@ class Int4ProjectionHandlers:
             layer.g_idx,
         )
 
-    def _call_projection(self, layer, inputs, training=None):
-        geometry = layer._quantization_geometry()
-        grouped = is_grouped(self.block_size(layer))
+    def _call_projection(self, layer, geometry, inputs, training=None):
+        grouped = layer.g_idx is not None
 
         @ops.custom_gradient
         def contract_with_inputs_gradient(
