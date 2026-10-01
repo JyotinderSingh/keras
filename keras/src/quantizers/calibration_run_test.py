@@ -615,6 +615,91 @@ class CalibrationRunModelTest(testing.TestCase):
             self.assertIsNone(getattr(call.args[1], "grad_fn", None))
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_run_hands_a_rank_4_block_output_on(self, mode):
+        # Regression test: the handoff split each batch into samples and
+        # re-added the batch axis only to rank-2 samples, so a rank-4
+        # output reached the next block with its axes merged.
+        vocab_size, seq_len, embed_dim = 32, 8, 16
+        inputs = layers.Input((seq_len,), dtype="int32")
+        embedding = layers.Embedding(vocab_size, embed_dim)
+        first = models.Sequential(
+            [layers.Dense(embed_dim), layers.Reshape((seq_len, 2, 8))]
+        )
+        second = models.Sequential(
+            [layers.Reshape((seq_len, embed_dim)), layers.Dense(embed_dim)]
+        )
+        model = models.Model(inputs, second(first(embedding(inputs))))
+        kwargs = {"num_grid_points": 3} if mode == "awq" else {}
+        config = _config(
+            mode,
+            num_samples=6,
+            calibration_batch_size=4,
+            sequence_length=seq_len,
+            group_size=-1,
+            **kwargs,
+        )
+        rng = np.random.default_rng(3)
+        config.dataset = [
+            rng.integers(0, vocab_size, (1, seq_len), dtype=np.int32)
+            for _ in range(6)
+        ]
+        config.tokenizer = lambda text: text
+        config.quantization_layer_structure = {
+            "pre_block_layers": [embedding],
+            "sequential_blocks": [first, second],
+        }
+        model.quantize(mode, config=config)
+        self.assertFalse(first.layers[0].calibration_pending)
+        self.assertFalse(second.layers[1].calibration_pending)
+        outputs = ops.convert_to_numpy(model(config.dataset[0]))
+        self.assertTrue(np.isfinite(outputs).all())
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_run_calibrates_only_layers_left_pending(self, mode):
+        # A layer quantized in another mode, or already calibrated, is
+        # left as it is instead of failing inside the solve.
+        model, config = _tiny_model(mode)
+        block = config.quantization_layer_structure["sequential_blocks"][0]
+        int8_layer, calibrated_layer = block.layers
+        int8_layer.quantize("int8")
+        int8_codes = ops.convert_to_numpy(int8_layer._kernel)
+        model.quantize(mode, config=config)
+        self.assertEqual(int8_layer.quantization_mode, "int8")
+        self.assertAllEqual(int8_layer._kernel, int8_codes)
+        self.assertEqual(calibrated_layer.quantization_mode, mode)
+        self.assertFalse(calibrated_layer.calibration_pending)
+
+        # A second call finds nothing pending and runs no forward pass.
+        codes = ops.convert_to_numpy(calibrated_layer.quantized_kernel)
+        with mock.patch.object(CalibrationRun, "_prefix_outputs") as prefix:
+            model.quantize(mode, config=config)
+        prefix.assert_not_called()
+        self.assertAllEqual(calibrated_layer.quantized_kernel, codes)
+
+    def test_run_solves_a_pending_layer_with_its_own_config(self):
+        # A layer quantized with its own config ahead of the run is solved
+        # with that config, which its variables were allocated for.
+        model, config = _tiny_model("gptq", weight_bits=8)
+        layer = config.quantization_layer_structure["sequential_blocks"][0]
+        layer = layer.layers[0]
+        kernel = ops.convert_to_numpy(layer.kernel)
+        layer_config = GPTQConfig(
+            dataset=None, tokenizer=None, weight_bits=4, group_size=8
+        )
+        layer.quantize("gptq", config=layer_config)
+        with _spy_on_observe("gptq") as observe:
+            model.quantize("gptq", config=config)
+        for call in observe.call_args_list:
+            calibrator = call.args[0]
+            expected = layer_config if calibrator.layer is layer else config
+            self.assertIs(calibrator.config, expected)
+        self.assertFalse(layer.calibration_pending)
+        self.assertEqual(layer.dtype_policy.name, "gptq/4/8_from_float32")
+        weight = layer._quantized_weight().dequantize("float32")
+        error = np.linalg.norm(weight - kernel) / np.linalg.norm(kernel)
+        self.assertLess(error, 0.2)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_under_a_bfloat16_policy(self, mode):
         # The solve runs in float32 when the variables are `bfloat16`.
         model, config = _tiny_model(mode, dtype="bfloat16")

@@ -28,7 +28,7 @@ class AWQConfigTest(testing.TestCase):
         self.assertEqual(config.mode, "awq")
 
     def test_config_invalid_calibration_batch_size(self):
-        for value in (0, -4):
+        for value in (0, -4, 0.5, 2.0):
             with self.assertRaisesRegex(
                 ValueError, "calibration_batch_size must be a positive"
             ):

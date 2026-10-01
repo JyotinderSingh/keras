@@ -150,31 +150,6 @@ def get_dataloader(
     return samples.astype(np.int32)[:, None, :]
 
 
-def _stack_calibration_batch(samples):
-    """Stacks a list of per-sample calibration activations into a single batch.
-
-    Each element may be a 2D `[sequence, features]` or 3D
-    `[1, sequence, features]` tensor. Every element is normalized to a leading
-    batch axis of size 1 and concatenated along axis 0, producing a
-    `[batch, sequence, features]` tensor that can be run through a block in a
-    single forward pass.
-
-    Args:
-        samples: List of per-sample activation tensors.
-
-    Returns:
-        A single `[batch, sequence, features]` tensor.
-    """
-    normalized = []
-    for sample in samples:
-        if ops.ndim(sample) == 2:
-            sample = ops.expand_dims(sample, axis=0)
-        normalized.append(sample)
-    if len(normalized) == 1:
-        return normalized[0]
-    return ops.concatenate(normalized, axis=0)
-
-
 def find_layers_in_block(block):
     """
     Finds all Dense and EinsumDense layers in a transformer block.
@@ -307,17 +282,19 @@ class CalibrationRun:
     `CalibrationStrategy` creates the run for it (`calibrate`). The run
     materializes the activations behind the prefix layers once, then
     walks the blocks in order. For each block it builds a calibrator per
-    layer, streams the block's inputs into them in batches, quantizes the
-    layers in execution-order stages ("true sequential": after a stage is
-    quantized, the later stages' statistics are re-estimated on the
+    layer this mode left pending, from the layer's own
+    `quantization_config`, streams the block's inputs into them, quantizes
+    the layers in execution-order stages ("true sequential": after a stage
+    is quantized, the later stages' statistics are re-estimated on the
     quantized upstream activations), and runs the calibrated block to
-    produce the next block's inputs.
+    produce the next block's inputs. The activations are kept as the
+    batches the blocks run on. A run with no pending layer does nothing.
 
     Args:
         strategy: The `CalibrationStrategy` of the mode. It supplies the
             calibrator class.
         config: The mode's config. It sets the number of samples and the
-            batch size of the run, and every calibrator solves with it.
+            batch size of the run.
         structure: Dict with keys `"pre_block_layers"` and
             `"sequential_blocks"`.
         filters: Optional filters that exclude layers from quantization.
@@ -325,7 +302,6 @@ class CalibrationRun:
 
     def __init__(self, strategy, config, structure, filters=None):
         self.strategy = strategy
-        self.config = config
         self.filters = filters
         self.pre_block_layers = structure.get("pre_block_layers", [])
         self.blocks = structure.get("sequential_blocks", [])
@@ -335,7 +311,7 @@ class CalibrationRun:
                 "quantize."
             )
         self.num_samples = config.num_samples
-        self.batch_size = max(1, int(config.calibration_batch_size))
+        self.batch_size = int(config.calibration_batch_size)
         # Layers whose statistics saw too few calibration tokens relative
         # to their input width, collected across all blocks for a single
         # summary warning.
@@ -347,6 +323,9 @@ class CalibrationRun:
         Args:
             dataloader: An iterable of token batches for the prefix layers.
         """
+        if not any(self._pending_layers(block) for block in self.blocks):
+            logging.info("No layers are pending calibration. Skipping.")
+            return
         logging.info("Starting model quantization...")
         inputs = self._prefix_outputs(dataloader)
         progbar = keras_utils.Progbar(target=len(self.blocks))
@@ -361,7 +340,8 @@ class CalibrationRun:
         logging.info("Quantization process complete.")
 
     def _prefix_outputs(self, dataloader):
-        # The pre-block layers run one sample at a time.
+        # The pre-block layers run one sample at a time; their outputs are
+        # stacked into the batches the blocks run on.
         outputs = []
         for batch in dataloader:
             batch = ops.convert_to_tensor(batch, dtype="int32")
@@ -369,32 +349,35 @@ class CalibrationRun:
                 batch = layer(batch)
             outputs.append(batch)
         self.num_samples = min(self.num_samples, len(outputs))
-        return outputs[: self.num_samples]
-
-    def _batches(self, inputs):
-        # The blocks run on batches of `batch_size` samples.
-        for start in range(0, self.num_samples, self.batch_size):
-            yield _stack_calibration_batch(
-                inputs[start : start + self.batch_size]
-            )
+        outputs = outputs[: self.num_samples]
+        return [
+            ops.concatenate(outputs[start : start + self.batch_size], axis=0)
+            for start in range(0, self.num_samples, self.batch_size)
+        ]
 
     def _sweep(self, block, layers, calibrators, inputs, execution_trace=None):
         with stream_inputs(layers, calibrators, execution_trace):
-            for batch in self._batches(inputs):
+            for batch in inputs:
                 _ = block(batch)
 
-    def _block_layers(self, block):
+    def _pending_layers(self, block):
+        # Only the layers this mode left pending: a layer quantized in
+        # another mode, or already calibrated, has no float kernel to solve.
         return {
             name: layer
             for name, layer in find_layers_in_block(block).items()
-            if should_quantize_layer(layer, self.filters)
+            if layer.quantization_mode == self.strategy.name
+            and layer.calibration_pending
+            and should_quantize_layer(layer, self.filters)
         }
 
     def _calibrator(self, layer):
-        return self.strategy.calibrator_cls(layer, self.config)
+        # The layer's own config, which `build` allocated its variables
+        # from, so the solve and the packing agree.
+        return self.strategy.calibrator_cls(layer, layer.quantization_config)
 
     def _calibrate_block(self, block_idx, block, inputs):
-        layers = self._block_layers(block)
+        layers = self._pending_layers(block)
         if not layers:
             logging.info(
                 f"  No quantizable layers found in block {block_idx}. Skipping."
@@ -442,15 +425,14 @@ class CalibrationRun:
             self.undersampled.append((name, tokens, rows))
 
     def _next_inputs(self, block, inputs):
-        # The first output of a block that returns several, split back into
-        # samples.
+        # Each batch's output goes to the next block as it is: the first
+        # output of a block that returns several.
         next_inputs = []
-        for batch in self._batches(inputs):
+        for batch in inputs:
             output = block(batch)
             if isinstance(output, (list, tuple)):
                 output = output[0]
-            for sample_idx in range(ops.shape(batch)[0]):
-                next_inputs.append(output[sample_idx])
+            next_inputs.append(output)
         return next_inputs
 
     def _warn_undersampled(self):

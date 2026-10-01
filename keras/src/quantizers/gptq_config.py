@@ -1,17 +1,19 @@
+import numbers
+
 from keras.src.api_export import keras_export
 from keras.src.quantizers.quantization_config import QuantizationConfig
 
 
 @keras_export("keras.quantizers.GPTQConfig")
 class GPTQConfig(QuantizationConfig):
-    """Configuration class for the GPTQ (Gradient-based Post-Training
+    """Configuration class for the GPTQ (Accurate Post-Training
     Quantization) algorithm.
 
     GPTQ is a post-training quantization method that quantizes neural network
     weights to lower precision (e.g., 4-bit) while minimizing the impact on
-    model accuracy. It works by analyzing the Hessian matrix of the loss
-    function with respect to the weights and applying optimal quantization
-    that preserves the most important weight values.
+    model accuracy. It accumulates the Hessian of each layer's inputs over
+    calibration data and quantizes the weights one column at a time,
+    correcting the columns still to come for the error already made.
 
     **When to use GPTQ:**
     - You want to reduce model size and memory usage
@@ -170,7 +172,10 @@ class GPTQConfig(QuantizationConfig):
             )
         if num_samples <= 0:
             raise ValueError("num_samples must be a positive integer.")
-        if calibration_batch_size <= 0:
+        if (
+            not isinstance(calibration_batch_size, numbers.Integral)
+            or calibration_batch_size <= 0
+        ):
             raise ValueError(
                 "calibration_batch_size must be a positive integer."
             )
@@ -229,6 +234,6 @@ class GPTQConfig(QuantizationConfig):
         """Returns the dtype policy string for this configuration.
 
         Returns:
-            A string representing the dtype policy, e.g. "gptq_4bit".
+            A string representing the dtype policy, e.g. "gptq/4/128".
         """
         return f"gptq/{self.weight_bits}/{self.group_size}"
