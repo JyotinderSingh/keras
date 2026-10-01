@@ -1,5 +1,6 @@
 import math
 import os
+from unittest import mock
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from keras.src import ops
 from keras.src import quantizers
 from keras.src import saving
 from keras.src import testing
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
@@ -336,6 +338,25 @@ class EmbeddingTest(test_case.TestCase):
             ValueError, "incompatible with embedding constraints"
         ):
             layer.enable_lora(rank=2)
+
+    def test_mode_without_lora_support_refuses_lora(self):
+        # No lookup mode refuses LoRA today, so int8 stands in for one.
+        strategy = strategy_registry.get_strategy("int8")
+        message = "lora is not currently supported with INT8"
+        with mock.patch.object(strategy, "supports_lora", False):
+            layer = layers.Embedding(input_dim=10, output_dim=16)
+            layer.build()
+            layer.quantize("int8")
+            with self.assertRaisesRegex(NotImplementedError, message):
+                layer.enable_lora(2)
+            self.assertFalse(layer.lora_enabled)
+
+            layer = layers.Embedding(input_dim=10, output_dim=16)
+            layer.build()
+            layer.enable_lora(2)
+            with self.assertRaisesRegex(NotImplementedError, message):
+                layer.quantize("int8")
+            self.assertIsNone(layer.quantization_mode)
 
     def test_enable_lora_when_already_enabled(self):
         layer = layers.Embedding(input_dim=10, output_dim=16)

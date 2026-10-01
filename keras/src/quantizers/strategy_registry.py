@@ -77,6 +77,14 @@ class QuantizationStrategy:
     # (pre-block layers + sequential blocks) before mutating any layer.
     requires_layer_structure = False
 
+    # Whether a layer quantized with this mode can enable LoRA.
+    supports_lora = True
+
+    # The geometry families (`QuantizationGeometry.family`) this mode's math
+    # handles, or `None` for any family. A layer of another family, such as
+    # one that `supports_layer` claims, is refused before it changes.
+    geometry_families = None
+
     # --- Config resolution ------------------------------------------------
 
     def default_config(self):
@@ -155,8 +163,9 @@ class QuantizationStrategy:
         The built-in strategies read the layer through its geometry, so a layer
         that does not define one (a layer still on its own per-mode
         methods, or a custom layer that a registered mode claims through
-        `supports_layer`) is refused here with a clear error rather than
-        failing deeper inside the mode.
+        `supports_layer`), or whose geometry family the mode does not
+        handle (`geometry_families`), is refused here with a clear error
+        rather than failing deeper inside the mode.
 
         Args:
             layer: The layer being quantized.
@@ -170,6 +179,15 @@ class QuantizationStrategy:
                 f"Layer {layer.__class__.__name__} does not define a "
                 f"quantization geometry, so mode '{self.name}' cannot be "
                 "applied to it."
+            )
+        if (
+            self.geometry_families is not None
+            and geometry.family not in self.geometry_families
+        ):
+            raise NotImplementedError(
+                f"Quantization mode '{self.name}' does not support the "
+                f"'{geometry.family}' quantization geometry of layer "
+                f"{layer.__class__.__name__}."
             )
         return geometry
 

@@ -207,10 +207,7 @@ class Dense(Layer):
             raise ValueError(
                 "lora is already enabled. This can only be done once per layer."
             )
-        if self.quantization_mode == "gptq":
-            raise NotImplementedError(
-                "lora is not currently supported with GPTQ quantization."
-            )
+        self._check_lora_supported(self.quantization_mode)
         self._tracker.unlock()
         # `kernel` is the unpacked kernel in its own shape whatever the
         # quantization mode, so its first dimension is the input dimension.

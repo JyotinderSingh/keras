@@ -1,3 +1,5 @@
+from unittest import mock
+
 import numpy as np
 from absl.testing import parameterized
 
@@ -9,6 +11,8 @@ from keras.src import ops
 from keras.src import testing
 from keras.src.dtype_policies.dtype_policy import QUANTIZATION_MODES
 from keras.src.quantizers import strategy_registry
+from keras.src.quantizers.awq_config import AWQConfig
+from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
 
 
@@ -443,3 +447,69 @@ class QuantizeTransactionTest(testing.TestCase):
         # The layer is still float and still quantizable.
         layer.quantize("int8")
         self.assertEqual(layer.quantization_mode, "int8")
+
+
+class ProjectionOnlyModeTest(testing.TestCase):
+    """A mode written for projections refuses a lookup layer it claims."""
+
+    @parameterized.named_parameters(
+        ("float8", "float8"),
+        ("ternary", "ternary"),
+        ("gptq", "gptq"),
+        ("awq", "awq"),
+    )
+    def test_claimed_lookup_layer_is_refused(self, mode):
+        config = None
+        if mode == "gptq":
+            config = GPTQConfig(dataset=None, tokenizer=None)
+        elif mode == "awq":
+            config = AWQConfig(dataset=None, tokenizer=None)
+        layer = layers.Embedding(10, 8)
+        layer.build()
+        strategy = strategy_registry.get_strategy(mode)
+        with mock.patch.object(strategy, "supports_layer", return_value=True):
+            with self.assertRaisesRegex(
+                NotImplementedError, "'lookup' quantization geometry"
+            ):
+                layer.quantize(mode, config=config)
+        # Refused before the layer changes.
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+
+    def test_ternary_refuses_a_claimed_einsum_layer(self):
+        layer = layers.EinsumDense("ab,bc->ac", output_shape=4)
+        layer.build((None, 3))
+        strategy = strategy_registry.get_strategy("ternary")
+        with mock.patch.object(strategy, "supports_layer", return_value=True):
+            with self.assertRaisesRegex(
+                NotImplementedError, "only a `Dense` kernel"
+            ):
+                layer.quantize("ternary")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+
+    def test_float8_build_refuses_a_claimed_lookup_layer(self):
+        # A layer built from a float8 policy, as on load.
+        strategy = strategy_registry.get_strategy("float8")
+        with mock.patch.object(strategy, "supports_layer", return_value=True):
+            layer = layers.Embedding(10, 8, dtype="float8_from_float32")
+            with self.assertRaisesRegex(
+                NotImplementedError, "'lookup' quantization geometry"
+            ):
+                layer.build()
+
+    def test_model_quantize_skips_claimed_lookup_layer(self):
+        model = models.Sequential(
+            [
+                layers.Input((3,), dtype="int32"),
+                layers.Embedding(10, 8, name="emb"),
+                layers.Dense(4, name="proj"),
+            ]
+        )
+        strategy = strategy_registry.get_strategy("float8")
+        with mock.patch.object(strategy, "supports_layer", return_value=True):
+            model.quantize("float8")
+        self.assertIsNone(model.get_layer("emb").quantization_mode)
+        self.assertEqual(model.get_layer("proj").quantization_mode, "float8")
+        model(np.array([[1, 2, 3]]))

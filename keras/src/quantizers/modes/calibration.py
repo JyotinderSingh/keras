@@ -22,8 +22,13 @@ from keras.src.quantizers.strategy_registry import QuantizationStrategy
 class CalibrationStrategy(QuantizationStrategy):
     """A post-training strategy whose values arrive from a calibration pass."""
 
+    geometry_families = ("projection",)
     requires_config = True
     requires_layer_structure = True
+    # Not supported yet: the calibration forward has no term for a LoRA
+    # update, and a merged save needs a re-quantization onto the
+    # calibrated grid, which these modes do not have (`encode`).
+    supports_lora = False
 
     def quantize(self, layer, config):
         # The quantized values arrive later, so this only allocates the
