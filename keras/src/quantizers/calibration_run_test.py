@@ -75,41 +75,27 @@ class TransformerBlock(layers.Layer):
         return self.dense(inputs)
 
 
-def build_all_tokens_strings(dataset, tokenizer, eos_id=None):
-    pieces = []
-    for i, s in enumerate(dataset):
-        toks = np.asarray(tokenizer.tokenize(s), dtype=np.int32).reshape(-1)
-        pieces.append(toks)
-        if eos_id is not None and i < len(dataset) - 1:
-            pieces.append(np.array([eos_id], dtype=np.int32))
+def build_all_tokens_strings(dataset, tokenizer):
+    pieces = [
+        np.asarray(tokenizer.tokenize(s), dtype=np.int32).reshape(-1)
+        for s in dataset
+    ]
     return np.concatenate(pieces, axis=0).astype(np.int32, copy=False)
-
-
-def sliding_windows(x, L):
-    return np.lib.stride_tricks.sliding_window_view(x, L)
 
 
 @pytest.mark.requires_trainable_backend
 class TestCalibrationCore(testing.TestCase):
-    @parameterized.named_parameters(
-        [("strided", "strided"), ("linspace", "linspace"), ("random", "random")]
-    )
-    def test_shape_and_dtype_strings(self, sampling):
+    def test_shape_and_dtype_strings(self):
         """Test the shape and dtype of the output for string inputs."""
         tok = MockTokenizer()
         dataset = ["a b c d e f g", "h i j k"]
         seq_len, n = 5, 7
 
-        out = get_dataloader(
-            tok, seq_len, dataset, num_samples=n, sampling=sampling, seed=123
-        )
+        out = get_dataloader(tok, seq_len, dataset, num_samples=n)
         self.assertEqual(out.shape, (n, 1, seq_len))
         self.assertEqual(out.dtype, np.int32)
 
-    @parameterized.named_parameters(
-        [("strided", "strided"), ("linspace", "linspace"), ("random", "random")]
-    )
-    def test_shape_and_dtype_pretokenized(self, sampling):
+    def test_shape_and_dtype_pretokenized(self):
         """Test the shape and dtype of the output for pre-tokenized inputs."""
         tok = MockTokenizer()
         # Pre-tokenized inputs; mixed shapes (1, L) and (L,)
@@ -120,74 +106,23 @@ class TestCalibrationCore(testing.TestCase):
         tok = MockTokenizer()
         seq_len, n = 3, 4
 
-        out = get_dataloader(
-            tok, seq_len, seqs, num_samples=n, sampling=sampling, seed=7
-        )
+        out = get_dataloader(tok, seq_len, seqs, num_samples=n)
         self.assertEqual(out.shape, (n, 1, seq_len))
         self.assertEqual(out.dtype, np.int32)
 
     def test_strided_is_deterministic_for_same_args(self):
         tok = MockTokenizer()
         dataset = ["a b c d e", "f g h i j k"]
-        out1 = get_dataloader(
-            tok, 4, dataset, num_samples=6, sampling="strided", seed=99
-        )
-        out2 = get_dataloader(
-            tok, 4, dataset, num_samples=6, sampling="strided", seed=99
-        )
+        out1 = get_dataloader(tok, 4, dataset, num_samples=6)
+        out2 = get_dataloader(tok, 4, dataset, num_samples=6)
         self.assertTrue(ops.all(ops.equal(out1, out2)))
 
-    def test_random_reproducibility_by_seed(self):
+    def test_windows_are_contiguous_runs_of_the_stream(self):
         tok = MockTokenizer()
-        dataset = ["a b c d e", "f g h i j k"]
-        a = get_dataloader(
-            tok, 4, dataset, num_samples=6, sampling="random", seed=123
-        )
-        b = get_dataloader(
-            tok, 4, dataset, num_samples=6, sampling="random", seed=123
-        )
-        c = get_dataloader(
-            tok, 4, dataset, num_samples=6, sampling="random", seed=124
-        )
-        self.assertTrue(ops.all(ops.equal(a, b)))
-        self.assertFalse(ops.all(ops.equal(a, c)))
-
-    def test_linspace_windows_match_expected(self):
-        tok = MockTokenizer()
-        dataset = ["aa bb cc dd", "ee ff gg"]
-        seq_len, n = 3, 5
-        eos_id = None
-
-        all_tokens = build_all_tokens_strings(dataset, tok, eos_id=eos_id)
-        max_start = all_tokens.size - seq_len
-        expected_starts = np.linspace(0, max_start, n, dtype=np.int64)
-
-        expected = sliding_windows(all_tokens, seq_len)[expected_starts]
-        got = get_dataloader(
-            tok, seq_len, dataset, num_samples=n, sampling="linspace"
-        )
-        self.assertTrue(
-            ops.all(ops.equal(got[:, 0, :], expected.astype(np.int32)))
-        )
-
-    def test_strided_override_respected(self):
-        """Tests that strided windows are disjoint and cover the input."""
-        tok = MockTokenizer()
-        # 20 tokens total
-        # with seq_len=4 and stride=4, we expect disjoint chunks
-        # in order (modulo offset)
         dataset = [" ".join([f"t{i}" for i in range(20)])]
-        seq_len, n, stride = 4, 5, 4
+        seq_len, n = 4, 5
 
-        out = get_dataloader(
-            tok,
-            seq_len,
-            dataset,
-            num_samples=n,
-            sampling="strided",
-            stride=stride,
-            seed=0,
-        )
+        out = get_dataloader(tok, seq_len, dataset, num_samples=n)
 
         # Validate that each sample is a contiguous run
         # of length seq_len from the flattened stream
@@ -197,31 +132,6 @@ class TestCalibrationCore(testing.TestCase):
             # (This is a soft check; exact start positions depend on offset.)
             joined = " ".join(map(str, s.tolist()))
             self.assertIn(joined, " ".join(map(str, flat.tolist())))
-
-    def test_eos_insertion_is_present_in_some_window_with_linspace(self):
-        tok = MockTokenizer()
-        dataset = ["aa aa", "bb bb"]  # len = 5 + 1(EOS) + 5 = 11
-        eos = 9999
-        seq_len = 3
-        n = 3
-
-        out = get_dataloader(
-            tok,
-            seq_len,
-            dataset,
-            num_samples=n,
-            sampling="linspace",
-            eos_id=eos,
-        )
-
-        # linspace starts -> [0, 4, 8]; the middle window [4:7]
-        # includes EOS at 5
-        windows = out[:, 0, :]
-        self.assertTrue(
-            np.any(np.any(windows == eos, axis=1)),
-            "Expected EOS to appear in at least one sampled window with "
-            "linspace.",
-        )
 
     def test_get_dataloader_error_scenarios(self):
         """Tests error cases for get_dataloader."""
@@ -635,7 +545,7 @@ class CalibrationRunTest(testing.TestCase):
         for dense in denses:
             self.assertIsNone(dense.quantization_mode)
         run.run()
-        self.assertEqual(run.num_samples, 3)
+        self.assertEqual(len(run.dataloader), 3)
         self.assertEqual(run.quantized, denses)
         for dense in denses:
             _assert_calibrated(self, dense, mode)

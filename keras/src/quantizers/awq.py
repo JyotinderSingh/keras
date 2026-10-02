@@ -45,7 +45,6 @@ import functools
 
 from keras.src import ops
 from keras.src.quantizers.calibrator import Calibrator
-from keras.src.quantizers.calibrator import accumulate_hessian
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_sz_map
 from keras.src.quantizers.quantizers import quantize_with_sz_map
@@ -359,8 +358,9 @@ def awq_quantize_matrix(
 class AWQCalibrator(Calibrator):
     """AWQ calibrator for one layer: the activation statistics of its inputs.
 
-    It accumulates the per-channel mean of `|x|` and GPTQ's Hessian
-    `2 mean(x x^T)`, one of each per problem of the contraction view.
+    It accumulates the per-channel mean of `|x|` beside the Hessian
+    `2 mean(x x^T)` of every calibrator, one of each per problem of the
+    contraction view.
 
     Args:
         strategy: The `awq` mode's `CalibrationStrategy`.
@@ -374,25 +374,17 @@ class AWQCalibrator(Calibrator):
         self.activation_magnitudes = ops.zeros(
             self._per_problem((self.rows,)), dtype="float32"
         )
-        self.hessian = ops.zeros(
-            self._per_problem((self.rows, self.rows)), dtype="float32"
-        )
 
-    def observe(self, inputs):
-        """Updates the running means of `|x|` and of the Hessian."""
-        x = self._inputs_view(inputs)
+    def _observe(self, x):
+        # mean <- mean + (batch_mean - mean) * n / (count + n)
         num_new_samples = int(ops.shape(x)[-2])
         total_samples = self.num_samples + num_new_samples
-
-        # mean <- mean + (batch_mean - mean) * n / (count + n)
         batch_mean = ops.mean(ops.abs(x), axis=-2)
         delta = ops.subtract(batch_mean, self.activation_magnitudes)
         self.activation_magnitudes = ops.add(
             self.activation_magnitudes,
             ops.multiply(delta, num_new_samples / total_samples),
         )
-        self.hessian = accumulate_hessian(self.hessian, x, self.num_samples)
-        self.num_samples = total_samples
 
     def _solve(self, weights, index):
         # The references skip clipping the query and key projections: the
@@ -410,4 +402,4 @@ class AWQCalibrator(Calibrator):
             group_size=self.config.group_size,
             apply_clip=apply_clip,
         )
-        return codes, scale, zero, g_idx, {"awq_scales": awq_scales}
+        return codes, scale, zero, g_idx, awq_scales

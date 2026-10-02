@@ -3,9 +3,10 @@
 A `CalibrationRun` creates one `Calibrator` per float layer of a block,
 passes every input the layer sees during the calibration sweeps to
 `observe`, then calls `quantize`, which solves for the layer's codes and
-swaps them in through the mode's strategy. `GPTQCalibrator` (a Hessian) and
-`AWQCalibrator` (activation magnitudes and a Hessian) are the calibrators
-of the built-in modes.
+swaps them in through the mode's strategy. Every calibrator accumulates
+the Hessian of the layer's inputs. `GPTQCalibrator` solves with it;
+`AWQCalibrator` also accumulates activation magnitudes and scores its
+searches with the Hessian.
 """
 
 from keras.src import ops
@@ -18,14 +19,14 @@ def accumulate_hessian(hessian, x, num_samples):
     GPTQ solves with this Hessian and AWQ scores its searches with it.
 
     Args:
-        hessian: The Hessian of the `num_samples` rows seen so far, with a
-            leading problem axis when `x` has one.
-        x: The batch laid out by the contraction view, `(rows, features)`
-            or `(batch, rows, features)`.
-        num_samples: The number of rows `hessian` covers.
+        hessian: The Hessian of the `num_samples` samples seen so far, with
+            a leading problem axis when `x` has one.
+        x: The batch laid out by the contraction view, `(samples, rows)`
+            or `(batch, samples, rows)`.
+        num_samples: The number of samples `hessian` covers.
 
     Returns:
-        The Hessian of the `num_samples` rows and the rows of `x`.
+        The Hessian of the `num_samples` samples and the samples of `x`.
     """
     total_samples = num_samples + int(ops.shape(x)[-2])
     gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
@@ -46,14 +47,14 @@ class Calibrator:
     """Per-layer statistics and solve of one calibration mode.
 
     The constructor resolves the layer's `ContractionView`. `rows` is the
-    number of contracted features of one input sample, `columns` the
-    number of outputs, and `batch` the number of independent problems
-    that a kernel axis shared with the inputs splits the kernel into. A
-    statistic has a leading problem axis only when `batch > 1`.
-    `num_samples` counts the input rows observed so far, per problem.
-    Subclasses implement `observe` and `_solve`, and a subclass that sets
-    `warn_tokens_per_row` also words the warning in its classmethod
-    `undersampling_warning(layers)`.
+    number of contracted features of one input sample, and `batch` the
+    number of independent problems that a kernel axis shared with the
+    inputs splits the kernel into. A statistic has a leading problem axis
+    only when `batch > 1`. `num_samples` counts the input samples observed
+    so far, per problem, and `hessian` is their `2 mean(x x^T)`.
+    Subclasses implement `_solve` and can accumulate statistics of their
+    own in `_observe`. A subclass that sets `warn_tokens_per_row` also
+    words the warning in its classmethod `undersampling_warning(layers)`.
 
     Args:
         strategy: The `CalibrationStrategy` of the mode the calibrator
@@ -64,8 +65,8 @@ class Calibrator:
             and the swap builds the layer's variables from it.
     """
 
-    # Warn after the run when a layer saw fewer input rows than this per
-    # input feature; `None` never warns.
+    # Warn after the run when a layer saw fewer calibration tokens than
+    # this per kernel row (input feature); `None` never warns.
     warn_tokens_per_row = None
 
     def __init__(self, strategy, layer, config):
@@ -84,11 +85,23 @@ class Calibrator:
         self.view = geometry.contraction_view()
         self.batch = self.view.batch
         self.rows = self.view.rows
-        self.columns = self.view.columns
+        self.hessian = ops.zeros(
+            self._per_problem((self.rows, self.rows)), dtype="float32"
+        )
 
     def observe(self, inputs):
         """Accumulates statistics from one batch of the layer's inputs."""
-        raise NotImplementedError
+        x = self._inputs_view(inputs)
+        self._observe(x)
+        self.hessian = accumulate_hessian(self.hessian, x, self.num_samples)
+        self.num_samples += int(ops.shape(x)[-2])
+
+    def _observe(self, x):
+        """Accumulates the mode's own statistics from a laid-out batch.
+
+        `x` is the batch as `_inputs_view` returns it; `num_samples` does
+        not count it yet.
+        """
 
     def _inputs_view(self, inputs):
         """Validates `inputs` and lays them out through the view.
@@ -132,19 +145,18 @@ class Calibrator:
             self._solve(ops.transpose(kernel[index]), index)
             for index in range(self.batch)
         ]
-        codes, scale, zero, g_idx, extra = self._stack_problems(results)
         self.strategy.write_back(
-            self.layer, self.config, codes, scale, zero, g_idx, **extra
+            self.layer, self.config, *self._stack_problems(results)
         )
 
     def _solve(self, weights, index):
         """Quantizes `weights`, problem `index`'s `[out, in]` kernel.
 
         Returns:
-            `(codes, scale, zero, g_idx, extra)`: the codes `[out, in]`, the
-            scale and zero point `[out, n_groups]`, the group index `[in]`,
-            and a dict of the mode's extra calibrated values, one per input
-            row, which `write_back` receives as keyword arguments.
+            `(codes, scale, zero, g_idx, input_scales)`: the codes
+            `[out, in]`, the scale and zero point `[out, n_groups]`, the
+            group index `[in]`, and the per-input-row scales `[in]` that
+            multiplied the weights before quantization, or `None`.
         """
         raise NotImplementedError
 
@@ -157,20 +169,19 @@ class Calibrator:
         `[n_groups, out]`, so the forward pass never transposes. Each
         problem's groups are numbered after the previous problem's.
         """
-        codes, scales, zeros, group_indices = [], [], [], []
-        extras = {}
-        for index, (code, scale, zero, g_idx, extra) in enumerate(results):
+        codes, scales, zeros, group_indices, input_scales = [], [], [], [], []
+        for index, (code, scale, zero, g_idx, in_scales) in enumerate(results):
             n_groups = ops.shape(scale)[1]
             codes.append(ops.transpose(code))
             scales.append(ops.transpose(scale))
             zeros.append(ops.transpose(zero))
             group_indices.append(ops.add(g_idx, index * n_groups))
-            for name, value in extra.items():
-                extras.setdefault(name, []).append(value)
+            if in_scales is not None:
+                input_scales.append(in_scales)
         return (
             ops.concatenate(codes, axis=0),
             ops.concatenate(scales, axis=0),
             ops.concatenate(zeros, axis=0),
             ops.concatenate(group_indices, axis=0),
-            {name: ops.concatenate(v, axis=0) for name, v in extras.items()},
+            ops.concatenate(input_scales, axis=0) if input_scales else None,
         )

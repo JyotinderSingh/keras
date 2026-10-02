@@ -1,11 +1,12 @@
-"""Shared chassis for the calibration-based quantization modes.
+"""The calibration-based quantization modes, GPTQ and AWQ.
 
 GPTQ and AWQ allocate the same family of variables, run the same
 dequantize-and-contract forward pass, and speak the same three-part policy
-grammar; they differ only in the code bit-width (which fixes how the
-kernel is packed), in one extra AWQ variable and its inverse scaling, in
-a handful of message fragments and, for the calibration run, in the
-calibrator class. Those differences are the hooks below.
+grammar. They differ in the code bit-width (which fixes how the kernel is
+packed), in the calibrator class, and in one extra AWQ variable of input
+scales that the quantized weight divides out. `GPTQStrategy` and
+`AWQStrategy`, at the end of this module, declare these differences as
+class attributes.
 
 A LoRA update trains against the dequantized weight, as it does for int8
 and int4: the forward pass adds it to the contraction, the calibrators
@@ -18,7 +19,13 @@ import math
 import warnings
 
 from keras.src import ops
+from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
+from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
+from keras.src.quantizers.awq import AWQCalibrator
+from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibration_run import CalibrationRun
+from keras.src.quantizers.gptq import GPTQCalibrator
+from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
@@ -144,6 +151,11 @@ class CalibrationStrategy(QuantizationStrategy):
 
     # --- Variables --------------------------------------------------------
 
+    # Name of the variable of per-input-row scales that multiplied the
+    # weights before quantization, or `None`. The quantized weight divides
+    # them back out (`QuantizedWeight.input_scales`).
+    input_scales_name = None
+
     def build(self, layer, input_shape, config):
         """Allocates the quantized kernel and quantization parameters.
 
@@ -193,21 +205,30 @@ class CalibrationStrategy(QuantizationStrategy):
             dtype="uint8",
             trainable=False,
         )
-        self._build_extra_variables(layer, rows)
+        if self.input_scales_name is not None:
+            setattr(
+                layer,
+                self.input_scales_name,
+                layer.add_weight(
+                    name=self.input_scales_name,
+                    shape=(rows,),
+                    initializer="ones",
+                    trainable=False,
+                ),
+            )
         layer.g_idx = add_group_index(layer, rows)
-
-    def _build_extra_variables(self, layer, rows):
-        """Creates any mode-specific variables, after the zero point."""
-
-    def _input_scales(self, layer):
-        """Per-input-row scales divided out of the dequantized kernel."""
-        del layer
-        return None
 
     # --- Calibration state ------------------------------------------------
 
     def write_back(
-        self, layer, config, codes, scale, zero_point, g_idx, **extra
+        self,
+        layer,
+        config,
+        codes,
+        scale,
+        zero_point,
+        g_idx,
+        input_scales=None,
     ):
         """Swaps a float layer's kernel for its calibrated values.
 
@@ -216,6 +237,8 @@ class CalibrationStrategy(QuantizationStrategy):
         deletes the float kernel and names the policy after `config`.
         `codes` are the unpacked codes in the kernel's `[in, out]`
         orientation; they are packed here as `build` lays out the variable.
+        `input_scales` go to the `input_scales_name` variable of a mode
+        that has one.
         """
 
         def swap(layer, config):
@@ -229,20 +252,12 @@ class CalibrationStrategy(QuantizationStrategy):
             layer.kernel_scale.assign(scale)
             layer.kernel_zero.assign(zero_point)
             layer.g_idx.assign(g_idx)
-            self._assign_extra_variables(layer, **extra)
+            if self.input_scales_name is not None:
+                getattr(layer, self.input_scales_name).assign(input_scales)
             # Last, so a swap that raises keeps the float kernel.
             del layer._kernel
 
         layer._swap_quantized(self, config, swap)
-
-    def _assign_extra_variables(self, layer, **extra):
-        """Assigns any mode-specific calibrated values."""
-        del layer
-        if extra:
-            raise TypeError(
-                f"Quantization mode '{self.name}' has no extra calibrated "
-                f"variables. Received: {sorted(extra)}"
-            )
 
     # --- LoRA merge -------------------------------------------------------
 
@@ -318,7 +333,11 @@ class CalibrationStrategy(QuantizationStrategy):
             shape=geometry.weight_shape,
             axis=0,
             permutation=view.kernel_permutation,
-            input_scales=self._input_scales(layer),
+            input_scales=(
+                getattr(layer, self.input_scales_name)
+                if self.input_scales_name is not None
+                else None
+            ),
         )
 
     # --- Forward pass -----------------------------------------------------
@@ -329,3 +348,31 @@ class CalibrationStrategy(QuantizationStrategy):
         y = geometry.contract(inputs, W)
         y = geometry.add_lora_delta(inputs, y)
         return apply_bias_activation(layer, y)
+
+
+class GPTQStrategy(CalibrationStrategy):
+    """GPTQ post-training quantization (calibration-based, 2/3/4/8-bit).
+
+    GPTQ quantizes the kernel one column at a time and corrects the columns
+    still to come with the inverse Hessian of the layer's inputs.
+    """
+
+    name = "gptq"
+    config_cls = GPTQConfig
+    policy_cls = GPTQDTypePolicy
+    calibrator_cls = GPTQCalibrator
+
+
+class AWQStrategy(CalibrationStrategy):
+    """AWQ post-training quantization (activation-aware, 4-bit).
+
+    AWQ uses 4-bit quantization with per-channel AWQ scales that protect
+    salient weights based on activation magnitudes.
+    """
+
+    name = "awq"
+    config_cls = AWQConfig
+    policy_cls = AWQDTypePolicy
+    calibrator_cls = AWQCalibrator
+    # Per-input-row scales from the activation magnitudes.
+    input_scales_name = "awq_scales"

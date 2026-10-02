@@ -27,7 +27,6 @@ from keras.src.quantizers.quantization_test_utils import (
     tiny_transformer_classifier,
 )
 from keras.src.quantizers.quantization_test_utils import token_dataset
-from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.testing.test_utils import named_product
 
 VOCAB_SIZE = 1000
@@ -87,18 +86,6 @@ def _hessian_calibrator(layer):
     return calibrate_layer(layer, calibration_config("gptq"), solve=False)
 
 
-def _scale_zero_fn(config, compute_dtype="float32"):
-    """The scale and zero rule `GPTQ` binds for a layer of `compute_dtype`."""
-    return functools.partial(
-        compute_quantization_parameters,
-        bits=config.weight_bits,
-        symmetric=config.symmetric,
-        per_channel=config.per_channel,
-        group_size=config.group_size,
-        compute_dtype=compute_dtype,
-    )
-
-
 @pytest.mark.requires_trainable_backend
 class GPTQTest(testing.TestCase):
     def test_initialization_with_dense_layer(self):
@@ -106,14 +93,14 @@ class GPTQTest(testing.TestCase):
 
         calibrator = _hessian_calibrator(mock_layer)
         self.assertEqual(calibrator.rows, 64)
-        self.assertEqual(calibrator.columns, 128)
+        self.assertEqual(calibrator.view.columns, 128)
         self.assertEqual(calibrator.hessian.shape, (64, 64))
 
     def test_initialization_with_einsumdense_3d(self):
         mock_layer = _get_test_layer("EinsumDense", kernel_shape=(64, 4, 32))
         calibrator = _hessian_calibrator(mock_layer)
         self.assertEqual(calibrator.rows, 64)
-        self.assertEqual(calibrator.columns, 4 * 32)
+        self.assertEqual(calibrator.view.columns, 4 * 32)
         self.assertEqual(calibrator.hessian.shape, (64, 64))
 
     def test_update_hessian(self):
@@ -394,31 +381,41 @@ class GPTQTest(testing.TestCase):
     def test_non_positive_definite_hessian_raises(self):
         """A non-positive-definite Hessian is rejected with a clear error.
 
-        `gptq_quantize_matrix` takes an already dampened Hessian, and
-        `GPTQ.quantize` guarantees positive definiteness by adding
-        `hessian_damping * mean(diag(H))` to the diagonal before calling.
-        A zero or negative diagonal entry breaks that contract, and the
+        `gptq_quantize_matrix` revives a zero diagonal entry (an input
+        that never fired) and adds `hessian_damping * mean(diag(H))` to
+        the diagonal, which keeps the Hessian of real inputs positive
+        definite. A negative diagonal entry breaks that contract, and the
         Cholesky factorization must surface it as a `ValueError` on every
         backend rather than silently propagating NaNs.
         """
         out_features, in_features = 4, 4
         weights = ops.ones((out_features, in_features), dtype="float32")
-        config = GPTQConfig(
-            dataset=None, tokenizer=None, weight_bits=4, group_size=-1
-        )
-        compute_scale_zero = _scale_zero_fn(config)
+        hessian = np.eye(in_features, dtype=np.float32)
+        hessian[2, 2] = -1.0
+        with self.assertRaisesRegex(ValueError, "Cholesky"):
+            gptq_quantize_matrix(
+                weights,
+                ops.convert_to_tensor(hessian),
+                bits=4,
+                blocksize=2,
+                group_size=-1,
+                hessian_damping=0.0,
+            )
 
-        for bad_diagonal in (0.0, -1.0):
-            hessian = np.eye(in_features, dtype=np.float32)
-            hessian[2, 2] = bad_diagonal
-            with self.assertRaisesRegex(ValueError, "Cholesky"):
-                gptq_quantize_matrix(
-                    weights,
-                    ops.convert_to_tensor(hessian),
-                    blocksize=2,
-                    group_size=-1,
-                    compute_scale_zero=compute_scale_zero,
-                )
+    def test_zero_diagonal_is_a_dead_input(self):
+        # An input with a zero Hessian diagonal never fired. The solve
+        # revives it, and its weights land on its group's zero point.
+        weights = ops.ones((4, 4), dtype="float32")
+        hessian = np.eye(4, dtype=np.float32)
+        hessian[2, 2] = 0.0
+        codes, _, zero, g_idx = gptq_quantize_matrix(
+            weights, ops.convert_to_tensor(hessian), bits=4, group_size=2
+        )
+        codes = ops.convert_to_numpy(codes)
+        zero = ops.convert_to_numpy(zero)
+        g_idx = ops.convert_to_numpy(g_idx)
+        self.assertAllEqual(codes[:, 2], zero[:, g_idx[2]])
+        self.assertTrue(np.all(codes[:, 3] != zero[:, g_idx[3]]))
 
     def test_ill_conditioned_hessian_produces_finite_weights(self):
         """Severe ill-conditioning must not produce NaNs or infinities.
@@ -453,20 +450,16 @@ class GPTQTest(testing.TestCase):
         weights = ops.convert_to_tensor(
             rng.normal(size=(6, 4)).astype("float32")
         )
-        config = GPTQConfig(
-            dataset=None, tokenizer=None, weight_bits=W_BITS, group_size=-1
-        )
-        compute_scale_zero = _scale_zero_fn(config)
-
         # blocksize=2 puts the ill-conditioned feature at the start of the
         # second block, so the cross-block error propagation is covered too.
         for blocksize in (2, 4):
             quantized, scale, zero, _ = gptq_quantize_matrix(
                 weights,
                 ops.convert_to_tensor(hessian),
+                bits=W_BITS,
                 blocksize=blocksize,
                 group_size=-1,
-                compute_scale_zero=compute_scale_zero,
+                hessian_damping=0.0,
             )
             for name, tensor in (
                 ("quantized", quantized),
