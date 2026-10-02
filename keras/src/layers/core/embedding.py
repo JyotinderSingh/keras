@@ -301,12 +301,6 @@ class Embedding(Layer):
         )
         return super().from_config(config)
 
-    def _quantization_mode_error(self, mode):
-        return NotImplementedError(
-            "Invalid quantization mode. Expected one of ('int8', 'int4'). "
-            f"Received: quantization_mode={mode}"
-        )
-
     @property
     def variable_serialization_spec(self):
         """Returns a dict mapping quantization modes to variable names in order.
