@@ -4,8 +4,10 @@
 matrix is a change to this table. Every supported pair runs the same
 stages: the life cycle, LoRA, the dtype policy setter, the input
 gradient, the TF SavedModel export and `from_config` with `set_weights`.
-The reversible lookups also run the reverse call with a soft cap. Every
-other pair is refused before the layer changes.
+The reversible lookups also run the reverse call with a soft cap. The
+calibration modes refuse `quantize` on one layer, which stays float, and
+also run through `Model.quantize`. Every other pair is refused before
+the layer changes.
 
 The table holds the third-party layers of `quantization_test_utils`: a
 layer outside Keras that follows the quantization protocol runs every
@@ -501,6 +503,22 @@ class QuantizationConformanceTest(testing.TestCase):
             layer.dtype_policy = name
         self.assertEqual(layer.dtype_policy.name, "float32")
         self.assertIsNone(layer.quantization_mode)
+
+    @parameterized.named_parameters(CALIBRATED_PAIRS)
+    def test_layer_quantize_refuses_calibration_modes(self, mode_name, kind):
+        # A calibration mode needs the run of `Model.quantize`; one layer
+        # on its own is refused and stays float.
+        case = MODES[mode_name]
+        layer = build_layer(kind)
+        before = _snapshot(layer)
+        with self.assertRaisesRegex(ValueError, r"model\.quantize"):
+            layer.quantize(case.mode, config=case.make_config())
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertEqual(len(layer.weights), len(before))
+        for variable, (expected, value) in zip(layer.weights, before):
+            self.assertIs(variable, expected)
+            self.assertAllEqual(variable, value)
 
     @parameterized.named_parameters(PROJECTION_PAIRS)
     @pytest.mark.requires_trainable_backend

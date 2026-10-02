@@ -4,7 +4,6 @@ from keras.src import ops
 from keras.src.ops import linalg
 from keras.src.quantizers.calibrator import Calibrator
 from keras.src.quantizers.calibrator import accumulate_hessian
-from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantizers import compute_quantization_parameters
 from keras.src.quantizers.quantizers import dequantize_with_zero_point
 from keras.src.quantizers.quantizers import quantize_with_zero_point
@@ -273,19 +272,18 @@ class GPTQCalibrator(Calibrator):
     """GPTQ calibrator for one layer: the Hessian of its inputs.
 
     Args:
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the `gptq` mode.
+        strategy: The `gptq` mode's `CalibrationStrategy`.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the `gptq` mode.
         config: `GPTQConfig` instance with quantization parameters.
     """
 
-    mode = "gptq"
     # GPTQ's Hessian is close to singular with fewer calibration tokens
     # than this per input feature.
     warn_tokens_per_row = 4
 
-    def __init__(self, layer, config=None):
-        config = config or GPTQConfig(dataset=None, tokenizer=None)
-        super().__init__(layer, config)
+    def __init__(self, strategy, layer, config):
+        super().__init__(strategy, layer, config)
         self.compute_scale_zero = functools.partial(
             compute_quantization_parameters,
             bits=config.weight_bits,

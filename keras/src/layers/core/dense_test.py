@@ -27,6 +27,18 @@ from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.testing import test_utils
 
 
+def _calibrate(layer, config):
+    """Calibrates the float `layer` in `config.mode` on random inputs.
+
+    The calibrator's solve swaps the layer for the quantized one.
+    """
+    calibrator = calibrate_layer(layer, config, solve=False)
+    rng = np.random.default_rng(0)
+    rows = calibrator.rows
+    calibrator.observe(rng.standard_normal((16, rows)).astype("float32"))
+    calibrator.quantize()
+
+
 class DenseTest(testing.TestCase):
     @parameterized.named_parameters(
         ("int8", "int8", {"axis": 0}, {}),
@@ -906,13 +918,14 @@ class DenseTest(testing.TestCase):
         correctly."""
         layer = layers.Dense(units=16)
         layer.build((None, 8))
-        layer.quantize(
-            "gptq",
-            config=GPTQConfig(
+        _calibrate(
+            layer,
+            GPTQConfig(
                 dataset=None, tokenizer=None, weight_bits=4, group_size=8
             ),
         )
         config = layer.get_config()
+        self.assertIsNone(config["quantization_config"])
         new_layer = layers.Dense.from_config(config)
         new_layer.build((None, 8))
         self.assertEqual(new_layer.quantization_mode, "gptq")
@@ -922,42 +935,17 @@ class DenseTest(testing.TestCase):
         correctly."""
         layer = layers.Dense(units=16)
         layer.build((None, 8))
-        layer.quantize(
-            "awq",
-            config=AWQConfig(
+        _calibrate(
+            layer,
+            AWQConfig(
                 dataset=None, tokenizer=None, group_size=8, num_grid_points=10
             ),
         )
         config = layer.get_config()
+        self.assertIsNone(config["quantization_config"])
         new_layer = layers.Dense.from_config(config)
         new_layer.build((None, 8))
         self.assertEqual(new_layer.quantization_mode, "awq")
-
-    def test_gptq_uncalibrated_save_raises(self):
-        """Saving a GPTQ layer that was never calibrated must raise."""
-        layer = layers.Dense(units=16)
-        layer.build((None, 8))
-        layer.quantize(
-            "gptq",
-            config=GPTQConfig(
-                dataset=None, tokenizer=None, weight_bits=4, group_size=8
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "never been calibrated"):
-            layer.save_own_variables({})
-
-    def test_awq_uncalibrated_save_raises(self):
-        """Saving an AWQ layer that was never calibrated must raise."""
-        layer = layers.Dense(units=16)
-        layer.build((None, 8))
-        layer.quantize(
-            "awq",
-            config=AWQConfig(
-                dataset=None, tokenizer=None, group_size=8, num_grid_points=10
-            ),
-        )
-        with self.assertRaisesRegex(ValueError, "never been calibrated"):
-            layer.save_own_variables({})
 
     def test_int4_kernel_returns_unpacked_form(self):
         """Test that the `kernel` property returns the unpacked int4 kernel."""
@@ -999,11 +987,11 @@ class DenseTest(testing.TestCase):
         self.assertEqual(report.skipped, [(layer.path, report.SKIP_NO_SUPPORT)])
 
     @parameterized.named_parameters(
-        test_utils.named_product(mode=["gptq", "awq"], calibrated=[False, True])
+        test_utils.named_product(mode=["gptq", "awq"], lora_first=[False, True])
     )
-    def test_calibration_modes_enable_lora(self, mode, calibrated):
-        # LoRA trains against the dequantized codes once calibrated, and
-        # against the frozen float kernel while the calibration is pending.
+    def test_calibration_modes_enable_lora(self, mode, lora_first):
+        # LoRA trains against the dequantized codes, whether it is enabled
+        # on the float layer before the calibration or after it.
         if mode == "gptq":
             config = GPTQConfig(dataset=None, tokenizer=None, group_size=4)
         else:
@@ -1012,26 +1000,18 @@ class DenseTest(testing.TestCase):
             )
         layer = layers.Dense(4)
         layer.build((None, 8))
-        layer.quantize(mode, config=config)
-        if calibrated:
-            calibrate_layer(
-                layer, config, np.random.random((16, 8)).astype("float32")
-            )
-        layer.enable_lora(2)
+        if lora_first:
+            layer.enable_lora(2)
+        _calibrate(layer, config)
+        if not lora_first:
+            layer.enable_lora(2)
         self.assertTrue(layer.lora_enabled)
         # bias + the two LoRA factors.
         self.assertLen(layer.trainable_weights, 3)
         num_stored = 4 if mode == "gptq" else 5
-        if calibrated:
-            self.assertFalse(hasattr(layer, "_kernel"))
-            self.assertLen(layer.non_trainable_weights, num_stored)
-            self.assertEqual(tuple(layer.kernel.shape), (8, 4))
-        else:
-            # The float kernel is frozen until `write_back` retires it.
-            self.assertFalse(layer._kernel.trainable)
-            self.assertLen(layer.non_trainable_weights, num_stored + 1)
-            with self.assertRaisesRegex(ValueError, "never been calibrated"):
-                layer.save_own_variables({})
+        self.assertFalse(hasattr(layer, "_kernel"))
+        self.assertLen(layer.non_trainable_weights, num_stored)
+        self.assertEqual(tuple(layer.kernel.shape), (8, 4))
 
     def test_legacy_load_own_variables(self):
         # In previous versions, `load_own_variables` accepted a store with
@@ -1131,7 +1111,7 @@ class DenseTest(testing.TestCase):
         layer = layers.Dense(units=16, dtype="gptq/4/8_from_float32")
         layer.build((None, 8))
         layer.load_own_variables(gptq_store)
-        self.assertFalse(layer.calibration_pending)
+        self.assertFalse(hasattr(layer, "_kernel"))
         self.assertAllClose(layer.bias, gptq_store["0"])
         self.assertAllClose(layer.quantized_kernel, gptq_store["1"])
         self.assertAllClose(layer.kernel_scale, gptq_store["2"])
@@ -1144,7 +1124,7 @@ class DenseTest(testing.TestCase):
         layer = layers.Dense(units=16, dtype="awq/4/8_from_float32")
         layer.build((None, 8))
         layer.load_own_variables(awq_store)
-        self.assertFalse(layer.calibration_pending)
+        self.assertFalse(hasattr(layer, "_kernel"))
         self.assertAllClose(layer.bias, awq_store["0"])
         self.assertAllClose(layer.quantized_kernel, awq_store["1"])
         self.assertAllClose(layer.kernel_scale, awq_store["2"])
@@ -1232,7 +1212,7 @@ class DenseTest(testing.TestCase):
 
                 target = self._build_dense_for_mode(mode)
                 target.load_own_variables(test_utils.positional_store(source))
-                self.assertFalse(target.calibration_pending)
+                self.assertFalse(hasattr(target, "_kernel"))
                 test_utils.assert_serialized_variables_equal(
                     self, source, target
                 )
@@ -1243,31 +1223,11 @@ class DenseTest(testing.TestCase):
                     target(x), ops.matmul(x, weight) + target.bias
                 )
 
-    def test_gptq_awq_load_completes_pending_calibration(self):
-        # A layer quantized but not yet calibrated still holds its float
-        # kernel. Loading a calibrated store installs the codes and retires
-        # the float kernel.
-        configs = {
-            "gptq": GPTQConfig(
-                dataset=None, tokenizer=None, weight_bits=4, group_size=32
-            ),
-            "awq": AWQConfig(dataset=None, tokenizer=None, group_size=32),
-        }
-        for mode, config in configs.items():
+    def test_gptq_awq_unbuilt_layer_reports_no_variables(self):
+        for mode in ("gptq", "awq"):
             with self.subTest(mode=mode):
                 source = self._build_dense_for_mode(mode)
                 test_utils.randomize_serialized_variables(source)
-
-                target = layers.Dense(units=64)
-                target.build((None, 256))
-                target.quantize(mode, config=config)
-                self.assertTrue(target.calibration_pending)
-                target.load_own_variables(test_utils.positional_store(source))
-                self.assertFalse(target.calibration_pending)
-                self.assertFalse(hasattr(target, "_kernel"))
-                test_utils.assert_serialized_variables_equal(
-                    self, source, target
-                )
 
                 # An unbuilt layer reports that it has no variables.
                 unbuilt = layers.Dense(units=64, dtype=source.dtype_policy)
@@ -1300,13 +1260,12 @@ class DenseTest(testing.TestCase):
         kernel."""
         layer = layers.Dense(units=2)
         layer.build((None, 2))
-        layer.quantize(
-            "gptq",
-            config=GPTQConfig(
+        _calibrate(
+            layer,
+            GPTQConfig(
                 dataset=None, tokenizer=None, weight_bits=4, group_size=8
             ),
         )
-        layer.calibration_pending = False  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
             layer.kernel,
@@ -1320,9 +1279,9 @@ class DenseTest(testing.TestCase):
 
         original_kernel_params = ops.prod(layer._kernel.shape)
 
-        layer.quantize(
-            "gptq",
-            config=GPTQConfig(
+        _calibrate(
+            layer,
+            GPTQConfig(
                 dataset=None, tokenizer=None, weight_bits=4, group_size=8
             ),
         )
@@ -1335,13 +1294,12 @@ class DenseTest(testing.TestCase):
         kernel."""
         layer = layers.Dense(units=2)
         layer.build((None, 2))
-        layer.quantize(
-            "awq",
-            config=AWQConfig(
+        _calibrate(
+            layer,
+            AWQConfig(
                 dataset=None, tokenizer=None, group_size=8, num_grid_points=10
             ),
         )
-        layer.calibration_pending = False  # Bypass calibration check
         packed_kernel = layer.quantized_kernel
         self.assertAllClose(
             layer.kernel,
@@ -1355,9 +1313,9 @@ class DenseTest(testing.TestCase):
 
         original_kernel_params = ops.prod(layer._kernel.shape)
 
-        layer.quantize(
-            "awq",
-            config=AWQConfig(
+        _calibrate(
+            layer,
+            AWQConfig(
                 dataset=None, tokenizer=None, group_size=8, num_grid_points=10
             ),
         )

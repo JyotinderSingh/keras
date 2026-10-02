@@ -12,10 +12,10 @@ from keras.src import models
 from keras.src import ops
 from keras.src import testing
 from keras.src.quantizers import strategy_registry
-from keras.src.quantizers.awq_config import AWQConfig
-from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 
 
@@ -267,24 +267,39 @@ class LayerTransitionsTest(testing.TestCase):
         self.assertEqual(layer.quantization_mode, config.mode)
 
     @parameterized.named_parameters(
-        ("int8", "int8", None),
-        ("int4", "int4", None),
-        ("float8", "float8", None),
-        ("ternary", "ternary", None),
-        ("gptq", "gptq", GPTQConfig),
-        ("awq", "awq", AWQConfig),
+        ("int8", "int8"),
+        ("int4", "int4"),
+        ("float8", "float8"),
+        ("ternary", "ternary"),
     )
-    def test_failure_after_the_mode_built_its_variables(self, mode, cls):
+    def test_failure_after_the_mode_built_its_variables(self, mode):
         layer, inputs = _built("dense")
         snapshot = self._snapshot(layer, inputs)
-        config = None
-        if cls is not None:
-            config = cls(dataset=["a"], tokenizer=lambda x: np.zeros((1, 4)))
         with _fail_after_quantize(mode):
             with self.assertRaisesRegex(RuntimeError, "Injected"):
-                layer.quantize(mode, config=config)
+                layer.quantize(mode)
         self.assertUnchanged(layer, inputs, snapshot)
         self.assertIsNone(layer.quantization_mode)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_failure_inside_the_calibration_swap(self, mode):
+        # The calibrator's write-back swaps the float layer through the
+        # same transaction as `Layer.quantize`. The failure comes after the
+        # swap assigned the codes and deleted the float kernel.
+        layer, inputs = _built("dense")
+        snapshot = self._snapshot(layer, inputs)
+        config = calibration_config(mode, group_size=-1)
+        calibrator = calibrate_layer(layer, config, inputs, solve=False)
+        with mock.patch.object(
+            type(layer),
+            "_finalize_quantization_policy",
+            side_effect=RuntimeError("Injected failure."),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Injected"):
+                calibrator.quantize()
+        self.assertUnchanged(layer, inputs, snapshot)
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
 
     @pytest.mark.skipif(
         backend.backend() != "tensorflow",

@@ -28,9 +28,10 @@ def _config(mode, **kwargs):
 
 
 def _calibrate(layer, mode, x, **kwargs):
-    """Quantizes `layer` with `mode` and calibrates it on `x`.
+    """Calibrates the float `layer` with `mode` on `x`.
 
-    Returns the calibrator.
+    The calibrator's solve swaps the layer for the quantized one. Returns
+    the calibrator.
     """
     return calibrate_layer(layer, _config(mode, **kwargs), x)
 
@@ -52,6 +53,62 @@ def _dense(kernel):
 
 def _dequantized(layer):
     return ops.convert_to_numpy(layer._quantized_weight().dequantize("float32"))
+
+
+class CalibrationSwapTest(testing.TestCase):
+    """A calibration mode quantizes a float layer in one step."""
+
+    @parameterized.named_parameters(named_product(mode=MODES))
+    def test_one_layer_is_not_quantized_on_its_own(self, mode):
+        rng = np.random.default_rng(0)
+        layer, _ = _make_layer("dense", rng)
+        weights = [ops.convert_to_numpy(w) for w in layer.weights]
+        with self.assertRaisesRegex(
+            ValueError, rf"model\.quantize\('{mode}', config=\.\.\.\)"
+        ):
+            layer.quantize(mode, config=_config(mode))
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+        self.assertEqual(len(layer.weights), len(weights))
+        for variable, value in zip(layer.weights, weights):
+            self.assertAllEqual(variable, value)
+
+    @parameterized.named_parameters(named_product(mode=MODES))
+    def test_calibrated_layer_holds_no_config(self, mode):
+        # The policy names the bit width and the group size; the run's
+        # config, with its dataset, stays with the caller.
+        rng = np.random.default_rng(0)
+        layer, x = _make_layer("dense", rng)
+        weights = [w.path for w in layer.weights]
+        _calibrate(layer, mode, x, weight_bits=4, group_size=4)
+        self.assertEqual(layer.dtype_policy.name, f"{mode}/4/4_from_float32")
+        self.assertIsNone(layer.quantization_config)
+        self.assertIsNone(layer.get_config()["quantization_config"])
+        self.assertFalse(hasattr(layer, "_kernel"))
+        # The bias keeps its place; the codes and their parameters follow.
+        self.assertEqual(layer.weights[0].path, weights[1])
+        self.assertLen(layer.weights, 5 if mode == "gptq" else 6)
+
+    @parameterized.named_parameters(named_product(mode=MODES))
+    def test_config_from_a_file_is_dropped(self, mode):
+        # A config deserialized with a calibrated layer cannot change what
+        # the policy name says: the variables follow the policy, and the
+        # layer serializes no config again.
+        rng = np.random.default_rng(0)
+        layer, x = _make_layer("dense", rng)
+        _calibrate(layer, mode, x, weight_bits=4, group_size=4)
+        layer_config = layer.get_config()
+        layer_config["quantization_config"] = saving.serialize_keras_object(
+            _config(mode, weight_bits=8 if mode == "gptq" else 4, group_size=2)
+        )
+        loaded = layers.Dense.from_config(layer_config)
+        loaded.build((None, 12))
+        self.assertIsNone(loaded.quantization_config)
+        self.assertIsNone(loaded.get_config()["quantization_config"])
+        self.assertEqual(loaded.kernel_scale.shape, layer.kernel_scale.shape)
+        loaded.set_weights(layer.get_weights())
+        self.assertAllEqual(loaded(x), layer(x))
 
 
 class CalibrationEinsumLayoutTest(testing.TestCase):
@@ -558,30 +615,25 @@ class CalibrationLoRATest(testing.TestCase):
 
     @parameterized.named_parameters(named_product(mode=MODES, kind=KINDS))
     def test_enable_lora_before_calibration(self, mode, kind):
-        # The pending forward already carries the update; the calibrators
-        # quantize the base kernel, so the update stays a separate term.
+        # The calibrators quantize the base kernel of the float layer, so
+        # the update stays a separate term, and the swap keeps the factors.
         rng = np.random.default_rng(0)
         layer, x = _make_layer(kind, rng)
         twin, _ = _make_layer(kind, rng)
         twin.kernel.assign(layer.kernel)
         layer.enable_lora(2)
         _set_adapter(layer, rng, scale=0.05)
-        float_output = ops.convert_to_numpy(layer(x))
+        factors = [
+            ops.convert_to_numpy(layer.lora_kernel_a),
+            ops.convert_to_numpy(layer.lora_kernel_b),
+        ]
 
-        config = _config(mode, group_size=4)
-        layer.quantize(mode, config=config)
-        self.assertTrue(layer.calibration_pending)
-        self.assertFalse(layer._kernel.trainable)
-        self.assertAllClose(
-            layer(x), float_output, atol=1e-6, tpu_atol=1e-2, tpu_rtol=1e-2
-        )
-        with self.assertRaisesRegex(ValueError, "never been calibrated"):
-            layer.save_own_variables({})
-
-        twin.quantize(mode, config=config)
         for target in (layer, twin):
-            calibrate_layer(target, config, x)
+            _calibrate(target, mode, x, group_size=4)
         self.assertFalse(hasattr(layer, "_kernel"))
+        self.assertTrue(layer.lora_enabled)
+        self.assertAllEqual(layer.lora_kernel_a, factors[0])
+        self.assertAllEqual(layer.lora_kernel_b, factors[1])
         self.assertAllEqual(layer.quantized_kernel, twin.quantized_kernel)
         twin.enable_lora(2)
         twin.lora_kernel_a.assign(layer.lora_kernel_a)

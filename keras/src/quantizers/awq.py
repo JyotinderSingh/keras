@@ -44,7 +44,6 @@ Departures from the references:
 import functools
 
 from keras.src import ops
-from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibrator import Calibrator
 from keras.src.quantizers.calibrator import accumulate_hessian
 from keras.src.quantizers.quantizers import compute_quantization_parameters
@@ -364,16 +363,14 @@ class AWQCalibrator(Calibrator):
     `2 mean(x x^T)`, one of each per problem of the contraction view.
 
     Args:
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the `awq` mode.
+        strategy: The `awq` mode's `CalibrationStrategy`.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the `awq` mode.
         config: `AWQConfig` instance with quantization parameters.
     """
 
-    mode = "awq"
-
-    def __init__(self, layer, config=None):
-        config = config or AWQConfig(dataset=None, tokenizer=None)
-        super().__init__(layer, config)
+    def __init__(self, strategy, layer, config):
+        super().__init__(strategy, layer, config)
         self.activation_magnitudes = ops.zeros(
             self._per_problem((self.rows,)), dtype="float32"
         )

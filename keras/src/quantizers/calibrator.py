@@ -1,15 +1,14 @@
 """The per-layer object of a calibration mode.
 
-A `CalibrationRun` creates one `Calibrator` per layer of a block, passes
-every input the layer sees during the calibration sweeps to `observe`,
-then calls `quantize`, which solves for the layer's codes and writes them
-back through the mode's strategy. `GPTQCalibrator` (a Hessian) and
+A `CalibrationRun` creates one `Calibrator` per float layer of a block,
+passes every input the layer sees during the calibration sweeps to
+`observe`, then calls `quantize`, which solves for the layer's codes and
+swaps them in through the mode's strategy. `GPTQCalibrator` (a Hessian) and
 `AWQCalibrator` (activation magnitudes and a Hessian) are the calibrators
 of the built-in modes.
 """
 
 from keras.src import ops
-from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.geometry import ProjectionGeometry
 
 
@@ -57,28 +56,30 @@ class Calibrator:
     `undersampling_warning(layers)`.
 
     Args:
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the calibrator's mode.
-        config: The mode's config object.
+        strategy: The `CalibrationStrategy` of the mode the calibrator
+            solves for.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the mode.
+        config: The mode's config object. The solve reads its parameters,
+            and the swap builds the layer's variables from it.
     """
 
-    # The quantization mode the calibrator solves for.
-    mode = None
     # Warn after the run when a layer saw fewer input rows than this per
     # input feature; `None` never warns.
     warn_tokens_per_row = None
 
-    def __init__(self, layer, config):
+    def __init__(self, strategy, layer, config):
+        self.strategy = strategy
         self.layer = layer
         self.config = config
         self.num_samples = 0
-        self.strategy = strategy_registry.get_strategy(self.mode)
         geometry = layer._quantization_geometry()
         if not isinstance(
             geometry, ProjectionGeometry
-        ) or not layer._supports_quantization_mode(self.strategy):
+        ) or not layer._supports_quantization_mode(strategy):
             raise TypeError(
-                f"Unsupported layer type for {self.mode.upper()}: {type(layer)}"
+                f"Unsupported layer type for {strategy.name.upper()}: "
+                f"{type(layer)}"
             )
         self.view = geometry.contraction_view()
         self.batch = self.view.batch
@@ -121,7 +122,7 @@ class Calibrator:
         return statistic if self.batch == 1 else statistic[index]
 
     def quantize(self):
-        """Solves each problem for its codes and writes them back."""
+        """Solves each problem for its codes and swaps them in."""
         # The base kernel, in float32 whatever the layer's variable dtype. A
         # LoRA update stays a separate term of the forward pass, as for int8
         # and int4.
@@ -132,7 +133,9 @@ class Calibrator:
             for index in range(self.batch)
         ]
         codes, scale, zero, g_idx, extra = self._stack_problems(results)
-        self.strategy.write_back(self.layer, codes, scale, zero, g_idx, **extra)
+        self.strategy.write_back(
+            self.layer, self.config, codes, scale, zero, g_idx, **extra
+        )
 
     def _solve(self, weights, index):
         """Quantizes `weights`, problem `index`'s `[out, in]` kernel.

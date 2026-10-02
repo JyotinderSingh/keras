@@ -65,10 +65,6 @@ class QuantizationStrategy:
     # still creates the float weight.
     owns_weight_storage = True
 
-    # Whether `Model.quantize` must resolve a quantization layer structure
-    # (pre-block layers + sequential blocks) before mutating any layer.
-    requires_layer_structure = False
-
     # Whether a layer quantized with this mode can use LoRA. `enable_lora`
     # and `Layer.quantize` check it, so a mode that sets it to False refuses
     # LoRA in either order, before the layer changes.
@@ -233,8 +229,7 @@ class QuantizationStrategy:
         """Returns the `QuantizedWeight` view of `layer`'s weight, or `None`.
 
         `None` means the mode holds no integer codes for the layer: it keeps
-        the float weight (float8), or the codes are not available yet (a
-        calibration mode before its calibration pass).
+        the float weight (float8).
         """
         del layer
         return None
@@ -248,29 +243,21 @@ class QuantizationStrategy:
         quantized_weight = self.quantized_weight(layer)
         return () if quantized_weight is None else (quantized_weight,)
 
-    # --- Serialization ----------------------------------------------------
-
-    def check_saveable(self, layer):
-        """Raises if `layer`'s variables are not in a persistable state."""
-        del layer
-
-    def unstored_variables(self, layer):
-        """Variables of `layer` that a store of this mode has no entry for."""
-        del layer
-        return ()
-
-    def variables_loaded(self, layer):
-        """Called after `layer`'s variables were assigned from a store."""
-        del layer
-
     # --- Model-level orchestration ----------------------------------------
 
-    def finalize_model_quantization(self, model, config, structure, filters):
-        """Hook run by `Model.quantize` after the per-layer walk.
+    def model_run(self, model, config):
+        """The run that quantizes `model`'s layers together, or `None`.
 
-        Structure-aware modes run their calibration pass here.
+        `Model.quantize` calls it before it changes any layer. With `None`,
+        the walk quantizes each layer on its own (`Layer.quantize`). A mode
+        whose values come from calibration data returns its run, which
+        refuses here what it can refuse. The walk then asks the run whether
+        it `covers` each layer and hands it the layers to quantize (`add`).
+        `run()` quantizes them, and `quantized` lists the layers that
+        changed, also when `run()` raises.
         """
-        del model, config, structure, filters
+        del model, config
+        return None
 
 
 def register_quantization_strategy(strategy):

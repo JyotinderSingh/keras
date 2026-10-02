@@ -16,7 +16,7 @@ from keras.src import saving
 from keras.src import testing
 from keras.src.quantizers import gptq
 from keras.src.quantizers import strategy_registry
-from keras.src.quantizers.calibration_run import find_layers_in_block
+from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.gptq import gptq_quantize_matrix
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
@@ -482,12 +482,12 @@ class GPTQTest(testing.TestCase):
             self.assertGreaterEqual(quantized_values.min(), 0)
             self.assertLessEqual(quantized_values.max(), 2**W_BITS - 1)
 
-    def test_find_layers_in_block_includes_layers_with_sub_layers(self):
-        """`Dense`/`EinsumDense` are collected even when they own sub-layers.
+    def test_run_covers_layers_with_sub_layers(self):
+        """`Dense`/`EinsumDense` are covered even when they own sub-layers.
 
         A `Dense` whose activation is a `Layer` owns that `Layer`, so a leaf
-        filter would wrongly hide it from calibration. `find_layers_in_block`
-        must return both such a `Dense` and a plain `Dense`.
+        filter would wrongly hide it from calibration. The run must cover
+        both such a `Dense` and a plain `Dense`, and not the activation.
         """
         block = models.Sequential(
             [
@@ -496,15 +496,22 @@ class GPTQTest(testing.TestCase):
             ]
         )
         block.build((None, 8))
-
-        found = find_layers_in_block(
-            block, strategy_registry.get_strategy("gptq")
+        config = GPTQConfig(
+            dataset=[np.zeros((1, 8), "int32")],
+            tokenizer=lambda text: text,
+            num_samples=1,
+            sequence_length=8,
         )
 
-        self.assertEqual(len(found), 2)
+        run = CalibrationRun(
+            strategy_registry.get_strategy("gptq"),
+            config,
+            {"pre_block_layers": [], "sequential_blocks": [block]},
+        )
+
         for dense in block.layers:
-            self.assertIn(dense.path, found)
-            self.assertIs(found[dense.path], dense)
+            self.assertTrue(run.covers(dense))
+        self.assertFalse(run.covers(block.layers[0].activation))
 
     def test_gptq_model_quantize_per_channel_group_size(self):
         """`model.quantize("gptq")` with `group_size=-1` must not crash.
@@ -536,7 +543,8 @@ class GPTQTest(testing.TestCase):
         model.quantize("gptq", config=config)
 
         dense = structure["sequential_blocks"][0].layers[0]
-        self.assertFalse(dense.calibration_pending)
+        self.assertEqual(dense.quantization_mode, "gptq")
+        self.assertFalse(hasattr(dense, "_kernel"))
         self.assertEqual(tuple(dense.kernel_scale.shape), (1, 4))
         self.assertEqual(tuple(dense.kernel_zero.shape), (1, 4))
 
@@ -914,7 +922,7 @@ class TestModelQuantization(testing.TestCase):
         # In-structure Dense layers are quantized and calibrated.
         for dense in block.layers:
             self.assertEqual(dense.quantization_mode, "gptq")
-            self.assertFalse(dense.calibration_pending)
+            self.assertFalse(hasattr(dense, "_kernel"))
 
         # Out-of-structure layers must stay completely untouched.
         self.assertIsNone(getattr(head, "quantization_mode", None))
@@ -941,7 +949,7 @@ class TestModelQuantization(testing.TestCase):
 
         The activation `Layer` makes the `Dense` a non-leaf, but GPTQ must
         still discover and calibrate it: after `quantize("gptq")` the layer
-        is in `gptq` mode with its calibration no longer pending.
+        is in `gptq` mode and holds no float kernel.
         """
         keras.utils.set_random_seed(123)
         embed_dim = 8
@@ -970,7 +978,7 @@ class TestModelQuantization(testing.TestCase):
 
         act_dense = structure["sequential_blocks"][0].layers[0]
         self.assertEqual(act_dense.quantization_mode, "gptq")
-        self.assertFalse(act_dense.calibration_pending)
+        self.assertFalse(hasattr(act_dense, "_kernel"))
 
     def test_gptq_missing_structure_leaves_model_unmodified(self):
         """A config without a structure raises before any layer is mutated."""
@@ -1061,9 +1069,8 @@ class TestModelQuantization(testing.TestCase):
             getattr(restored_dense, "quantization_mode", None), "gptq"
         )
         self.assertTrue(hasattr(restored_dense, "quantized_kernel"))
-        self.assertIsNone(
-            restored_dense.quantization_config.quantization_layer_structure
-        )
+        # A calibrated layer stores no config, so no structure either.
+        self.assertIsNone(restored_dense.quantization_config)
         # Stored by the model width: 4 rows of 4 columns packed to 2 bytes.
         self.assertEqual(
             tuple(restored_block.layers[1].quantized_kernel.shape), (4, 2)
@@ -1222,7 +1229,6 @@ class GPTQReferenceTest(testing.TestCase):
             activation_order=activation_order,
             symmetric=symmetric,
         )
-        layer.quantize("gptq", config=config)
         calibrator = calibrate_layer(layer, config, x, solve=False)
         hessian = ops.convert_to_numpy(calibrator.hessian)
         weights_transpose = ops.convert_to_numpy(ops.transpose(layer._kernel))
