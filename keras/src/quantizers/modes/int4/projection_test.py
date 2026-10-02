@@ -1,6 +1,8 @@
-"""int4 stores an einsum kernel along its contraction, like `Dense`."""
+"""int4 stores an einsum kernel along its contraction, like `Dense`, and
+takes its input gradient through the dequantized kernel."""
 
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from keras.src import dtype_policies
@@ -8,6 +10,8 @@ from keras.src import layers
 from keras.src import ops
 from keras.src import testing
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import input_gradient
+from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.testing.test_utils import named_product
 
 # Each equation with the kernel permutation that puts its contracted axes
@@ -323,3 +327,78 @@ class Int4EinsumLayoutTest(testing.TestCase):
         self.assertTrue(np.all(np.isfinite(outputs[1])))
         error = np.linalg.norm(outputs[1] - outputs[0])
         self.assertLess(error / np.linalg.norm(outputs[0]), 0.05)
+
+
+def _float_twin(layer, equation, output_shape, input_shape):
+    """A float `EinsumDense` that holds `layer`'s dequantized kernel."""
+    twin = layers.EinsumDense(equation, output_shape=output_shape)
+    twin.build(input_shape)
+    twin.kernel.assign(_dequantized(layer))
+    return twin
+
+
+class Int4InputGradientTest(testing.TestCase):
+    """The input gradient is the float layer's on the dequantized kernel."""
+
+    @parameterized.named_parameters(
+        named_product(EQUATIONS, block_size=[-1, 3])
+    )
+    @pytest.mark.requires_trainable_backend
+    def test_weight_only_gradient_is_the_float_layers(
+        self,
+        equation,
+        input_shape,
+        output_shape,
+        permutation,
+        dims,
+        block_size,
+    ):
+        del permutation, dims
+        kernel = _kernel(equation, output_shape, input_shape, seed=9)
+        layer = _einsum(equation, output_shape, input_shape, kernel, block_size)
+        twin = _float_twin(layer, equation, output_shape, input_shape)
+        x = _inputs(input_shape, seed=10)
+        self.assertAllClose(
+            input_gradient(layer, x),
+            input_gradient(twin, x),
+            atol=1e-6,
+            rtol=1e-6,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )
+
+    @parameterized.named_parameters(
+        [
+            case
+            for case in EQUATIONS
+            if case["testcase_name"]
+            in ("matmul", "gemma_q", "expert_down", "two_contracted_apart")
+        ]
+    )
+    @pytest.mark.requires_trainable_backend
+    def test_activation_quantizer_gradient_is_straight_through(
+        self, equation, input_shape, output_shape, permutation, dims
+    ):
+        # The rounding of the inputs passes the gradient on unchanged.
+        del permutation, dims
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        layer.kernel.assign(
+            _kernel(equation, output_shape, input_shape, seed=11)
+        )
+        layer.quantize(
+            "int4",
+            config=Int4QuantizationConfig(
+                block_size=-1, activation_quantizer=AbsMaxQuantizer()
+            ),
+        )
+        twin = _float_twin(layer, equation, output_shape, input_shape)
+        x = _inputs(input_shape, seed=12)
+        self.assertAllClose(
+            input_gradient(layer, x),
+            input_gradient(twin, x),
+            atol=1e-5,
+            rtol=1e-5,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )

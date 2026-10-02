@@ -3,7 +3,8 @@
 `calibrate_layer` is the only place in the tests that constructs a
 `Calibrator`, so a change to how a calibration mode quantizes one layer
 is one edit here. `tiny_calibration_model` is the model the calibration
-tests run `Model.quantize` on.
+tests run `Model.quantize` on. `input_gradient` takes a layer's input
+gradient on the active backend.
 
 `LAYERS` is the table of quantizable layers that the conformance test
 (`conformance_test.py`) runs, built from the einsum equations in
@@ -17,6 +18,7 @@ is quantizable with the built-in modes.
 
 import numpy as np
 
+from keras.src import backend
 from keras.src import initializers
 from keras.src import layers
 from keras.src import models
@@ -712,6 +714,27 @@ def layer_inputs(kind, rng, batch_size=4):
     return rng.standard_normal((batch_size,) + input_shape[1:]).astype(
         "float32"
     )
+
+
+def input_gradient(layer, x):
+    """The gradient of `sum(layer(x))` with respect to `x`."""
+    if backend.backend() == "jax":
+        import jax  # Only this backend runs the branch.
+
+        return np.asarray(jax.grad(lambda v: ops.sum(layer(v)))(x))
+    if backend.backend() == "torch":
+        import torch  # Only this backend runs the branch.
+
+        v = torch.tensor(x, requires_grad=True)
+        ops.sum(layer(v)).backward()
+        return v.grad.detach().cpu().numpy()
+    import tensorflow as tf  # Only this backend runs the branch.
+
+    v = tf.constant(x)
+    with tf.GradientTape() as tape:
+        tape.watch(v)
+        y = tf.reduce_sum(layer(v))
+    return tape.gradient(y, v).numpy()
 
 
 def policy_built(layer):

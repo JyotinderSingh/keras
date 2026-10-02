@@ -42,6 +42,7 @@ from keras.src.quantizers.quantization_test_utils import ReleasedProtocolLayer
 from keras.src.quantizers.quantization_test_utils import build_layer
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
+from keras.src.quantizers.quantization_test_utils import input_gradient
 from keras.src.quantizers.quantization_test_utils import layer_inputs
 from keras.src.quantizers.quantization_test_utils import policy_built
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
@@ -214,27 +215,6 @@ def _variable_table(layer):
         (v.name, tuple(v.shape), backend.standardize_dtype(v.dtype))
         for v in layer.weights
     )
-
-
-def _input_gradient(layer, x):
-    """The gradient of `sum(layer(x))` with respect to `x`."""
-    if backend.backend() == "jax":
-        import jax
-
-        return np.asarray(jax.grad(lambda v: ops.sum(layer(v)))(x))
-    if backend.backend() == "torch":
-        import torch
-
-        v = torch.tensor(x, requires_grad=True)
-        ops.sum(layer(v)).backward()
-        return v.grad.detach().cpu().numpy()
-    import tensorflow as tf
-
-    v = tf.constant(x)
-    with tf.GradientTape() as tape:
-        tape.watch(v)
-        y = tf.reduce_sum(layer(v))
-    return tape.gradient(y, v).numpy()
 
 
 def _set_lora_factors(layer, weight_name, scale):
@@ -536,7 +516,7 @@ class QuantizationConformanceTest(testing.TestCase):
         reference = _twin(kind, layer)
         x = layer_inputs(kind, rng)
         _quantize(layer, case, x)
-        gradient = _input_gradient(layer, x)
+        gradient = input_gradient(layer, x)
 
         if strategy.owns_weight_storage and kind != "ternary_dense":
             # The gradient flows through the dequantized weight, whatever
@@ -545,7 +525,7 @@ class QuantizationConformanceTest(testing.TestCase):
             reference._kernel.assign(weight.dequantize("float32"))
             self.assertAllClose(
                 gradient,
-                _input_gradient(reference, x),
+                input_gradient(reference, x),
                 atol=1e-5,
                 rtol=1e-5,
                 tpu_atol=1e-2,
@@ -553,12 +533,12 @@ class QuantizationConformanceTest(testing.TestCase):
         elif kind == "ternary_dense":
             # The float layer's straight-through kernel is the frozen one.
             self.assertAllClose(
-                gradient, _input_gradient(reference, x), atol=1e-5, rtol=1e-5
+                gradient, input_gradient(reference, x), atol=1e-5, rtol=1e-5
             )
         else:
             # float8 rounds the inputs and the kernel to 3 mantissa bits.
             self.assertLess(
-                _relative_error(gradient, _input_gradient(reference, x)), 0.1
+                _relative_error(gradient, input_gradient(reference, x)), 0.1
             )
 
     @parameterized.named_parameters(PAIRS)

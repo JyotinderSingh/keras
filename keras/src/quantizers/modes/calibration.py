@@ -27,7 +27,7 @@ from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.common import add_group_index
-from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import dequantize_and_contract
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
 from keras.src.quantizers.quantized_weight import NoPack
@@ -344,10 +344,8 @@ class CalibrationStrategy(QuantizationStrategy):
 
     def call(self, layer, inputs, training=False):
         geometry = self.require_geometry(layer)
-        W = self.quantized_weight(layer).dequantize(layer.compute_dtype)
-        y = geometry.contract(inputs, W)
-        y = geometry.add_lora_delta(inputs, y)
-        return apply_bias_activation(layer, y)
+        weight = self.quantized_weight(layer)
+        return dequantize_and_contract(layer, geometry, weight, inputs)
 
 
 class GPTQStrategy(CalibrationStrategy):

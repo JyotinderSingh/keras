@@ -1,8 +1,7 @@
 """Shared building blocks for the built-in quantization modes.
 
-The helpers here are pure code motion: each one emits exactly the op
-sequence its call sites emitted inline, so modes that adopt them keep
-producing identical traced programs.
+Each helper emits the op sequence that its callers would emit inline, so a
+mode that adopts one keeps its outputs bit for bit.
 """
 
 from keras.src import ops
@@ -103,3 +102,16 @@ def apply_bias_activation(layer, x):
     if layer.activation is not None:
         x = layer.activation(x)
     return x
+
+
+def dequantize_and_contract(layer, geometry, quantized_weight, inputs):
+    """The weight-only forward pass of a projection.
+
+    Contracts the inputs against the weight dequantized to the compute
+    dtype, then adds the LoRA update, the bias and the activation. The
+    input gradient is autodiff's, through the dequantized weight.
+    """
+    weight = quantized_weight.dequantize(layer.compute_dtype)
+    x = geometry.contract(inputs, weight)
+    x = geometry.add_lora_delta(inputs, x)
+    return apply_bias_activation(layer, x)

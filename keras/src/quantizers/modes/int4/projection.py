@@ -5,6 +5,7 @@ import math
 from keras.src import ops
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import dequantize_and_contract
 from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
@@ -109,57 +110,46 @@ class Int4ProjectionHandlers:
         )
 
     def _call_projection(self, layer, geometry, inputs, training=None):
-        grouped = layer.g_idx is not None
+        if layer.inputs_quantizer is None:
+            weight = self._quantized_weight_projection(layer, geometry)
+            return dequantize_and_contract(layer, geometry, weight, inputs)
 
+        # Only a per-channel kernel has an activation quantizer
+        # (`Int4QuantizationConfig` refuses one with groups).
         @ops.custom_gradient
-        def contract_with_inputs_gradient(
-            inputs, kernel, kernel_scale, *group_params
-        ):
-            """Dequantizes the int4 kernel and contracts in float.
+        def contract_with_inputs_gradient(inputs, kernel, kernel_scale):
+            """Contracts the quantized inputs against the dequantized kernel.
 
-            `group_params` is `(kernel_zero, g_idx)` for a grouped scheme
-            and empty for per-channel. Autodiff cannot differentiate through
-            the packed kernel, so the gradient with respect to the inputs is
-            taken through the dequantized kernel.
+            The gradient with respect to the inputs is taken straight
+            through the rounding of the inputs.
             """
-            kernel_zero, g_idx = group_params if group_params else (None, None)
 
             def dequantize():
                 return self._view(
-                    layer, geometry, kernel, kernel_scale, kernel_zero, g_idx
+                    layer, geometry, kernel, kernel_scale, None, None
                 ).dequantize(layer.compute_dtype)
 
             def grad_fn(*args, upstream=None):
                 if upstream is None:
                     (upstream,) = args
                 inputs_grad = geometry.contract_grad(upstream, dequantize())
-                return (inputs_grad, None, None) + (None,) * len(group_params)
+                return inputs_grad, None, None
 
-            float_kernel = dequantize()
-            if layer.inputs_quantizer:
-                inputs_q, inputs_scale = layer.inputs_quantizer(
-                    inputs, axis=geometry.inputs_quantization_axis
-                )
-                x = geometry.contract(inputs_q, float_kernel)
-                x = ops.cast(x, layer.compute_dtype)
-                x = ops.divide(x, geometry.align_inputs_scale(inputs_scale))
-            else:
-                x = geometry.contract(inputs, float_kernel)
+            inputs_q, inputs_scale = layer.inputs_quantizer(
+                inputs, axis=geometry.inputs_quantization_axis
+            )
+            x = geometry.contract(inputs_q, dequantize())
+            x = ops.cast(x, layer.compute_dtype)
+            x = ops.divide(x, geometry.align_inputs_scale(inputs_scale))
             return x, grad_fn
 
-        params = [
+        x = contract_with_inputs_gradient(
             inputs,
             ops.convert_to_tensor(layer._kernel),
             # Read inside the autocast scope: on TensorFlow eager the gradient
             # runs after it, and the variable itself would then read float32.
             ops.convert_to_tensor(layer.kernel_scale.value),
-        ]
-        if grouped:
-            params += [
-                ops.convert_to_tensor(layer.kernel_zero),
-                ops.convert_to_tensor(layer.g_idx),
-            ]
-        x = contract_with_inputs_gradient(*params)
+        )
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 
