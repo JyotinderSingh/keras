@@ -494,7 +494,6 @@ class QuantizationConformanceTest(testing.TestCase):
     def test_refused_policy_setter_keeps_the_float_policy(
         self, mode_name, kind
     ):
-        self.skipTest("The dtype policy setter keeps a policy it refused.")
         case = MODES[mode_name]
         layer = build_layer(kind)
         name = f"{case.make_config().dtype_policy_string()}_from_float32"

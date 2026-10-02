@@ -67,6 +67,17 @@ else:
         f"Backend '{backend.backend()}' must implement a layer mixin class."
     )
 
+# The attributes of a quantized dtype policy that fix the layer's stored
+# variables: the mode and its parameters. A quantized layer's policy may
+# change its source dtype, never these.
+_QUANTIZATION_POLICY_ATTRIBUTES = (
+    "quantization_mode",
+    "block_size",
+    "weight_bits",
+    "group_size",
+    "amax_history_length",
+)
+
 
 @keras_export(["keras.Layer", "keras.layers.Layer"])
 class Layer(BackendLayer, Operation):
@@ -789,31 +800,63 @@ class Layer(BackendLayer, Operation):
     @dtype_policy.setter
     def dtype_policy(self, value):
         policy = dtype_policies.get(value)
-        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
-            if self.path in self._dtype_policy:
-                del self._dtype_policy[self.path]
-            self._dtype_policy[self.path] = policy
+        previous = self._dtype_policy
+        previous_own = self._own_dtype_policy
+        in_map = isinstance(previous, DTypePolicyMap) and self.path
+        if in_map:
+            previous_entry = None
+            if self.path in previous:
+                previous_entry = previous[self.path]
+                del previous[self.path]
+            previous[self.path] = policy
         else:
             self._dtype_policy = policy
         policy = self._own_dtype_policy
-        if policy.quantization_mode is not None:
-            if self.built and not self._is_quantized:
-                # Forward the policy's full parameters into `quantize` so the
-                # built variables agree with the policy name: assigning
-                # "int4/32_from_float32" quantizes with block_size=32 instead
-                # of silently falling back to the default block size while
-                # keeping a name that says 32. A mode may refuse
-                # policy-triggered quantization by raising here (GPTQ needs
-                # a calibration dataset that a bare policy cannot carry).
+        try:
+            if (
+                self._is_quantized
+                and previous_own.quantization_mode is not None
+            ):
+                # The variables of the current mode exist, so only the
+                # source dtype of the policy may change.
+                if any(
+                    getattr(policy, name, None)
+                    != getattr(previous_own, name, None)
+                    for name in _QUANTIZATION_POLICY_ATTRIBUTES
+                ):
+                    raise ValueError(
+                        f"Layer '{self.name}' is quantized with "
+                        f"dtype_policy='{previous_own.name}'. Its dtype "
+                        "policy can change only its source dtype, not its "
+                        "quantization mode or parameters. Received: "
+                        f"dtype_policy='{policy.name}'"
+                    )
+            elif (
+                policy.quantization_mode is not None
+                and self.built
+                and not self._is_quantized
+            ):
+                # Forward the policy's full parameters into `quantize` so
+                # the built variables agree with the policy name
+                # ("int4/32_from_float32" builds block size 32). A mode may
+                # refuse policy-triggered quantization (GPTQ needs a
+                # calibration dataset that a bare policy cannot carry).
                 strategy = strategy_registry.get_strategy(
                     policy.quantization_mode
                 )
-                config = (
-                    strategy.config_from_policy(policy)
-                    if strategy is not None
-                    else None
+                self.quantize(
+                    policy.quantization_mode,
+                    config=strategy.config_from_policy(policy),
                 )
-                self.quantize(policy.quantization_mode, config=config)
+        except Exception:
+            # A refused policy is not stored.
+            if in_map:
+                del previous[self.path]
+                if previous_entry is not None:
+                    previous[self.path] = previous_entry
+            else:
+                self._dtype_policy = previous
+            raise
 
     @property
     def _own_dtype_policy(self):
@@ -1442,7 +1485,9 @@ class Layer(BackendLayer, Operation):
         Resolves `mode`/`config` into a `QuantizationConfig`, validates that
         the layer supports the mode *before* mutating any state, then lets
         the mode's strategy compute and swap the variables and updates the
-        dtype policy.
+        dtype policy. A refused or failed quantization leaves the layer as
+        it was: the same variables in the same order, the same attributes
+        and config.
 
         A layer supports quantization by defining
         `_quantization_geometry()`; only instances of the exact class that
@@ -1480,15 +1525,46 @@ class Layer(BackendLayer, Operation):
         strategy.check_quantizable(self)
         if self.lora_enabled:
             self._check_lora_supported(mode)
+        attributes = dict(vars(self))
+        tracked = {
+            "trainable_variables": list(self._trainable_variables),
+            "non_trainable_variables": list(self._non_trainable_variables),
+        }
         self._tracker.unlock()
         try:
-            # Record the config only after the mode is validated, so a
-            # rejected mode leaves the layer untouched.
             self.quantization_config = config
             strategy.quantize(self, config)
             self._finalize_quantization_policy(strategy, config)
+        except Exception:
+            self._restore_quantization_state(attributes, tracked)
+            raise
         finally:
             self._tracker.lock()
+
+    def _restore_quantization_state(self, attributes, tracked):
+        """Puts the layer back in the state `quantize` recorded.
+
+        A failed quantization can delete the float weight, create the
+        mode's variables and attributes, and record a config. This deletes
+        every attribute that `attributes` (a copy of `vars(self)`) does not
+        hold, tracks the variables of `tracked` again in their stores and
+        order, and sets every other attribute back to its recorded value.
+        A TensorFlow checkpoint of the layer then holds only its float
+        variables.
+        """
+        for name in set(vars(self)) - set(attributes):
+            delattr(self, name)
+        for variable in (
+            self._trainable_variables + self._non_trainable_variables
+        ):
+            self._untrack_variable(variable)
+        for store, variables in tracked.items():
+            for variable in variables:
+                self._tracker.add_to_store(store, variable)
+                self._post_track_variable(variable)
+        for name, value in attributes.items():
+            if name not in vars(self) or vars(self)[name] is not value:
+                setattr(self, name, value)
 
     def _quantization_geometry(self):
         """Returns this layer's quantization geometry, or `None`.
@@ -1580,11 +1656,14 @@ class Layer(BackendLayer, Operation):
         """Loads the variables `_save_serialized_variables` saved."""
         mode = self.quantization_mode
         strategy = strategy_registry.get_strategy(mode)
-        if not self.lora_enabled:
-            unstored = ()
-            if self.built and strategy is not None:
-                unstored = strategy.unstored_variables(self)
-            self._check_load_own_variables(store, skip=unstored)
+        # The store holds no LoRA factors (a save merges the update into
+        # the weight) and no variable the mode leaves unstored.
+        unstored = []
+        if self.lora_enabled:
+            unstored += [getattr(self, f"lora_{name}_{f}") for f in ("a", "b")]
+        if self.built and strategy is not None:
+            unstored += strategy.unstored_variables(self)
+        self._check_load_own_variables(store, skip=unstored)
         if not self.built:
             return
         if mode not in self.variable_serialization_spec:
@@ -1594,13 +1673,7 @@ class Layer(BackendLayer, Operation):
             target = getattr(self, f"_{name}" if entry == name else entry)
             if target is None:
                 continue
-            value = store[str(idx)]
-            if entry == "g_idx":
-                # `g_idx` is stored as `float32` (see build). Cast to the
-                # variable dtype on assign so both legacy `float32`
-                # checkpoints and any `int32`-saved ones load correctly.
-                value = ops.cast(value, target.dtype)
-            target.assign(value)
+            target.assign(store[str(idx)])
             idx += 1
         if self.lora_enabled:
             for factor in ("a", "b"):
