@@ -1445,10 +1445,10 @@ class Layer(BackendLayer, Operation):
     def _strategy_owns_weight_storage(self):
         """Whether the quantization strategy creates the weight storage.
 
-        A strategy that owns its weight storage (int8, int4) creates the
-        quantized variables in `quantized_build`, so `build` must not add
-        the floating-point weight. Float8 and the unquantized layer keep
-        the floating-point weight.
+        A strategy that owns its weight storage (every mode but float8)
+        creates the quantized variables in `quantized_build`, so `build`
+        must not add the floating-point weight. Float8 and the unquantized
+        layer keep the floating-point weight.
 
         Returns:
             A boolean.

@@ -659,8 +659,11 @@ class QuantizedProjectionGradientTest(testing.TestCase):
         reason="Only TensorFlow runs the eager gradient outside autocast.",
     )
     def test_eager_input_gradient_matches_graph(self, kind, mode, block_size):
-        # TensorFlow eager runs the custom gradient after the autocast scope
-        # closes, so the forward pass must read the scale inside it.
+        # TensorFlow eager runs a custom gradient after the autocast scope
+        # closes, so the int8 forward pass must read the scale inside it.
+        # The int4 rows have no activation quantizer and no custom gradient:
+        # they check that autodiff gives the same gradient eagerly and in a
+        # `tf.function`.
         import tensorflow as tf  # Only this backend runs the test.
 
         rng = np.random.default_rng(0)

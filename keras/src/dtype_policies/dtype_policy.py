@@ -57,12 +57,12 @@ def _parse_int4_mode(mode_str):
 
 
 def _parse_bits_and_group_mode(
-    mode_str, name, policy_name, validate_weight_bits, group_size_semantics
+    mode_str, name, policy_name, validate_weight_bits
 ):
     """Parses the `"<name>/<weight_bits>/<group_size>"` grammar.
 
     Shared by the two calibration policies, which differ only in the
-    bit-widths they accept and in how `group_size=-1` reads.
+    bit-widths they accept.
     """
     parts = mode_str.split("/")
     expected_format = f"'{name}/<weight_bits>/<group_size>'"
@@ -90,7 +90,7 @@ def _parse_bits_and_group_mode(
     if group_size < -1 or group_size == 0:
         raise ValueError(
             "Invalid group_size in mode. Supported values are "
-            f"-1 ({group_size_semantics}) or a positive integer, "
+            "-1 (one group of all input rows) or a positive integer, "
             f"but got {group_size} from '{mode_str}'."
         )
     return {"weight_bits": weight_bits, "group_size": group_size}
@@ -119,7 +119,6 @@ def _parse_gptq_mode(mode_str):
         "gptq",
         "GPTQDTypePolicy",
         _validate_gptq_weight_bits,
-        "whole-tensor",
     )
 
 
@@ -129,7 +128,6 @@ def _parse_awq_mode(mode_str):
         "awq",
         "AWQDTypePolicy",
         _validate_awq_weight_bits,
-        "per-channel",
     )
 
 
@@ -479,10 +477,11 @@ class GPTQDTypePolicy(QuantizedDTypePolicy):
             -   `"gptq"`: The identifier for the quantization algorithm.
             -   `<weight_bits>`: Number of bits to quantize weights to.
                 Supported values are 2, 3, 4, and 8.
-            -   `<group_size>`: The group size for quantization. Supported
-                values are -1 (for whole-tensor quantization) or any
-                positive integer. Typically a smaller group size leads
-                to better accuracy but slower speed.
+            -   `<group_size>`: The number of input rows that share a
+                scale and a zero point. Supported values are -1 (one
+                group of all input rows) or any positive integer.
+                Typically a smaller group size leads to better accuracy
+                but slower speed.
             Example: `"gptq/4/128"`.
         source_name: The source dtype policy name, e.g. "float32".
     """
@@ -534,9 +533,9 @@ class AWQDTypePolicy(QuantizedDTypePolicy):
             -   `"awq"`: The identifier for the quantization algorithm.
             -   `<weight_bits>`: Number of bits to quantize weights to.
                 AWQ presently only supports 4-bit quantization.
-            -   `<group_size>`: The group size for quantization. Supported
-                values are -1 (for per-channel quantization) or any
-                positive integer.
+            -   `<group_size>`: The number of input rows that share a
+                scale and a zero point. Supported values are -1 (one
+                group of all input rows) or any positive integer.
             Example: `"awq/4/128"`.
         source_name: The source dtype policy name, e.g. "float32".
     """

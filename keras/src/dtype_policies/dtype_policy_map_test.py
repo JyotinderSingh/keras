@@ -9,6 +9,9 @@ from keras.src import testing
 from keras.src.dtype_policies.dtype_policy import dtype_policy
 from keras.src.dtype_policies.dtype_policy import set_dtype_policy
 from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
+from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantizers import AbsMaxQuantizer
 
 
 @pytest.mark.skipif(testing.jax_uses_gpu(), reason="Leads to core dumps on CI")
@@ -82,6 +85,57 @@ class DTypePolicyMapTest(testing.TestCase):
         reloaded_model = saving.load_model(f"{temp_dir}/model.keras")
         reloaded_y = reloaded_model(x, training=False)
         self.assertAllClose(y, reloaded_y)
+
+    def test_map_only_config_rebuilds_with_default_quantizers(self):
+        # A layer whose config holds the policies of its sub-layers in a
+        # map, and not the sub-layers' configs.
+        class Block(layers.Layer):
+            def __init__(self, dtype=None, name="block", **kwargs):
+                super().__init__(dtype=dtype, name=name, **kwargs)
+                self.int8_dense = layers.Dense(8, dtype=dtype, name="int8")
+                self.int4_dense = layers.Dense(8, dtype=dtype, name="int4")
+
+            def call(self, inputs):
+                return self.int4_dense(self.int8_dense(inputs))
+
+            def get_config(self):
+                config = super().get_config()
+                policy_map = DTypePolicyMap()
+                for layer in self._flatten_layers():
+                    if layer.quantization_mode is not None:
+                        policy_map[layer.path] = layer.dtype_policy
+                config.update({"dtype": policy_map})
+                return config
+
+        inputs = layers.Input([4])
+        block = Block()
+        model = models.Model(inputs, block(inputs))
+        block.int8_dense.quantize(
+            "int8", config=Int8QuantizationConfig(activation_quantizer=None)
+        )
+        block.int4_dense.quantize(
+            "int4", config=Int4QuantizationConfig(block_size=2)
+        )
+        self.assertIsNone(block.int8_dense.inputs_quantizer)
+
+        path = f"{self.get_temp_dir()}/model.keras"
+        model.save(path)
+        reloaded = saving.load_model(path, custom_objects={"Block": Block})
+        int8_dense = reloaded.layers[1].int8_dense
+        int4_dense = reloaded.layers[1].int4_dense
+
+        # The map keeps the modes, the parameters of the policies and the
+        # stored values.
+        self.assertEqual(int8_dense.quantization_mode, "int8")
+        self.assertEqual(int4_dense._own_dtype_policy.block_size, 2)
+        self.assertAllEqual(int8_dense._kernel, block.int8_dense._kernel)
+        self.assertAllEqual(
+            int4_dense.kernel_scale, block.int4_dense.kernel_scale
+        )
+        # It does not keep the sub-layers' configs: the int8 layer gets the
+        # mode's default activation quantizer.
+        self.assertIsNone(int8_dense.quantization_config)
+        self.assertIsInstance(int8_dense.inputs_quantizer, AbsMaxQuantizer)
 
     def test_add(self):
         dtype_policy_map = DTypePolicyMap()

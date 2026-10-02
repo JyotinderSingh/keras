@@ -1,7 +1,9 @@
 """Shared building blocks for the built-in quantization modes.
 
-Each helper emits the op sequence that its callers would emit inline, so a
-mode that adopts one keeps its outputs bit for bit.
+`GeometryDispatchStrategy` is the base class of the modes that write one
+handler per geometry family (int8, int4). The functions below are steps
+that several modes share: the group index variable, the bias and
+activation, and the weight-only forward pass of a projection.
 """
 
 from keras.src import ops

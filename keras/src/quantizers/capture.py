@@ -6,8 +6,15 @@ replacing a layer's `call` for the duration, a capture is registered on
 the layer and `Operation._dispatch_call`, the one place that selects the
 forward pass, runs it before the forward it dispatches to: `call` or
 `quantized_call`, eager or rematerialized, under `__call__` or
-`stateless_call`. Nothing on the layer is rebound, so there is nothing to
-restore and a dispatch change cannot orphan calibration silently.
+`stateless_call`. The scope sets one slot on the layer
+(`_calibration_capture`) and resets it on exit; nothing else on the layer
+changes, so a dispatch change cannot orphan calibration silently.
+
+The slot belongs to the layer object: a layer that a block calls at
+several places runs its capture at each call, and a layer is in one scope
+at a time. The capture runs in Python when the forward pass is dispatched,
+so it sees values only when the block runs eagerly, as `CalibrationRun`
+runs it; inside a traced function it sees tracers, once per trace.
 """
 
 from contextlib import contextmanager

@@ -1,12 +1,12 @@
 """The per-layer object of a calibration mode.
 
-A `CalibrationRun` creates one `Calibrator` per float layer of a block,
-passes every input the layer sees during the calibration sweeps to
-`observe`, then calls `quantize`, which solves for the layer's codes and
-swaps them in through the mode's strategy. Every calibrator accumulates
-the Hessian of the layer's inputs. `GPTQCalibrator` solves with it;
-`AWQCalibrator` also accumulates activation magnitudes and scores its
-searches with the Hessian.
+A `CalibrationRun` creates one `Calibrator` per float layer of a block, in
+the layer's stage, passes every input the layer sees during the sweep of
+that stage to `observe`, then calls `quantize`, which solves for the
+layer's codes and swaps them in through the mode's strategy. Every
+calibrator accumulates the Hessian of the layer's inputs. `GPTQCalibrator`
+solves with it; `AWQCalibrator` also accumulates activation magnitudes and
+scores its searches with the Hessian.
 """
 
 from keras.src import ops

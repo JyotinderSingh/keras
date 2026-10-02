@@ -232,9 +232,9 @@ class Dense(Layer):
             regularizer=self.kernel_regularizer,
         )
         if self._quantized_weight() is None:
-            # The float kernel is the weight only while the layer holds one
-            # (unquantized, or a calibration mode before its pass); a
-            # quantized weight's codes were built non-trainable.
+            # The float kernel is the weight of an unquantized layer (float8,
+            # which keeps it, refuses LoRA above); a quantized weight's codes
+            # were built non-trainable.
             self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
