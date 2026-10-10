@@ -188,6 +188,13 @@ class CalibrationRun:
             and the batch size of the run.
         structure: Dict with keys `"pre_block_layers"` and
             `"sequential_blocks"`.
+
+    Each block is calibrated on the quantized outputs of the block
+    before it, for both modes: the statistics describe the activations
+    the block sees at inference. This is the GPTQ references' rule; the
+    AWQ references calibrate every block on the float model's
+    activations. On SmolLM2-135M the two gave the same held-out
+    perplexity over three calibration seeds.
     """
 
     def __init__(self, strategy, config, structure):

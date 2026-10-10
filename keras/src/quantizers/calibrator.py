@@ -3,13 +3,44 @@
 A `CalibrationRun` creates one `Calibrator` per float layer of a block, in
 the layer's stage, passes every input the layer sees during the sweep of
 that stage to `observe`, then calls `quantize`, which solves for the
-layer's codes and swaps them in through the mode's strategy.
-`GPTQCalibrator` (a Hessian) and `AWQCalibrator` (activation magnitudes) are
-the calibrators of the built-in modes.
+layer's codes and swaps them in through the mode's strategy. Every
+calibrator accumulates the Hessian of the layer's inputs. `GPTQCalibrator`
+solves with it; `AWQCalibrator` also accumulates activation magnitudes and
+scores its searches with the Hessian.
 """
 
 from keras.src import ops
 from keras.src.quantizers.geometry import ProjectionGeometry
+
+
+def accumulate_hessian(hessian, x, num_samples):
+    """Adds a batch of inputs to a running Hessian `2 X^T X / N`.
+
+    GPTQ solves with this Hessian and AWQ scores its searches with it.
+
+    Args:
+        hessian: The Hessian of the `num_samples` samples seen so far, with
+            a leading problem axis when `x` has one.
+        x: The batch laid out by the contraction view, `(samples, rows)`
+            or `(batch, samples, rows)`.
+        num_samples: The number of samples `hessian` covers.
+
+    Returns:
+        The Hessian of the `num_samples` samples and the samples of `x`.
+    """
+    total_samples = num_samples + int(ops.shape(x)[-2])
+    gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
+    # Ensures numerical stability and symmetry in case of large floating
+    # point activations.
+    gram_matrix = ops.divide(
+        ops.add(gram_matrix, ops.swapaxes(gram_matrix, -1, -2)), 2.0
+    )
+    # Decay the previous mean and add the batch's contribution (2 / N).
+    if num_samples > 0:
+        hessian = ops.multiply(hessian, ops.divide(num_samples, total_samples))
+    return ops.add(
+        hessian, ops.multiply(ops.divide(2.0, total_samples), gram_matrix)
+    )
 
 
 class Calibrator:
@@ -20,9 +51,10 @@ class Calibrator:
     number of independent problems that a kernel axis shared with the
     inputs splits the kernel into. A statistic has a leading problem axis
     only when `batch > 1`. `num_samples` counts the input samples observed
-    so far, per problem. Subclasses implement `observe` and `_solve`, and
-    a subclass that sets `warn_tokens_per_row` also words the warning in
-    its classmethod `undersampling_warning(layers)`.
+    so far, per problem, and `hessian` is their `2 mean(x x^T)`.
+    Subclasses implement `_solve` and can accumulate statistics of their
+    own in `_observe`. A subclass that sets `warn_tokens_per_row` also
+    words the warning in its classmethod `undersampling_warning(layers)`.
 
     Args:
         strategy: The `CalibrationStrategy` of the mode the calibrator
@@ -53,10 +85,23 @@ class Calibrator:
         self.view = geometry.contraction_view()
         self.batch = self.view.batch
         self.rows = self.view.rows
+        self.hessian = ops.zeros(
+            self._per_problem((self.rows, self.rows)), dtype="float32"
+        )
 
     def observe(self, inputs):
         """Accumulates statistics from one batch of the layer's inputs."""
-        raise NotImplementedError
+        x = self._inputs_view(inputs)
+        self._observe(x)
+        self.hessian = accumulate_hessian(self.hessian, x, self.num_samples)
+        self.num_samples += int(ops.shape(x)[-2])
+
+    def _observe(self, x):
+        """Accumulates the mode's own statistics from a laid-out batch.
+
+        `x` is the batch as `_inputs_view` returns it; `num_samples` does
+        not count it yet.
+        """
 
     def _inputs_view(self, inputs):
         """Validates `inputs` and lays them out through the view.
