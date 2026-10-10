@@ -404,9 +404,8 @@ class PointwiseGeometry(ProjectionGeometry):
     """The `(1, in, out)` kernel of a pointwise convolution.
 
     A kernel of another layout than `(input_dim, units)` describes its
-    axes in `kernel_axes`; the int4 layout and the calibration view
-    derive from it. The int8 scale layout still comes from the hooks
-    below that read the kernel's axes.
+    axes in `kernel_axes`; the stored scale layout and the calibration
+    view derive from it.
     """
 
     @property
@@ -418,23 +417,6 @@ class PointwiseGeometry(ProjectionGeometry):
 
     def contract_grad(self, upstream, float_kernel):
         return ops.einsum("btd,kcd->btc", upstream, float_kernel)
-
-    @property
-    def kernel_reduced_axes(self):
-        return (0, 1)
-
-    def kernel_scale_shape(self, kernel_shape):
-        return (kernel_shape[2],)
-
-    @property
-    def kernel_scale_axis(self):
-        return None
-
-    def kernel_scale_for_storage(self, scale):
-        return ops.reshape(scale, (-1,))
-
-    def kernel_scale_for_dequant(self, scale):
-        return scale
 
     def add_lora_delta(self, inputs, x):
         layer = self.layer

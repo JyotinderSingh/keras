@@ -30,7 +30,6 @@ class Int4ProjectionHandlers:
     """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
-        geometry.prepare()
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(config, None)
         )
@@ -89,7 +88,10 @@ class Int4ProjectionHandlers:
                 self.resolve_block_size(layer, layer.quantization_config)
             ),
             shape=geometry.weight_shape,
-            axis=0,
+            # A grouped scale runs per group of rows, a per-channel scale
+            # per column.
+            axis=None if layer.g_idx is None else 0,
+            scale_axes=(1,) if layer.g_idx is None else None,
             permutation=permutation,
             zero_point=layer.kernel_zero,
             g_idx=layer.g_idx,
@@ -136,7 +138,6 @@ class Int4ProjectionHandlers:
         return apply_bias_activation(layer, x)
 
     def _encode_projection(self, layer, geometry, weight, config):
-        geometry.prepare()
         # `Int4Strategy.resolve_block_size` is the single source of truth for
         # the group size, shared with the build path and the dtype-policy
         # naming, so the quantized values, the built variables, and the saved

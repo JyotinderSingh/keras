@@ -2,8 +2,6 @@ import dataclasses
 import re
 import string
 
-import numpy as np
-
 from keras.src import activations
 from keras.src import constraints
 from keras.src import initializers
@@ -436,107 +434,6 @@ class EinsumDense(Layer):
     def _quantization_geometry(self):
         return EinsumProjectionGeometry(self)
 
-    def _get_kernel_scale_shape(self, kernel_shape):
-        """Get the shape of the kernel scale tensor.
-
-        The kernel scale tensor is used to scale the kernel tensor.
-        The shape of the kernel scale tensor is the same as the shape of the
-        kernel tensor, but with the reduced axes set to 1, and the transpose
-        axes set to the original axes.
-
-        Args:
-            kernel_shape: The shape of the kernel tensor.
-
-        Returns:
-            The shape of the kernel scale tensor.
-        """
-        kernel_scale_shape = np.array(kernel_shape)
-        kernel_scale_shape[self._kernel_reduced_axes] = 1
-
-        kernel_scale_shape = kernel_scale_shape[self._kernel_transpose_axes]
-        kernel_scale_shape = kernel_scale_shape.tolist()
-        for a in sorted(self._kernel_expand_axes):
-            kernel_scale_shape.insert(a, 1)
-        for a in sorted(self._kernel_squeeze_axes, reverse=True):
-            kernel_scale_shape.pop(a)
-        return kernel_scale_shape
-
-    def _adjust_scale_for_dequant(self, scale):
-        """Adjusts scale tensor layout for dequantization.
-
-        Helper method to handle scale adjustments before dequantization.
-        This is the reverse order of operations used when building the layer.
-
-        Args:
-            scale: The scale tensor to adjust.
-
-        Returns:
-            The adjusted scale tensor.
-        """
-        if self._kernel_squeeze_axes:
-            scale = ops.expand_dims(scale, axis=self._kernel_squeeze_axes)
-        if self._kernel_expand_axes:
-            scale = ops.squeeze(scale, axis=self._kernel_expand_axes)
-        if self._kernel_transpose_axes:
-            # We need to reverse the transpose operation.
-            reverse_transpose = sorted(
-                range(len(self._kernel_transpose_axes)),
-                key=self._kernel_transpose_axes.__getitem__,
-            )
-            scale = ops.transpose(scale, axes=reverse_transpose)
-        return scale
-
-    def _adjust_scale_for_quant(self, scale, tensor_type="kernel"):
-        """Adjusts scale tensor layout after quantization.
-
-        Helper method to handle scale adjustments after re-quantization.
-        This is the forward order of operations used when building the layer.
-
-        Args:
-            scale: The scale tensor to adjust.
-            tensor_type: The type of tensor to adjust the scale for.
-                "kernel" or "input".
-        Returns:
-            The adjusted scale tensor.
-        """
-        if tensor_type == "kernel":
-            transpose_axes = self._kernel_transpose_axes
-            expand_axes = self._kernel_expand_axes
-            squeeze_axes = self._kernel_squeeze_axes
-        elif tensor_type == "input":
-            transpose_axes = self._input_transpose_axes
-            expand_axes = self._input_expand_axes
-            squeeze_axes = self._input_squeeze_axes
-        else:
-            raise ValueError(f"Invalid tensor type: {tensor_type}")
-
-        if transpose_axes:
-            scale = ops.transpose(scale, transpose_axes)
-        if expand_axes:
-            scale = ops.expand_dims(scale, axis=expand_axes)
-        if squeeze_axes:
-            scale = ops.squeeze(scale, axis=squeeze_axes)
-        return scale
-
-    def _set_quantization_info(self):
-        if hasattr(self, "_input_reduced_axes"):
-            # Already set.
-            return
-        (
-            self._input_reduced_axes,
-            self._kernel_reduced_axes,
-            self._input_transpose_axes,
-            self._kernel_transpose_axes,
-            self._input_expand_axes,
-            self._kernel_expand_axes,
-            self._input_squeeze_axes,
-            self._kernel_squeeze_axes,
-            self._custom_gradient_equation,
-            self._kernel_reverse_transpose_axes,
-        ) = _analyze_quantization_info(
-            self.equation, [None] * self.input_spec.ndim
-        )
-
 
 def _analyze_einsum_string(equation, bias_axes, input_shape, output_shape):
     """Parses an einsum string to determine the shapes of the weights.
@@ -568,38 +465,13 @@ def _analyze_einsum_string(equation, bias_axes, input_shape, output_shape):
         ValueError: If the einsum `equation` is not in a supported format.
     """
 
-    dot_replaced_string = re.sub(r"\.\.\.", "0", equation)
-
-    # This is the case where no ellipses are present in the string.
-    split_string = re.match(
-        "([a-zA-Z]+),([a-zA-Z]+)->([a-zA-Z]+)", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape
-        )
-
-    # This is the case where ellipses are present on the left.
-    split_string = re.match(
-        "0([a-zA-Z]+),([a-zA-Z]+)->0([a-zA-Z]+)", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape, left_elided=True
-        )
-
-    # This is the case where ellipses are present on the right.
-    split_string = re.match(
-        "([a-zA-Z]{2,})0,([a-zA-Z]+)->([a-zA-Z]+)0", dot_replaced_string
-    )
-    if split_string:
-        return _analyze_split_string(
-            split_string, bias_axes, input_shape, output_shape
-        )
-
-    raise ValueError(
-        f"Invalid einsum equation '{equation}'. Equations must be in the form "
-        "[X],[Y]->[Z], ...[X],[Y]->...[Z], or [X]...,[Y]->[Z]...."
+    *specs, ellipsis = _split_equation(equation)
+    return _analyze_split_string(
+        specs,
+        bias_axes,
+        input_shape,
+        output_shape,
+        left_elided=ellipsis == "left",
     )
 
 
@@ -639,8 +511,7 @@ def _analyze_split_string(
     and calculates the required shapes for the kernel and bias weights.
 
     Args:
-        split_string: A regex match object containing the input, weight, and
-            output specifications.
+        split_string: The input, weight and output specifications.
         bias_axes: A string indicating which output axes to apply a bias to.
         input_shape: The shape of the input tensor.
         output_shape: The user-specified partial shape of the output tensor.
@@ -657,9 +528,7 @@ def _analyze_split_string(
         ValueError: If there are inconsistencies between the input and output
             shapes or if the equation specifications are invalid.
     """
-    input_spec = split_string.group(1)
-    weight_spec = split_string.group(2)
-    output_spec = split_string.group(3)
+    input_spec, weight_spec, output_spec = split_string
     elided = len(input_shape) - len(input_spec)
 
     if isinstance(output_shape, int):
@@ -829,109 +698,3 @@ class EinsumAxes:
     def gradient_equation(self):
         """The einsum that produces the inputs gradient."""
         return f"{self.output},{self.kernel}->{self.inputs}"
-
-
-def _analyze_quantization_info(equation, input_shape):
-    """Analyzes an einsum equation to derive information for quantization.
-
-    This function canonicalizes the einsum equation (handling ellipses) and
-    determines the necessary tensor manipulations (reduction, transposition,
-    expansion, squeezing) required to correctly apply per-axis quantization
-    to the inputs and kernel. It also derives the einsum equation needed for
-    the custom gradient.
-
-    Args:
-        equation: The einsum equation string.
-        input_shape: The shape of the input tensor.
-
-    Returns:
-        A tuple containing metadata for quantization operations:
-        `input_reduced_axes`: Axes to reduce for input quantization.
-        `kernel_reduced_axes`: Axes to reduce for kernel quantization.
-        `input_transpose_axes`: Permutation for transposing the input scale.
-        `kernel_transpose_axes`: Permutation for transposing the kernel scale.
-        `input_expand_axes`: Axes to expand for the input scale.
-        `kernel_expand_axes`: Axes to expand for the kernel scale.
-        `input_squeeze_axes`: Axes to squeeze from the input scale.
-        `kernel_squeeze_axes`: Axes to squeeze from the kernel scale.
-        `custom_gradient_equation`: Einsum equation for the backward pass.
-        `kernel_reverse_transpose_axes`: Permutation to reverse the kernel
-            scale transpose.
-    """
-
-    axes = EinsumAxes.from_equation(equation, len(input_shape))
-    input_spec, weight_spec, output_spec = axes.inputs, axes.kernel, axes.output
-
-    # Determine the axes that should be reduced by the quantizer
-    input_reduced_axes = []
-    weight_reduced_axes = []
-    for i, label in enumerate(input_spec):
-        index = output_spec.find(label)
-        if index == -1:
-            input_reduced_axes.append(i)
-    for i, label in enumerate(weight_spec):
-        index = output_spec.find(label)
-        if index == -1:
-            weight_reduced_axes.append(i)
-
-    # Determine the axes of `ops.expand_dims`
-    input_expand_axes = []
-    weight_expand_axes = []
-    for i, label in enumerate(output_spec):
-        index_input = input_spec.find(label)
-        index_weight = weight_spec.find(label)
-        if index_input == -1:
-            input_expand_axes.append(i)
-        if index_weight == -1:
-            weight_expand_axes.append(i)
-
-    # Determine the axes of `ops.transpose`
-    input_transpose_axes = []
-    weight_transpose_axes = []
-    for i, label in enumerate(output_spec):
-        index_input = input_spec.find(label)
-        index_weight = weight_spec.find(label)
-        if index_input != -1:
-            input_transpose_axes.append(index_input)
-        if index_weight != -1:
-            weight_transpose_axes.append(index_weight)
-    # Postprocess the information:
-    # 1. Add dummy axes (1) to transpose_axes
-    # 2. Add axis to squeeze_axes if 1. failed. The axis then stays at its
-    #    own position, so the squeeze removes that size-1 axis.
-    input_squeeze_axes = []
-    weight_squeeze_axes = []
-    for ori_index in input_reduced_axes:
-        try:
-            index = input_expand_axes.pop(0)
-        except IndexError:
-            input_squeeze_axes.append(ori_index)
-            index = ori_index
-        input_transpose_axes.insert(index, ori_index)
-    for ori_index in weight_reduced_axes:
-        try:
-            index = weight_expand_axes.pop(0)
-        except IndexError:
-            weight_squeeze_axes.append(ori_index)
-            index = ori_index
-        weight_transpose_axes.insert(index, ori_index)
-    # Prepare equation for `einsum_with_inputs_gradient`
-    custom_gradient_equation = f"{output_spec},{weight_spec}->{input_spec}"
-    weight_reverse_transpose_axes = [
-        i
-        for (_, i) in sorted(
-            (v, i) for (i, v) in enumerate(weight_transpose_axes)
-        )
-    ]
-    return (
-        input_reduced_axes,
-        weight_reduced_axes,
-        input_transpose_axes,
-        weight_transpose_axes,
-        input_expand_axes,
-        weight_expand_axes,
-        input_squeeze_axes,
-        weight_squeeze_axes,
-        custom_gradient_equation,
-        weight_reverse_transpose_axes,
-    )
