@@ -1563,6 +1563,67 @@ class Layer(BackendLayer, Operation):
         strategy = strategy_registry.get_strategy(self.quantization_mode)
         return strategy.encode(self, merged, self.quantization_config)
 
+    def _save_serialized_variables(self, store, name):
+        """Saves the variables `variable_serialization_spec` lists.
+
+        `name` is the spec entry of the layer's weight (`"kernel"` or
+        `"embeddings"`), held at `_<name>`. The weight and its scale and
+        zero point come from `_get_weight_with_merged_lora`. Each variable
+        is stored under its position in the spec ("0", "1", ...); an entry
+        whose variable is `None` for this configuration is skipped.
+        """
+        if not self.built:
+            return
+        mode = self.quantization_mode
+        if mode not in self.variable_serialization_spec:
+            raise self._quantization_mode_error(mode)
+        strategy = strategy_registry.get_strategy(mode)
+        if strategy is not None:
+            strategy.check_saveable(self)
+        value, scale, zero_point = self._get_weight_with_merged_lora(name)
+        merged = {name: value}
+        if scale is not None:
+            merged[f"{name}_scale"] = scale
+        if zero_point is not None:
+            merged[f"{name}_zero"] = zero_point
+        idx = 0
+        for entry in self.variable_serialization_spec[mode]:
+            value = merged[entry] if entry in merged else getattr(self, entry)
+            if value is None:
+                continue
+            store[str(idx)] = value
+            idx += 1
+
+    def _load_serialized_variables(self, store, name):
+        """Loads the variables `_save_serialized_variables` saved."""
+        if not self.lora_enabled:
+            self._check_load_own_variables(store)
+        if not self.built:
+            return
+        mode = self.quantization_mode
+        if mode not in self.variable_serialization_spec:
+            raise self._quantization_mode_error(mode)
+        idx = 0
+        for entry in self.variable_serialization_spec[mode]:
+            target = getattr(self, f"_{name}" if entry == name else entry)
+            if target is None:
+                continue
+            value = store[str(idx)]
+            if entry == "g_idx":
+                # `g_idx` is stored as `float32` (see build). Cast to the
+                # variable dtype on assign so both legacy `float32`
+                # checkpoints and any `int32`-saved ones load correctly.
+                value = ops.cast(value, target.dtype)
+            target.assign(value)
+            idx += 1
+        if self.lora_enabled:
+            for factor in ("a", "b"):
+                lora = getattr(self, f"lora_{name}_{factor}")
+                lora.assign(ops.zeros(lora.shape))
+        strategy = strategy_registry.get_strategy(mode)
+        if strategy is not None:
+            strategy.variables_loaded(self)
+
     def _quantization_type_owner(self):
         """The class whose `_quantization_geometry` definition applies."""
         for cls in type(self).__mro__:
