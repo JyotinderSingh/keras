@@ -15,6 +15,7 @@ from keras.src.quantizers.geometry import LookupGeometry
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import QuantizationConfig
+from keras.src.quantizers.quantizers import ternarize
 
 
 class StrategyRegistryTest(testing.TestCase):
@@ -34,7 +35,7 @@ class StrategyRegistryTest(testing.TestCase):
 
     def test_register_requires_name(self):
         class Nameless(strategy_registry.QuantizationStrategy):
-            requires_config = True
+            pass
 
         with self.assertRaisesRegex(ValueError, "non-empty string `name`"):
             strategy_registry.register_quantization_strategy(Nameless)
@@ -42,7 +43,6 @@ class StrategyRegistryTest(testing.TestCase):
     def test_register_rejects_duplicates(self):
         class Duplicate(strategy_registry.QuantizationStrategy):
             name = "int8"
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, "already registered"):
             strategy_registry.register_quantization_strategy(Duplicate)
@@ -58,7 +58,6 @@ class StrategyRegistryTest(testing.TestCase):
 
         class Colliding(strategy_registry.QuantizationStrategy):
             name = colliding_name
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, "collides"):
             strategy_registry.register_quantization_strategy(Colliding)
@@ -69,11 +68,9 @@ class StrategyRegistryTest(testing.TestCase):
         # share a prefix without ambiguity.
         class Custom(strategy_registry.QuantizationStrategy):
             name = "custom"
-            requires_config = True
 
         class CustomTwo(strategy_registry.QuantizationStrategy):
             name = "custom2"
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(Custom)
         try:
@@ -98,7 +95,6 @@ class StrategyRegistryTest(testing.TestCase):
 
         class Reserved(strategy_registry.QuantizationStrategy):
             name = reserved_name
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, error):
             strategy_registry.register_quantization_strategy(Reserved)
@@ -110,7 +106,6 @@ class StrategyRegistryTest(testing.TestCase):
         # "mixed" prefixing "mixed_bfloat16") must not hijack them.
         class MixedMode(strategy_registry.QuantizationStrategy):
             name = "mixed"
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(MixedMode)
         try:
@@ -126,7 +121,6 @@ class StrategyRegistryTest(testing.TestCase):
         @strategy_registry.register_quantization_strategy
         class Decorated(strategy_registry.QuantizationStrategy):
             name = "decorated"
-            requires_config = True
 
         try:
             self.assertIsInstance(Decorated, type)
@@ -138,16 +132,6 @@ class StrategyRegistryTest(testing.TestCase):
             self.assertIsInstance(Sub, type)
         finally:
             strategy_registry.unregister_quantization_strategy("decorated")
-
-    def test_register_requires_config_source(self):
-        # A mode must be able to produce a config: via config_cls, via
-        # requires_config (explicit config mandatory), or by overriding
-        # default_config. Registration fails otherwise, not first use.
-        class NoConfig(strategy_registry.QuantizationStrategy):
-            name = "noconfig"
-
-        with self.assertRaisesRegex(ValueError, "must define `config_cls`"):
-            strategy_registry.register_quantization_strategy(NoConfig)
 
 
 class PolicyCodecCorpusTest(testing.TestCase):
@@ -556,3 +540,192 @@ class ProjectionOnlyModeTest(testing.TestCase):
         self.assertIsNone(model.get_layer("emb").quantization_mode)
         self.assertEqual(model.get_layer("proj").quantization_mode, "float8")
         model(np.array([[1, 2, 3]]))
+
+
+RECIPE_PROJECTION_SPEC = {
+    None: ["kernel"],
+    "int8": ["kernel", "kernel_scale"],
+    "int4": ["kernel", "kernel_scale", "kernel_zero", "g_idx"],
+    "float8": [
+        "kernel",
+        "inputs_scale",
+        "inputs_amax_history",
+        "kernel_scale",
+        "kernel_amax_history",
+        "outputs_grad_scale",
+        "outputs_grad_amax_history",
+    ],
+    "ternary": ["kernel", "kernel_scale"],
+}
+
+
+class RecipeProjection(layers.Layer):
+    """A third-party projection written per the `geometry.py` recipe.
+
+    It has no `units` attribute and no bias; the subclasses supply the
+    kernel shape and the geometry.
+    """
+
+    def __init__(self, features, **kwargs):
+        super().__init__(**kwargs)
+        self.features = features
+        self.activation = None
+
+    def kernel_shape_for(self, input_shape):
+        raise NotImplementedError
+
+    def build(self, input_shape):
+        self.kernel_shape = self.kernel_shape_for(input_shape)
+        if self.quantization_mode:
+            self.quantized_build(
+                self.kernel_shape,
+                mode=self.quantization_mode,
+                config=self.quantization_config,
+            )
+        if not self._strategy_owns_weight_storage():
+            self._kernel = self.add_weight(
+                name="kernel", shape=self.kernel_shape
+            )
+        self.bias = None
+
+    @property
+    def kernel(self):
+        quantized_weight = self._quantized_weight()
+        if quantized_weight is None:
+            return self._kernel
+        return quantized_weight.unpack()
+
+    def call(self, inputs):
+        return self._quantization_geometry().contract(inputs, self._kernel)
+
+    @property
+    def variable_serialization_spec(self):
+        return RECIPE_PROJECTION_SPEC
+
+    def save_own_variables(self, store):
+        self._save_serialized_variables(store, "kernel")
+
+    def load_own_variables(self, store):
+        self._load_serialized_variables(store, "kernel")
+
+
+class ReversedInputsGeometry(ProjectionGeometry):
+    """A 2-D projection that reads its input features in reverse order."""
+
+    def contract(self, inputs, kernel):
+        return ops.matmul(ops.flip(inputs, axis=-1), kernel)
+
+
+class ReversedInputsDense(RecipeProjection):
+    def kernel_shape_for(self, input_shape):
+        return (input_shape[-1], self.features)
+
+    def _quantization_geometry(self):
+        return ReversedInputsGeometry(self)
+
+
+class PointwiseGeometry(ProjectionGeometry):
+    """A 3-D `(1, input_dim, features)` kernel, as a pointwise convolution."""
+
+    def contract(self, inputs, kernel):
+        return ops.einsum("btc,kcd->btd", inputs, kernel)
+
+
+class PointwiseProjection(RecipeProjection):
+    def kernel_shape_for(self, input_shape):
+        return (1, input_shape[-1], self.features)
+
+    def _quantization_geometry(self):
+        return PointwiseGeometry(self)
+
+
+class CustomProjectionTest(testing.TestCase):
+    """Third-party projections stay quantizable with the built-in modes."""
+
+    @parameterized.named_parameters(
+        ("int8", "int8"),
+        ("int4", "int4"),
+        ("float8", "float8"),
+        ("ternary", "ternary"),
+    )
+    def test_quantizes_saves_and_loads(self, mode):
+        layer = ReversedInputsDense(4)
+        layer.build((None, 6))
+        x = np.random.uniform(-1, 1, size=(3, 6)).astype("float32")
+        layer.quantize(mode)
+        self.assertEqual(layer.quantization_mode, mode)
+        y = layer(x)
+        store = {}
+        layer.save_own_variables(store)
+        restored = ReversedInputsDense(4, dtype=layer.dtype_policy.name)
+        restored.build((None, 6))
+        restored.load_own_variables(store)
+        self.assertAllClose(restored(x), y)
+
+    def test_ternary_contracts_through_the_geometry(self):
+        layer = ReversedInputsDense(4)
+        layer.build((None, 6))
+        x = np.random.uniform(-1, 1, size=(3, 6)).astype("float32")
+        ternary_kernel, scale = ternarize(layer._kernel)
+        expected = ops.multiply(
+            ops.matmul(ops.flip(x, axis=-1), ternary_kernel), scale
+        )
+        layer.quantize("ternary")
+        self.assertAllClose(layer(x), expected)
+
+    def test_ternary_refuses_a_kernel_that_is_not_2d(self):
+        layer = PointwiseProjection(4)
+        layer.build((None, 5, 6))
+        kernel = ops.convert_to_numpy(layer._kernel)
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.quantize("ternary")
+        # Refused before the layer changes.
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+        self.assertAllEqual(layer._kernel, kernel)
+
+    def test_ternary_build_refuses_a_kernel_that_is_not_2d(self):
+        # A layer built from a ternary policy, as on load.
+        layer = PointwiseProjection(4, dtype="ternary_from_float32")
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.build((None, 5, 6))
+
+    def test_model_quantize_skips_a_kernel_that_is_not_2d(self):
+        model = models.Sequential(
+            [
+                layers.Input((5, 6)),
+                PointwiseProjection(4, name="pointwise"),
+                layers.Dense(3, name="dense"),
+            ]
+        )
+        model.quantize("ternary")
+        self.assertIsNone(model.get_layer("pointwise").quantization_mode)
+        self.assertEqual(model.get_layer("dense").quantization_mode, "ternary")
+        model(np.ones((2, 5, 6), "float32"))
+
+    def test_missing_build_attributes_are_refused_before_the_change(self):
+        class WithoutActivation(layers.Layer):
+            def build(self, input_shape):
+                self.kernel_shape = (input_shape[-1], 4)
+                self._kernel = self.add_weight(
+                    name="kernel", shape=self.kernel_shape
+                )
+                self.bias = None
+
+            def call(self, inputs):
+                return ops.matmul(inputs, self._kernel)
+
+            def _quantization_geometry(self):
+                return ProjectionGeometry(self)
+
+            @property
+            def variable_serialization_spec(self):
+                return RECIPE_PROJECTION_SPEC
+
+        layer = WithoutActivation()
+        layer.build((None, 6))
+        with self.assertRaisesRegex(ValueError, "did not set activation"):
+            layer.quantize("int8")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertEqual(tuple(layer._kernel.shape), (6, 4))

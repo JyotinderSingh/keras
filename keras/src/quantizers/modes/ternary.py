@@ -29,17 +29,27 @@ class TernaryStrategy(QuantizationStrategy):
 
     def check_quantizable(self, layer):
         geometry = self.require_geometry(layer)
-        # The ternary math is written for the 2-D kernel of a `Dense`.
+        self._check_kernel(layer, geometry, geometry.weight_shape)
+
+    def _check_kernel(self, layer, geometry, kernel_shape):
+        # The ternary math is written for a 2-D `(input_dim, units)` kernel:
+        # it packs the last axis and contracts through the geometry.
         if isinstance(geometry, EinsumProjectionGeometry):
             raise NotImplementedError(
                 "Quantization mode 'ternary' supports only a `Dense` kernel, "
                 "not the einsum kernel of layer "
                 f"{layer.__class__.__name__}."
             )
+        if len(kernel_shape) != 2:
+            raise NotImplementedError(
+                "Quantization mode 'ternary' supports only a 2-D kernel. "
+                f"Layer {layer.__class__.__name__} has a kernel of shape "
+                f"{tuple(kernel_shape)}."
+            )
 
     def build(self, layer, input_shape, config):
         del config
-        self.check_quantizable(layer)
+        self._check_kernel(layer, self.require_geometry(layer), input_shape)
         input_dim, units = input_shape
         # Stored as `[in, packed(out)]` like every other packed projection:
         # five trits per byte (3^5 == 243 <= 256) along the output axis.
@@ -63,25 +73,27 @@ class TernaryStrategy(QuantizationStrategy):
 
     def quantized_weight(self, layer):
         # The scale is the scalar multiplier `beta`. The forward pass
-        # applies it to the matmul output rather than to the codes.
+        # applies it to the contraction output rather than to the codes.
+        shape = self.require_geometry(layer).weight_shape
         return QuantizedWeight(
             codes=layer._kernel,
             scale=layer.kernel_scale,
-            layout=TernaryTrits(axis=-1, orig_len=layer.units),
+            layout=TernaryTrits(axis=-1, orig_len=shape[-1]),
             scheme=WeightScheme(code_range=(-1, 1), scale_form="multiplier"),
-            shape=self.require_geometry(layer).weight_shape,
+            shape=shape,
         )
 
     def call(self, layer, inputs, **kwargs):
         # A storage format, not a compute win: the packed kernel is unpacked
-        # to `{-1, 0, +1}` on every call and fed to a standard matmul, so
-        # inference is slightly slower than a float `Dense` call. A native
-        # ternary kernel reading the packed format would be needed for a
-        # speedup.
+        # to `{-1, 0, +1}` on every call and fed to a standard contraction,
+        # so inference is slightly slower than a float `Dense` call. A
+        # native ternary kernel reading the packed format would be needed
+        # for a speedup.
+        geometry = self.require_geometry(layer)
         kernel = ops.cast(
             self.quantized_weight(layer).unpack(), layer.compute_dtype
         )
-        x = ops.matmul(inputs, kernel)
+        x = geometry.contract(inputs, kernel)
         x = ops.multiply(x, ops.cast(layer.kernel_scale, layer.compute_dtype))
         return apply_bias_activation(layer, x)
 
@@ -96,6 +108,6 @@ class TernaryStrategy(QuantizationStrategy):
         kernel_ternary, beta = geometry.ternary_values()
         packed_kernel, _, _ = pack_ternary(kernel_ternary, axis=-1)
         del layer._kernel
-        layer.quantized_build(kernel_shape, "ternary")
+        layer.quantized_build(kernel_shape, self.name)
         layer._kernel.assign(packed_kernel)
         layer.kernel_scale.assign(beta)

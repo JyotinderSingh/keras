@@ -11,9 +11,11 @@ the layer changes.
 
 The table holds the third-party layers of `quantization_test_utils`: a
 layer outside Keras that follows the quantization protocol runs every
-stage with every mode it lists, and the calibration modes also run on it
-through `Model.quantize`. `ReleasedProtocolLayer` covers a layer on the
-per-layer protocol of Keras 3.12-3.15.
+stage with every mode it lists whose geometry the mode handles, and the
+calibration modes also run on it through `Model.quantize`. The ternary
+mode handles only a 2-D kernel, so it refuses `Pointwise1D` before the
+layer changes. `ReleasedProtocolLayer` covers a layer on the per-layer
+protocol of Keras 3.12-3.15.
 """
 
 import os
@@ -118,7 +120,8 @@ SUPPORTED = {
     "int4_per_channel": ALL_PROJECTIONS + ALL_LOOKUPS,
     "int4_grouped": ALL_PROJECTIONS + ALL_LOOKUPS,
     "float8": ALL_PROJECTIONS,
-    "ternary": ["dense", "ternary_dense"] + THIRD_PARTY_PROJECTIONS,
+    # `pointwise` lists ternary, but its kernel is 3-D.
+    "ternary": ["dense", "ternary_dense", "permuted_dense"],
     "gptq": ALL_PROJECTIONS,
     "awq": ALL_PROJECTIONS,
 }
@@ -161,12 +164,6 @@ def _skip_known_gaps(test, mode_name, kind):
     ):
         test.skipTest(
             "XLA:CPU computes the int8 dot of a batch-axis einsum wrongly."
-        )
-    if MODES[mode_name].mode == "ternary" and LAYERS[kind].third_party:
-        test.skipTest(
-            "The ternary mode contracts with a plain matmul over a 2-D "
-            "kernel, so it ignores a geometry's `contract` and fails on an "
-            "N-D kernel."
         )
 
 

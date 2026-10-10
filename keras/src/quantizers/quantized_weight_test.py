@@ -1,5 +1,3 @@
-from unittest import mock
-
 import numpy as np
 import pytest
 from absl.testing import parameterized
@@ -627,37 +625,3 @@ class GeometryDispatchTest(testing.TestCase):
         layer = layers.ReversibleEmbedding(10, 4, tie_weights=False)
         layer.build((None,))
         self.assertEqual(NoCodes().quantized_weights(layer), ())
-
-    @parameterized.named_parameters(
-        ("build", "_build_projection"),
-        ("call", "_call_projection"),
-        ("quantized_weight", "_get_projection_quantized_weight"),
-    )
-    def test_missing_handler_refuses_before_the_layer_changes(self, handler):
-        incomplete = type("Incomplete", (Int8Strategy,), {handler: None})
-        layer = layers.Dense(4)
-        layer.build((None, 3))
-        kernel = ops.convert_to_numpy(layer._kernel)
-        modes = {"int8": incomplete()}
-        with mock.patch.dict(strategy_registry._MODE_TO_STRATEGY, modes):
-            with self.assertRaisesRegex(NotImplementedError, handler):
-                layer.quantize("int8")
-        self.assertIsNone(layer.quantization_mode)
-        self.assertIsNone(layer.quantization_config)
-        self.assertAllEqual(layer._kernel, kernel)
-
-    def test_overridden_verb_needs_no_handler(self):
-        class OwnCall(Int8Strategy):
-            _call_projection = None
-
-            def call(self, layer, *args, **kwargs):
-                return Int8Strategy._call_projection(
-                    self, layer, *args, **kwargs
-                )
-
-        layer = layers.Dense(4)
-        layer.build((None, 3))
-        modes = {"int8": OwnCall()}
-        with mock.patch.dict(strategy_registry._MODE_TO_STRATEGY, modes):
-            layer.quantize("int8")
-        self.assertEqual(layer.quantization_mode, "int8")

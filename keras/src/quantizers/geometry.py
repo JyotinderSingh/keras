@@ -43,13 +43,18 @@ class MyProjection(Layer):
         }
 ```
 
+A mode refuses a layer whose geometry family it does not handle
+(`QuantizationStrategy.geometry_families`): int8 and int4 handle
+projections and lookups; float8, ternary, GPTQ and AWQ handle projections
+only, and ternary only a 2-D kernel.
+
 The geometry is a thin adapter, so the strategies still read
 state directly off the layer. Beyond what `Layer` already provides, a
 quantizable layer must define:
 
 - Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
-  shape, recorded in `build()`), `units`, `bias` and `activation` (either
-  may be `None`). `EinsumProjectionGeometry` additionally relies on the
+  shape, recorded in `build()`), `bias` and `activation` (either may be
+  `None`). `EinsumProjectionGeometry` additionally relies on the
   `einsum_axes` record `EinsumDense` derives from its equation in
   `build()`, and on the equation analysis `EinsumDense` prepares in
   `_set_quantization_info()` (called through the geometry's `prepare()`).
@@ -88,12 +93,11 @@ knowledge of the layer.
 Two things this protocol deliberately does not offer. A layer cannot
 override one strategy's math for itself alone, because that surface lives
 on the strategy; a layer that contracts its kernel differently overrides
-the geometry hooks, and anything beyond that means replacing the strategy (by
-subclassing it, overriding the one handler, and registering it under a
-new mode name). A new geometry family, on the other hand, needs no dispatcher
-change at all: declare its `family`, list it in the mode's
-`geometry_families` and implement the strategy's handlers for it, which
-`GeometryDispatchStrategy` lists (`keras.src.quantizers.modes.common`).
+the geometry hooks, and anything beyond that is a change to the mode itself.
+A layer also cannot bring a new geometry family: each mode lists the
+families it handles in `geometry_families` and implements their handlers,
+which `GeometryDispatchStrategy` (`keras.src.quantizers.modes.common`)
+lists, so a new family is a change to the built-in modes.
 """
 
 import dataclasses
@@ -268,7 +272,7 @@ class ProjectionGeometry(QuantizationGeometry):
     """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul."""
 
     family = "projection"
-    build_attributes = ("kernel_shape",)
+    build_attributes = ("kernel_shape", "bias", "activation")
 
     @property
     def weight_shape(self):
@@ -416,7 +420,7 @@ class EinsumProjectionGeometry(ProjectionGeometry):
     implementation; this class routes the strategies to it.
     """
 
-    build_attributes = ("kernel_shape", "einsum_axes")
+    build_attributes = ("kernel_shape", "einsum_axes", "bias", "activation")
 
     def prepare(self):
         self.layer._set_quantization_info()
