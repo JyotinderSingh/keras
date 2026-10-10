@@ -26,6 +26,7 @@ from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
@@ -217,18 +218,7 @@ class CalibrationStrategy(QuantizationStrategy):
                     trainable=False,
                 ),
             )
-        # `g_idx` is stored as `float32` because TF has no GPU kernel for
-        # int32 resource variables (would pin the variable to CPU and break
-        # jit_compile on GPU); consumers cast to int32 on-device.
-        # Not autocast: bfloat16 holds integers exactly only up to 256.
-        layer.g_idx = layer.add_weight(
-            name="g_idx",
-            shape=(rows,),
-            initializer="zeros",
-            dtype="float32",
-            trainable=False,
-            autocast=False,
-        )
+        layer.g_idx = add_group_index(layer, rows)
 
     # --- Calibration state ------------------------------------------------
 
