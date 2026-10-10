@@ -6,13 +6,18 @@ from keras.src import layers
 from keras.src import models
 from keras.src import ops
 from keras.src import testing
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.calibration_run import _stack_calibration_batch
 from keras.src.quantizers.calibration_run import find_layers_in_block
 from keras.src.quantizers.calibration_run import get_dataloader
 from keras.src.quantizers.calibration_run import gptq_quantize
 from keras.src.quantizers.calibration_run import stream_hessians
-from keras.src.quantizers.gptq import GPTQ
 from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
+from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
+from keras.src.quantizers.quantization_test_utils import token_dataset
+from keras.src.utils.rng_utils import set_random_seed
 
 VOCAB_SIZE = 100
 
@@ -267,7 +272,7 @@ class TestGPTQCore(testing.TestCase):
     def test_calibration_batching_produces_identical_hessian(self):
         """The Hessian accumulated during calibration must be identical
         whether calibration samples are streamed one at a time or in
-        batches. `update_hessian_with_batch` flattens activations to
+        batches. `GPTQCalibrator.observe` flattens activations to
         `[-1, features]`, so batching only changes the number of forward
         passes, not the math."""
         d_model = 16
@@ -289,7 +294,10 @@ class TestGPTQCore(testing.TestCase):
         def accumulate(batch_size):
             layers_map = find_layers_in_block(block)
             gptq_objects = {
-                name: GPTQ(layer) for name, layer in layers_map.items()
+                name: calibrate_layer(
+                    layer, calibration_config("gptq"), solve=False
+                )
+                for name, layer in layers_map.items()
             }
             with stream_hessians(layers_map, gptq_objects):
                 for start in range(0, num_samples, batch_size):
@@ -442,3 +450,61 @@ class TestDataloaderReproducibility(testing.TestCase):
         self.assertEqual(out.shape, (4, 1, 8))
         self.assertAllClose(out[:, 0, 0], np.array([88, 336, 584, 832]))
         self.assertAllClose(out[0, 0], np.arange(88, 96))
+
+
+class CalibrationRunTest(testing.TestCase):
+    """The pieces the calibration drivers share, once per mode."""
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_resolution_error_names_the_received_policy(self, mode):
+        layer = layers.Dense(4)
+        layer.build((None, 3))
+        strategy = strategy_registry.get_strategy(mode)
+        with self.assertRaisesRegex(
+            ValueError,
+            f"{mode.upper()} quantization.*Received: dtype_policy=<.*float32",
+        ):
+            strategy.resolve_group_size(layer, None)
+
+
+@pytest.mark.requires_trainable_backend
+class CalibrationRunModelTest(testing.TestCase):
+    """The drivers as `model.quantize` runs them."""
+
+    def test_calibration_under_a_bfloat16_policy(self):
+        """GPTQ solves in float32 when the variables are `bfloat16`.
+
+        It solved in the variable dtype, and its column updates then
+        failed with a dtype mismatch on JAX and TensorFlow.
+        """
+        set_random_seed(123)
+        seq_len, vocab_size, embed_dim = 16, 48, 8
+        model, structure = tiny_calibration_model(
+            [
+                layers.Dense(16, activation="relu", dtype="bfloat16"),
+                layers.Dense(embed_dim, dtype="bfloat16"),
+            ],
+            vocab_size=vocab_size,
+            sequence_length=seq_len,
+            embed_dim=embed_dim,
+            dtype="bfloat16",
+        )
+        rng = np.random.default_rng(seed=7)
+        config = calibration_config(
+            "gptq",
+            dataset=token_dataset(4, seq_len, vocab_size, rng),
+            tokenizer=lambda text: text,
+            weight_bits=4,
+            group_size=8,
+            num_samples=4,
+            sequence_length=seq_len,
+            quantization_layer_structure=structure,
+        )
+        model.quantize("gptq", config=config)
+        (block,) = structure["sequential_blocks"]
+        for layer in block.layers:
+            self.assertFalse(layer.calibration_pending)
+        outputs = ops.convert_to_numpy(
+            ops.cast(model(config.dataset[0]), "float32")
+        )
+        self.assertTrue(np.isfinite(outputs).all())
