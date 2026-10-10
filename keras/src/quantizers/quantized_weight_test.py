@@ -11,7 +11,6 @@ from keras.src import ops
 from keras.src import testing
 from keras.src.quantizers import packing
 from keras.src.quantizers import strategy_registry
-from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.int8 import Int8Strategy
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantized_weight import Int2Quads
@@ -450,19 +449,6 @@ class LayerViewTest(testing.TestCase):
         self.assertIsNone(layer._quantized_weight())
         layer.quantize("float8")
         self.assertIsNone(layer._quantized_weight())
-
-    def test_uncalibrated_calibration_mode_has_no_view(self):
-        layer = layers.Dense(3)
-        layer.build((None, 4))
-        layer.quantize(
-            "gptq",
-            config=GPTQConfig(dataset=None, tokenizer=None, group_size=2),
-        )
-        self.assertIsNone(layer._quantized_weight())
-        # The float kernel is still what the property exposes.
-        self.assertEqual(
-            backend.standardize_dtype(layer.kernel.dtype), "float32"
-        )
 
 
 class QuantizationSummaryTest(testing.TestCase):

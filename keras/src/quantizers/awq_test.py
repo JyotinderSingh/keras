@@ -357,8 +357,6 @@ class AWQLayerTest(testing.TestCase):
             num_grid_points=10,
         )
 
-        layer.quantize(config=config)
-
         # Simulate activation capture
         calibration_data = RNG.standard_normal((64, 16)).astype("float32")
         calibrator = calibrate_layer(
@@ -384,7 +382,6 @@ class AWQLayerTest(testing.TestCase):
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=10
         )
-        layer.quantize(config=config)
 
         # A second batch with a different row count exercises the
         # weighting.
@@ -410,7 +407,6 @@ class AWQLayerTest(testing.TestCase):
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=5
         )
-        layer.quantize(config=config)
         calibrator = calibrate_layer(layer, config, solve=False)
 
         # Feed more rows than the cap across several batches.
@@ -439,7 +435,6 @@ class AWQLayerTest(testing.TestCase):
             num_grid_points=5,
             apply_clip=False,
         )
-        layer.quantize(config=config)
         calibrator = calibrate_layer(
             layer,
             config,
@@ -450,14 +445,16 @@ class AWQLayerTest(testing.TestCase):
         self.assertEqual(calibrator._clip_samples, [])
 
     def test_awq_layer_variables_created(self):
-        """Test that AWQ layer variables are properly created."""
+        """The calibration swaps the float kernel for AWQ's variables."""
         layer = layers.Dense(32)
         layer.build(input_shape=(None, 16))
 
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=10
         )
-        layer.quantize(config=config)
+        calibrate_layer(
+            layer, config, RNG.standard_normal((64, 16)).astype("float32")
+        )
 
         # Check that AWQ-specific variables exist
         self.assertTrue(hasattr(layer, "quantized_kernel"))
@@ -465,7 +462,8 @@ class AWQLayerTest(testing.TestCase):
         self.assertIsNotNone(layer.kernel_zero)
         self.assertTrue(hasattr(layer, "awq_scales"))
         self.assertIsNotNone(layer.g_idx)
-        self.assertTrue(layer.calibration_pending)
+        self.assertFalse(hasattr(layer, "_kernel"))
+        self.assertIsNone(layer.quantization_config)
 
 
 @pytest.mark.requires_trainable_backend
@@ -473,28 +471,32 @@ class AWQIntegrationTest(testing.TestCase):
     """Integration tests for AWQ quantization."""
 
     def test_dense_layer_quantize_awq(self):
-        """Test Dense layer can be quantized with AWQ."""
+        """Test Dense layer can be calibrated with AWQ."""
         layer = layers.Dense(64)
         layer.build(input_shape=(None, 32))
 
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=16, num_grid_points=5
         )
-        layer.quantize(config=config)
+        calibrate_layer(
+            layer, config, RNG.standard_normal((16, 32)).astype("float32")
+        )
 
         # Check layer is properly configured
         self.assertEqual(layer.quantization_mode, "awq")
         self.assertTrue(hasattr(layer, "awq_scales"))
 
     def test_einsum_dense_layer_quantize_awq(self):
-        """Test EinsumDense layer can be quantized with AWQ."""
+        """Test EinsumDense layer can be calibrated with AWQ."""
         layer = layers.EinsumDense("ab,bc->ac", output_shape=(64,))
         layer.build(input_shape=(None, 32))
 
         config = AWQConfig(
             dataset=None, tokenizer=None, group_size=-1, num_grid_points=5
         )
-        layer.quantize(config=config)
+        calibrate_layer(
+            layer, config, RNG.standard_normal((16, 32)).astype("float32")
+        )
 
         # Check layer is properly configured
         self.assertEqual(layer.quantization_mode, "awq")
@@ -581,9 +583,8 @@ class AWQIntegrationTest(testing.TestCase):
             getattr(restored_dense, "quantization_mode", None), "awq"
         )
         self.assertTrue(hasattr(restored_dense, "quantized_kernel"))
-        self.assertIsNone(
-            restored_dense.quantization_config.quantization_layer_structure
-        )
+        # A calibrated layer stores no config, so no structure either.
+        self.assertIsNone(restored_dense.quantization_config)
 
 
 # Constants for end-to-end tests
@@ -913,7 +914,7 @@ class AWQAccuracyTest(testing.TestCase):
         # In-structure Dense layers are quantized and calibrated.
         for dense in block.layers:
             self.assertEqual(dense.quantization_mode, "awq")
-            self.assertFalse(dense.calibration_pending)
+            self.assertFalse(hasattr(dense, "_kernel"))
 
         # Out-of-structure layers must stay completely untouched.
         self.assertIsNone(getattr(head, "quantization_mode", None))

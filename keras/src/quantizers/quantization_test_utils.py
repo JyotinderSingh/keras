@@ -28,25 +28,23 @@ def calibration_config(mode, **kwargs):
 
 
 def calibrate_layer(layer, config, *batches, solve=True):
-    """Calibrates one layer in `config.mode` on `batches` of its inputs.
+    """Calibrates a float layer in `config.mode` on `batches` of its inputs.
 
     This is the only place in the tests that constructs a `Calibrator`.
-    With `solve=True`, a float layer is quantized first, and the
-    calibrator solves for the codes after it observed the batches. With
-    `solve=False`, the layer stays as it is and the calibrator only
-    observes, so a test can read the statistics or solve later.
+    The calibrator observes the batches. With `solve=True`, it then solves
+    for the codes and swaps the float layer for the quantized one in one
+    step. With `solve=False`, the layer stays float and the calibrator
+    only observes, so a test can read the statistics or solve later.
 
     Args:
-        layer: The layer to calibrate.
+        layer: The float layer to calibrate.
         config: The config of a calibration mode.
         *batches: Inputs of the layer, observed in order.
-        solve: Whether to quantize the layer and solve.
+        solve: Whether to solve and quantize the layer.
 
     Returns:
         The calibrator.
     """
-    if solve and layer.quantization_mode is None:
-        layer.quantize(config.mode, config=config)
     strategy = strategy_registry.get_strategy(config.mode)
     calibrator = strategy.calibrator_cls(strategy, layer, config)
     for batch in batches:

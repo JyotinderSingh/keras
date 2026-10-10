@@ -1,9 +1,9 @@
 """The per-layer object of a calibration mode.
 
-A calibration mode creates one `Calibrator` per layer it calibrates, passes
-every input the layer sees during the calibration sweeps to `observe`, then
-calls `quantize`, which solves for the layer's codes and writes them back
-through the mode's strategy.
+A `CalibrationRun` creates one `Calibrator` per float layer of a block, in
+the layer's stage, passes every input the layer sees during the sweep of
+that stage to `observe`, then calls `quantize`, which solves for the
+layer's codes and swaps them in through the mode's strategy.
 `GPTQCalibrator` (a Hessian) and `AWQCalibrator` (activation magnitudes) are
 the calibrators of the built-in modes.
 """
@@ -25,9 +25,10 @@ class Calibrator:
     Args:
         strategy: The `CalibrationStrategy` of the mode the calibrator
             solves for.
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the calibrator's mode.
-        config: The mode's config object.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the mode.
+        config: The mode's config object. The solve reads its parameters,
+            and the swap builds the layer's variables from it.
     """
 
     # Warn after the run when a layer saw fewer calibration tokens than
@@ -71,7 +72,7 @@ class Calibrator:
         return ops.cast(inputs, "float32")
 
     def quantize(self):
-        """Solves for the layer's codes and writes them back."""
+        """Solves for the layer's codes and swaps them in."""
         # The solve runs in float32 whatever the layer's variable dtype.
         kernel = ops.cast(self.layer.kernel, "float32")
         if len(kernel.shape) != 2:
@@ -84,6 +85,7 @@ class Calibrator:
         # `[n_groups, out]`, so the forward pass never transposes.
         self.strategy.write_back(
             self.layer,
+            self.config,
             ops.transpose(codes),
             ops.transpose(scale),
             ops.transpose(zero),

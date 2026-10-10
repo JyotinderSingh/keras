@@ -287,8 +287,8 @@ class GPTQCalibrator(Calibrator):
 
     Args:
         strategy: The `gptq` mode's `CalibrationStrategy`.
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the `gptq` mode.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the `gptq` mode.
         config: `GPTQConfig` instance with quantization parameters.
     """
 
