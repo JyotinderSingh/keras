@@ -23,6 +23,7 @@ from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import calibration_statistic
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
 from keras.src.quantizers.quantization_test_utils import token_dataset
+from keras.src.quantizers.report import QuantizationReport
 from keras.src.utils.rng_utils import set_random_seed
 
 VOCAB_SIZE = 100
@@ -413,6 +414,23 @@ class CalibrationRunTest(testing.TestCase):
                 calibrate_layer(layer, calibration_config(mode), solve=False)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_equation_without_a_view_is_refused_before_the_layer_changes(
+        self, mode
+    ):
+        layer = layers.EinsumDense("abc,cd->ad", output_shape=(5,))
+        layer.build((None, 3, 8))
+        weights = [ops.convert_to_numpy(w) for w in layer.weights]
+        with self.assertRaisesRegex(
+            NotImplementedError, "Cannot derive a contraction view"
+        ):
+            layer.quantize(mode, config=calibration_config(mode, group_size=-1))
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertEqual(len(layer.weights), len(weights))
+        for variable, value in zip(layer.weights, weights):
+            self.assertAllEqual(variable, value)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_calibrates_every_block_in_order(self, mode):
         vocab_size, seq_len, embed_dim = 32, 8, 4
         embedding = layers.Embedding(vocab_size, embed_dim)
@@ -588,6 +606,23 @@ class CalibrationRunModelTest(testing.TestCase):
         self.assertFalse([m for m in messages if "undersampled" in m])
         for layer in (block.observed, block.training_only):
             _assert_calibrated(self, layer, mode)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_equation_without_a_view_is_skipped_and_reported(self, mode):
+        dense = layers.Dense(8)
+        einsum = layers.EinsumDense("abc,bc->abc", output_shape=(16, 8))
+        model, config = _tiny_model(mode, block_layers=[dense, einsum])
+        kernel = ops.convert_to_numpy(einsum.kernel)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            report = model.quantize(mode, config=config)
+        self.assertIn(
+            (einsum.path, QuantizationReport.SKIP_NO_SUPPORT), report.skipped
+        )
+        self.assertIsNone(einsum.quantization_mode)
+        self.assertIsNone(einsum.quantization_config)
+        self.assertAllEqual(einsum.kernel, kernel)
+        _assert_calibrated(self, dense, mode)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_calibration_runs_without_grad_tracking(self, mode):

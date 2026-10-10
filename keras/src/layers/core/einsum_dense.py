@@ -14,6 +14,7 @@ from keras.src.initializers.random_initializers import VarianceScaling
 from keras.src.layers.input_spec import InputSpec
 from keras.src.layers.layer import Layer
 from keras.src.quantizers.geometry import EinsumProjectionGeometry
+from keras.src.quantizers.geometry import KernelAxes
 from keras.src.saving import serialization_lib
 
 
@@ -772,7 +773,9 @@ class EinsumAxes:
 
     Every axis fact the quantization modes read derives from the three
     label strings. An input or kernel axis is reduced (contracted) when
-    its label is not in the output.
+    its label is not in the output. `kernel_axes` gives the roles of the
+    kernel's axes, and `input_axes` finds the input axes with the same
+    labels.
     """
 
     inputs: str
@@ -799,6 +802,27 @@ class EinsumAxes:
         """The input axes the equation contracts."""
         return tuple(
             i for i, label in enumerate(self.inputs) if label not in self.output
+        )
+
+    @property
+    def kernel_axes(self):
+        """The roles of the kernel's axes, as a `KernelAxes`."""
+        roles = {"contracted": [], "free": [], "batch": []}
+        for i, label in enumerate(self.kernel):
+            if label not in self.output:
+                roles["contracted"].append(i)
+            elif label in self.inputs:
+                roles["batch"].append(i)
+            else:
+                roles["free"].append(i)
+        return KernelAxes(**roles)
+
+    def input_axes(self, kernel_axes):
+        """The input axes with the labels of `kernel_axes`, in their order."""
+        return tuple(
+            self.inputs.index(self.kernel[i])
+            for i in kernel_axes
+            if self.kernel[i] in self.inputs
         )
 
     @property
