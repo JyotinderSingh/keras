@@ -268,6 +268,10 @@ def validate_and_resolve_config(mode, config):
     """
     # 1. Backwards Compatibility: Handle string shortcuts.
     if isinstance(config, str):
+        if mode is not None and config != mode:
+            raise ValueError(
+                f"Contradictory arguments: mode='{mode}' but config='{config}'"
+            )
         mode = config
         config = None
 
