@@ -21,7 +21,6 @@ import warnings
 from keras.src import ops
 from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
 from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
-from keras.src.dtype_policies.dtype_policy_map import DTypePolicyMap
 from keras.src.quantizers.awq import AWQCalibrator
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibration_run import CalibrationRun
@@ -117,9 +116,7 @@ class CalibrationStrategy(QuantizationStrategy):
         layer, whose policy names no mode yet, reads them from the config
         of the run.
         """
-        policy = layer.dtype_policy
-        if isinstance(policy, DTypePolicyMap):
-            policy = policy[layer.path]
+        policy = layer._own_dtype_policy
         if policy.quantization_mode == self.name:
             return getattr(policy, attr)
         if isinstance(config, self.config_cls):

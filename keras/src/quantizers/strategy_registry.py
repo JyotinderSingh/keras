@@ -107,7 +107,9 @@ class QuantizationStrategy:
 
     # --- Per-layer hyperparameter resolution ------------------------------
 
-    # Mode-specific `resolve_*` helpers live on the concrete strategies.
+    # Mode-specific `resolve_*` helpers live on the concrete strategies and
+    # read the layer's own policy (`Layer._own_dtype_policy`, the map entry
+    # of a layer that holds a `DTypePolicyMap`).
     # `Int4Strategy.resolve_block_size` reads the config, then the policy,
     # then falls back to per-channel. The calibration modes read the
     # policy, then the config of the run (`resolve_weight_bits`,
