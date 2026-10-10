@@ -1,6 +1,13 @@
+"""The run scope of the calibration modes: one pass over one dataset.
+
+GPTQ and AWQ share one driver, `CalibrationRun`. What differs between the
+modes is declared, not coded twice: the calibrator class comes from the
+mode's `CalibrationStrategy`, the forward batch size from its config, and
+the undersampling threshold from the calibrator.
+"""
+
 import math
 import warnings
-from contextlib import contextmanager
 from contextlib import nullcontext
 
 import numpy as np
@@ -11,24 +18,16 @@ from keras.src import ops
 from keras.src import utils as keras_utils
 from keras.src.layers import Dense
 from keras.src.layers import EinsumDense
-from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.capture import calibration_scope
-from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.utils import should_quantize_layer
 
 
 def calibration_no_grad_scope():
     """Returns a context manager that disables gradient tracking.
 
-    Calibration is inference-only: it runs forward passes to accumulate
-    statistics and then assigns quantized values to variables. On the torch
-    backend those forwards would otherwise build autograd graphs, and
-    because per-sample activations are retained across the whole
-    calibration loop (and AWQ stashes activation samples for its clipping
-    search), the graphs and every intermediate activation stay alive until
-    the block completes - enough to exhaust GPU memory on models that fit
-    comfortably otherwise. JAX and TensorFlow build no such graphs in eager
-    mode, so this is a no-op there.
+    On torch the calibration forwards would otherwise build autograd
+    graphs, which the activations retained across the run keep alive.
+    JAX and TensorFlow build none in eager mode.
     """
     if backend.backend() == "torch":
         import torch
@@ -37,101 +36,22 @@ def calibration_no_grad_scope():
     return nullcontext()
 
 
-@contextmanager
-def stream_hessians(layers_map, gptq_objects, execution_trace=None):
-    """
-    Streams every target layer's input activations into its GPTQ
-    calibrator's running Hessian estimate at capture time.
-
-    On `__enter__`: For every (name, layer) in `layers_map`, registers a
-     calibration capture (`keras.src.quantizers.capture`) that the
-     dispatch machinery runs before each of the layer's forward passes,
-     whichever forward that is; the capture calls
-     `gptq_objects[name].observe` with the layer input, which the
-     calibrator lays out as `[-1, rows]`.
-
-    On `__exit__`: Every capture is removed even if an exception occurs.
-     Nothing on the layers is rebound.
-
-    * Space complexity: O(d**2) per layer (for the Hessian).
-    * No weights are modified; only GPTQ statistics are updated.
-
-    Args:
-        layers_map: Dict[str, Layer]. Mapping from logical layer names to
-         the Keras layers to observe during calibration. Keys must
-         match `gptq_objects`.
-        gptq_objects: Dict[str, GPTQCalibrator]. Mapping from names to
-         GPTQ calibrators.
-        execution_trace: Optional dict. When provided, each layer's FIRST
-         hook invocation records `{name: (call_index, input_tensor)}` into
-         it — the block-level execution order and the identity of the input
-         each layer consumes. Used to derive within-block quantization
-         stages (see `apply_gptq_layerwise`). The recorded tensors are only
-         kept alive for identity comparison; callers should drop the trace
-         after use.
-
-    Yields:
-        None: The captures are active only within the `with` block. After
-         exit, the layers carry no capture and are safe to use normally.
-
-    Example:
-    ```python
-    >>> with stream_hessians(layers_map, gptq_objects):
-    ...     for sample in calibration_inputs:
-    ...         if len(sample.shape) == 2:
-    ...             sample = ops.expand_dims(sample, 0)
-    ...         _ = block(sample)   # hooks update Hessians on-the-fly
-    >>> # <- captures removed here
-    ```
-    """
-    call_counter = [0]
-
-    def create_capture(name):
-        def capture(inp):
-            if execution_trace is not None and name not in execution_trace:
-                # Record block-level execution order and the input tensor's
-                # identity on the first call (a live reference is kept so the
-                # id cannot be recycled while tracing).
-                execution_trace[name] = (call_counter[0], inp)
-                call_counter[0] += 1
-            gptq_objects[name].observe(inp)
-
-        return capture
-
-    with calibration_scope(
-        {layer: create_capture(name) for name, layer in layers_map.items()}
-    ):
-        yield
+# Seed of the offset of the first calibration window.
+_WINDOW_OFFSET_SEED = 42
 
 
-def get_dataloader(
-    tokenizer,
-    sequence_length,
-    dataset,
-    num_samples=128,
-    *,
-    strategy="strided",
-    seed=42,
-    stride=None,
-    eos_id=None,
-):
-    """
-    Prepares and chunks the calibration dataloader, repeating short datasets.
-    All processing happens on the CPU.
+def get_dataloader(tokenizer, sequence_length, dataset, num_samples=128):
+    """Cuts `num_samples` token windows out of the calibration dataset.
+
+    The dataset is tokenized into one token stream, repeated if it is too
+    short, and windows of `sequence_length` tokens are taken at a regular
+    stride from a fixed offset. All processing happens on the CPU.
 
     Args:
         tokenizer: The tokenizer to use for text splitting.
         sequence_length: The length of each input sequence.
         dataset: The dataset to sample from.
         num_samples: The number of samples to generate.
-        strategy: The sampling strategy to use. Possible values are
-         1. "strided": Samples are taken at regular intervals.
-         2. "linspace": Samples are taken at evenly spaced intervals.
-         3. "random": Samples are taken at random positions.
-        seed: The random seed for reproducibility. Used only if
-         strategy="random"
-        stride: The stride length for "strided" sampling.
-        eos_id: The end-of-sequence token ID.
 
     Returns:
         np.ndarray of shape (num_samples, 1, sequence_length), dtype int32.
@@ -148,24 +68,17 @@ def get_dataloader(
     if not dataset_list:
         raise ValueError("Provided dataset is empty.")
 
-    pieces = []
     if isinstance(dataset_list[0], str):
-        for i, s in enumerate(dataset_list):
-            toks = ops.convert_to_numpy(tokenizer.tokenize(s)).reshape(-1)
-            pieces.append(toks)
-            # avoid windows that span document boundaries
-            if eos_id is not None and i < len(dataset_list) - 1:
-                pieces.append(np.array([eos_id], dtype=np.int32))
+        pieces = [
+            ops.convert_to_numpy(tokenizer.tokenize(s)).reshape(-1)
+            for s in dataset_list
+        ]
     else:
-        for s in dataset_list:
-            toks = ops.convert_to_numpy(s).reshape(-1)
-            pieces.append(toks.astype(np.int32, copy=False))
-
-    all_tokens = (
-        pieces[0].astype(np.int32, copy=False)
-        if len(pieces) == 1
-        else np.concatenate(pieces, axis=0).astype(np.int32, copy=False)
-    )
+        pieces = [
+            ops.convert_to_numpy(s).reshape(-1).astype(np.int32, copy=False)
+            for s in dataset_list
+        ]
+    all_tokens = np.concatenate(pieces, axis=0).astype(np.int32, copy=False)
 
     required_tokens = num_samples * sequence_length
     if all_tokens.size < required_tokens:
@@ -179,67 +92,28 @@ def get_dataloader(
             f"(have {all_tokens.size})."
         )
 
-    # Choose deterministic, well-spread starts by default
-    if strategy == "random":
-        rng = np.random.default_rng(seed)
-        starts = rng.integers(
-            0, max_start + 1, size=num_samples, dtype=np.int64
+    # A stride that covers the stream roughly uniformly, from an offset
+    # derived from a fixed seed. Python's `hash()` must not be used here:
+    # it is randomized per process, so the windows, and every quantization
+    # result, would differ between runs.
+    stride = max(1, (max_start + 1) // num_samples)
+    offset = (
+        int(
+            np.random.default_rng(_WINDOW_OFFSET_SEED).integers(
+                0, max_start + 1
+            )
         )
-    elif strategy == "linspace":
-        # even coverage with no RNG
-        starts = np.linspace(0, max_start, num_samples, dtype=np.int64)
-    elif strategy == "strided":
-        # stride chosen to cover the space roughly uniformly
-        if stride is None:
-            stride = max(1, (max_start + 1) // num_samples)
-        # Offset derived deterministically from the seed. Python's
-        # built-in `hash()` must not be used here: string/tuple hashes are
-        # randomized per process (PYTHONHASHSEED), which silently made
-        # calibration windows - and therefore every quantization result -
-        # unreproducible across runs despite the fixed seed.
-        offset = (
-            int(np.random.default_rng(seed).integers(0, max_start + 1))
-            if max_start > 0
-            else 0
-        )
-        starts = (offset + np.arange(num_samples, dtype=np.int64) * stride) % (
-            max_start + 1
-        )
-    else:
-        raise ValueError(f"Unknown strategy: {strategy}")
-
-    # Gather contiguous windows
-    # sliding_window_view avoids building a big index matrix
+        if max_start > 0
+        else 0
+    )
+    starts = (offset + np.arange(num_samples, dtype=np.int64) * stride) % (
+        max_start + 1
+    )
+    # `sliding_window_view` avoids building a big index matrix.
     windows = np.lib.stride_tricks.sliding_window_view(
         all_tokens, sequence_length
     )
-    samples = windows[starts]  # (num_samples, sequence_length)
-    return samples.astype(np.int32)[:, None, :]
-
-
-def _stack_calibration_batch(samples):
-    """Stacks a list of per-sample calibration activations into a single batch.
-
-    Each element may be a 2D `[sequence, features]` or 3D
-    `[1, sequence, features]` tensor. Every element is normalized to a leading
-    batch axis of size 1 and concatenated along axis 0, producing a
-    `[batch, sequence, features]` tensor that can be run through a block in a
-    single forward pass.
-
-    Args:
-        samples: List of per-sample activation tensors.
-
-    Returns:
-        A single `[batch, sequence, features]` tensor.
-    """
-    normalized = []
-    for sample in samples:
-        if ops.ndim(sample) == 2:
-            sample = ops.expand_dims(sample, axis=0)
-        normalized.append(sample)
-    if len(normalized) == 1:
-        return normalized[0]
-    return ops.concatenate(normalized, axis=0)
+    return windows[starts].astype(np.int32)[:, None, :]
 
 
 def find_layers_in_block(block):
@@ -261,265 +135,228 @@ def find_layers_in_block(block):
     return found_layers
 
 
-def _execution_stages(layer_names, execution_trace):
+def _execution_stages(block, layers, batch):
     """Groups a block's layers into sequential quantization stages.
 
     Reference GPTQ implementations quantize a block's sub-layers in
-    topological order ("true sequential"): once an upstream sub-layer is
-    quantized, downstream Hessians are re-estimated on the quantized
-    activations. Without this, e.g. an MLP's Hessian is captured while the
-    attention sub-layers are still full-precision, and the error
-    corrections it derives are tuned to activations that no longer exist
-    once attention is quantized too — which measurably degrades quality
-    below plain round-to-nearest.
+    topological order ("true sequential"): the statistics of a layer are
+    taken after the layers upstream of it are quantized, so its solve is
+    computed against the activations it sees at inference.
 
-    Stages are derived from the calibration trace: layers are ordered by
-    first invocation, and layers that consumed the *same* input tensor
-    (e.g. the query/key/value projections, or an MLP's gate/up pair) share
-    a stage since quantizing one cannot affect the others' inputs. Layers
-    that never fired during tracing are placed in the first stage,
-    preserving their (empty) Hessian behavior.
+    One forward pass of `batch` records the order the layers first run in
+    and the input each consumes. Consecutive layers that consume the same
+    input tensor (the query/key/value projections, an MLP's gate/up pair)
+    share a stage, since quantizing one cannot change the others' inputs.
+    The layers that do not run in that pass form the last stage.
 
     Args:
-        layer_names: Iterable of layer names in the block.
-        execution_trace: Dict of `{name: (call_index, input_tensor)}`
-            recorded by `stream_hessians`.
+        block: The block the layers belong to.
+        layers: The layers to group.
+        batch: One batch of the block's inputs.
 
     Returns:
-        List of lists of layer names, one list per stage, in execution
-        order.
+        List of lists of layers, one list per stage, in execution order.
     """
-    traced = [name for name in layer_names if name in execution_trace]
-    untraced = [name for name in layer_names if name not in execution_trace]
-    traced.sort(key=lambda name: execution_trace[name][0])
+    trace = {}
 
-    stages = []
-    current_stage, current_input_id = [], None
-    for name in traced:
-        input_id = id(execution_trace[name][1])
-        if current_stage and input_id != current_input_id:
-            stages.append(current_stage)
-            current_stage = []
-        current_stage.append(name)
-        current_input_id = input_id
-    if current_stage:
-        stages.append(current_stage)
+    def recorder(layer):
+        def record(inputs):
+            # The first call only. The trace keeps the input alive, so its
+            # identity cannot be reused within the pass.
+            trace.setdefault(id(layer), (layer, inputs))
 
+        return record
+
+    with calibration_scope({layer: recorder(layer) for layer in layers}):
+        block(batch)
+    stages, stage_input = [], None
+    for layer, inputs in trace.values():
+        if not stages or inputs is not stage_input:
+            stages.append([])
+        stages[-1].append(layer)
+        stage_input = inputs
+    untraced = [layer for layer in layers if id(layer) not in trace]
     if untraced:
-        if stages:
-            stages[0] = untraced + stages[0]
-        else:
-            stages = [untraced]
+        stages.append(untraced)
     return stages
 
 
-def apply_gptq_layerwise(dataloader, config, structure, filters=None):
-    """Applies GPTQ quantization layer-by-layer to a Keras model.
+class CalibrationRun:
+    """One calibration pass of a model's sequential blocks over a dataset.
 
-    This function uses the provided `structure` to identify pre-quantization
-    layers and sequential blocks.
-
-    The core logic operates as follows:
-
-    1.  It processes the model sequentially, one block at a time. For each
-        block, it uses temporary hooks to capture the input activations of
-        each target layer during a forward pass with the calibration data.
-    2.  These captured activations are used to compute the Hessian matrix for
-        each layer's weights.
-    3.  The GPTQ algorithm is then applied to each layer to find the optimal
-        quantized weights that minimize the error introduced.
-    4.  The output activations from the current block are then used as the
-        input for the next block, ensuring that quantization errors are
-        accounted for throughout the model.
+    `Model.quantize` resolves the layer structure and the mode's
+    `CalibrationStrategy` creates the run for it (`calibrate`). The run
+    materializes the activations behind the prefix layers once, then
+    walks the blocks in order. For each block it groups the layers this
+    mode left pending into execution-order stages ("true sequential").
+    For each stage in turn it builds a calibrator per layer, from the
+    layer's own `quantization_config`, passes the block's inputs through
+    the block to them, and quantizes the stage's layers, so a later
+    stage observes the quantized output of the stages before it. It then
+    runs the calibrated block to produce the next block's inputs. The
+    activations are kept as the batches the blocks run on. A run with no
+    pending layer does nothing.
 
     Args:
-        dataloader: An iterable providing calibration data.
-        config: A GPTQConfiguration object.
-        structure: A dictionary with keys "pre_block_layers" and
-            "sequential_blocks".
-        filters: Optional filters to exclude layers from quantization.
-
-    Raises:
-        ValueError: If the function cannot automatically find an embedding
-            layer or any transformer-like blocks to quantize within the model.
+        strategy: The `CalibrationStrategy` of the mode. It supplies the
+            calibrator class.
+        config: The mode's config. It sets the number of samples and the
+            batch size of the run.
+        structure: Dict with keys `"pre_block_layers"` and
+            `"sequential_blocks"`.
+        filters: Optional filters that exclude layers from quantization.
     """
 
-    num_samples = config.num_samples
-    strategy = strategy_registry.get_strategy("gptq")
+    def __init__(self, strategy, config, structure, filters=None):
+        self.strategy = strategy
+        self.filters = filters
+        self.pre_block_layers = structure.get("pre_block_layers", [])
+        self.blocks = structure.get("sequential_blocks", [])
+        if not self.blocks:
+            raise ValueError(
+                "No sequential blocks found in the provided structure to "
+                "quantize."
+            )
+        self.num_samples = config.num_samples
+        self.batch_size = int(config.calibration_batch_size)
+        # Layers whose statistics saw too few calibration tokens relative
+        # to their input width, and layers that observed no input,
+        # collected across all blocks for one warning each.
+        self.undersampled = []
+        self.unreached = []
 
-    logging.info("Starting model quantization...")
+    def run(self, dataloader):
+        """Calibrates and quantizes every block, in order.
 
-    pre_layers = structure.get("pre_block_layers", [])
-    transformer_blocks = structure.get("sequential_blocks", [])
+        Args:
+            dataloader: An iterable of token batches for the prefix layers.
+        """
+        if not any(self._pending_layers(block) for block in self.blocks):
+            logging.info("No layers are pending calibration. Skipping.")
+            return
+        logging.info("Starting model quantization...")
+        with calibration_no_grad_scope():
+            inputs = self._prefix_outputs(dataloader)
+            progbar = keras_utils.Progbar(target=len(self.blocks))
+            for block_idx, block in enumerate(self.blocks):
+                logging.info(f"Quantizing Block {block_idx}")
+                self._calibrate_block(block_idx, block, inputs)
+                if block_idx < len(self.blocks) - 1:
+                    logging.info(
+                        f"Generating inputs for block {block_idx + 1}..."
+                    )
+                    inputs = self._next_inputs(block, inputs)
+                progbar.update(current=block_idx + 1)
+        self._warn_undersampled()
+        self._warn_unreached()
+        logging.info("Quantization process complete.")
 
-    if not transformer_blocks:
-        raise ValueError(
-            "No sequential blocks found in the provided structure to quantize."
+    def _prefix_outputs(self, dataloader):
+        # The pre-block layers run one sample at a time; their outputs are
+        # stacked into the batches the blocks run on.
+        outputs = []
+        for batch in dataloader:
+            batch = ops.convert_to_tensor(batch, dtype="int32")
+            for layer in self.pre_block_layers:
+                batch = layer(batch)
+            outputs.append(batch)
+        self.num_samples = min(self.num_samples, len(outputs))
+        outputs = outputs[: self.num_samples]
+        return [
+            ops.concatenate(outputs[start : start + self.batch_size], axis=0)
+            for start in range(0, self.num_samples, self.batch_size)
+        ]
+
+    def _pending_layers(self, block):
+        # Only the layers this mode left pending: a layer quantized in
+        # another mode, or already calibrated, has no float kernel to solve.
+        return {
+            name: layer
+            for name, layer in find_layers_in_block(block).items()
+            if layer.quantization_mode == self.strategy.name
+            and layer.calibration_pending
+            and should_quantize_layer(layer, self.filters)
+        }
+
+    def _calibrator(self, layer):
+        # The layer's own config, which `build` allocated its variables
+        # from, so the solve and the packing agree.
+        return self.strategy.calibrator_cls(
+            self.strategy, layer, layer.quantization_config
         )
 
-    # Initial inputs are the outputs of the pre-block layers
-    inputs = []
-    for batch in dataloader:
-        batch = ops.convert_to_tensor(batch, dtype="int32")
-        for layer in pre_layers:
-            batch = layer(batch)
-        inputs.append(batch)
-
-    num_samples = min(num_samples, len(inputs))
-    inputs = inputs[:num_samples]
-
-    # Run calibration forward passes at this batch size. Because the Hessian is
-    # accumulated over the flattened `[-1, features]` activations, batching is
-    # mathematically identical to running one sample at a time; it only reduces
-    # the number of (expensive) forward passes through each block.
-    batch_size = max(1, int(config.calibration_batch_size))
-
-    progbar = keras_utils.Progbar(target=len(transformer_blocks))
-
-    # Layers whose Hessian saw too few calibration tokens relative to their
-    # input width, collected across all blocks for a single summary warning.
-    undersampled_layers = []
-
-    for block_idx, block in enumerate(transformer_blocks):
-        logging.info(f"Quantizing Block {block_idx}")
-        sub_layers_map = find_layers_in_block(block)
-
-        # Filter out layers that are not quantized with GPTQ
-        final_sub_layers_map = {}
-        for name, layer in sub_layers_map.items():
-            if not should_quantize_layer(layer, filters):
-                continue
-
-            final_sub_layers_map[name] = layer
-
-        sub_layers_map = final_sub_layers_map
-
-        if not sub_layers_map:
+    def _calibrate_block(self, block_idx, block, inputs):
+        layers = self._pending_layers(block)
+        if not layers:
             logging.info(
                 f"  No quantizable layers found in block {block_idx}. Skipping."
             )
-        else:
-            logging.info(f"Found layers: {list(sub_layers_map.keys())}")
-            gptq_objects = {
-                name: GPTQCalibrator(strategy, layer, config)
-                for name, layer in sub_layers_map.items()
-            }
+            return
+        logging.info(f"Found layers: {list(layers)}")
+        # Quantize the block's layers in execution-order stages ("true
+        # sequential", as in reference GPTQ): a stage observes the block
+        # after the stages before it are quantized, so its solves are
+        # computed against the activations the layers see at inference.
+        stages = _execution_stages(block, list(layers.values()), inputs[0])
+        for stage in stages:
+            self._calibrate_stage(block, stage, inputs)
 
-            execution_trace = {}
-            with stream_hessians(
-                sub_layers_map, gptq_objects, execution_trace=execution_trace
-            ):
-                for start in range(0, num_samples, batch_size):
-                    batch = _stack_calibration_batch(
-                        inputs[start : start + batch_size]
-                    )
-                    _ = block(batch)
+    def _calibrate_stage(self, block, layers, inputs):
+        # The statistics live for this call only, so the run holds those
+        # of one stage at a time.
+        calibrators = [self._calibrator(layer) for layer in layers]
+        with calibration_scope({c.layer: c.observe for c in calibrators}):
+            for batch in inputs:
+                block(batch)
+        for calibrator in calibrators:
+            name = calibrator.layer.path
+            if calibrator.num_samples:
+                self._tally_undersampling(name, calibrator)
+            else:
+                self.unreached.append(name)
+            logging.info(f"Quantizing {name}...")
+            calibrator.quantize()
 
-            # Quantize the block's layers in execution-order stages ("true
-            # sequential", as in reference GPTQ): after each stage is
-            # quantized, downstream stages' Hessians are re-estimated so
-            # their error corrections are computed against the quantized
-            # upstream activations they will actually see at inference.
-            stages = _execution_stages(sub_layers_map, execution_trace)
-            del execution_trace
+    def _tally_undersampling(self, name, calibrator):
+        threshold = calibrator.warn_tokens_per_row
+        if threshold is None:
+            return
+        tokens = int(calibrator.num_samples)
+        rows = int(calibrator.rows)
+        if tokens < threshold * rows:
+            self.undersampled.append((name, tokens, rows))
 
-            for stage_idx, stage_names in enumerate(stages):
-                if stage_idx > 0:
-                    stage_map = {
-                        name: sub_layers_map[name] for name in stage_names
-                    }
-                    stage_objects = {}
-                    for name in stage_names:
-                        # Drop the stale statistics before allocating new ones.
-                        del gptq_objects[name]
-                        gptq_objects[name] = GPTQCalibrator(
-                            strategy, sub_layers_map[name], config
-                        )
-                        stage_objects[name] = gptq_objects[name]
-                    with stream_hessians(stage_map, stage_objects):
-                        for start in range(0, num_samples, batch_size):
-                            batch = _stack_calibration_batch(
-                                inputs[start : start + batch_size]
-                            )
-                            _ = block(batch)
+    def _next_inputs(self, block, inputs):
+        # Each batch's output goes to the next block as it is: the first
+        # output of a block that returns several.
+        next_inputs = []
+        for batch in inputs:
+            output = block(batch)
+            if isinstance(output, (list, tuple)):
+                output = output[0]
+            next_inputs.append(output)
+        return next_inputs
 
-                for name in stage_names:
-                    gptq_object = gptq_objects.pop(name)
-                    tokens = int(gptq_object.num_samples)
-                    rows = int(gptq_object.rows)
-                    if tokens < gptq_object.warn_tokens_per_row * rows:
-                        undersampled_layers.append((name, tokens, rows))
-                    logging.info(f"Quantizing {name}...")
-                    gptq_object.quantize()
-
-            del gptq_objects
-
-        if block_idx < len(transformer_blocks) - 1:
-            logging.info(f"Generating inputs for block {block_idx + 1}...")
-            next_block_inputs = []
-            for start in range(0, num_samples, batch_size):
-                chunk = inputs[start : start + batch_size]
-                output = block(_stack_calibration_batch(chunk))
-                if isinstance(output, (list, tuple)):
-                    output = output[0]
-                # Split the batched output back into per-sample activations so
-                # the next block can be calibrated identically.
-                for sample_idx in range(len(chunk)):
-                    next_block_inputs.append(output[sample_idx])
-            inputs = next_block_inputs
-        progbar.update(current=block_idx + 1)
-
-    if undersampled_layers:
+    def _warn_undersampled(self):
+        if not self.undersampled:
+            return
         warnings.warn(
-            GPTQCalibrator.undersampling_warning(undersampled_layers),
+            self.strategy.calibrator_cls.undersampling_warning(
+                self.undersampled
+            ),
             stacklevel=2,
         )
 
-    logging.info("Quantization process complete.")
-
-
-def gptq_quantize(config, quantization_layer_structure, filters=None):
-    """
-    Quantizes the model using GPTQ.
-
-    Args:
-        config: The GPTQ configuration.
-        quantization_layer_structure: A dictionary describing the model's layer
-        structure for quantization.
-        filters: Optional filters to exclude layers from quantization.
-    """
-    if config.dataset is None or config.tokenizer is None:
-        raise ValueError(
-            "GPTQ quantization requires a dataset and a tokenizer. "
-            "Please provide them in the `GPTQConfig`."
-        )
-
-    if quantization_layer_structure is None:
-        raise ValueError(
-            "For 'gptq' mode, a valid quantization structure must be provided "
-            "either via `config.quantization_layer_structure` or by overriding "
-            "`model.get_quantization_layer_structure(mode)`. The structure "
-            "should be a dictionary with keys 'pre_block_layers' and "
-            "'sequential_blocks'."
-        )
-
-    # Load all data needed from the generator/source in a single call.
-    total_samples_to_request = config.num_samples
-    dataloader = get_dataloader(
-        config.tokenizer,
-        config.sequence_length,
-        config.dataset,
-        num_samples=total_samples_to_request,
-    )
-
-    # Split the materialized data. This works because dataloader
-    # is now a NumPy array, which can be sliced and reused.
-    calibration_dataloader = dataloader[: config.num_samples]
-
-    with calibration_no_grad_scope():
-        apply_gptq_layerwise(
-            calibration_dataloader,
-            config,
-            quantization_layer_structure,
-            filters=filters,
+    def _warn_unreached(self):
+        if not self.unreached:
+            return
+        warnings.warn(
+            f"{self.strategy.name.upper()} calibration observed no input "
+            f"for {len(self.unreached)} layer(s), so their weights are "
+            "quantized without calibration statistics: "
+            f"{', '.join(self.unreached)}. A layer that the blocks do not "
+            "run on the calibration data, such as a layer that runs only "
+            "in training, is never observed. To keep such a layer in "
+            "float, exclude it with `filters`.",
+            stacklevel=2,
         )

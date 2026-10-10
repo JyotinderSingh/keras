@@ -3,10 +3,10 @@
 GPTQ and AWQ allocate the same family of variables, run the same
 dequantize-and-contract forward pass, and speak the same three-part policy
 grammar. They differ in the code bit-width (which fixes how the kernel is
-packed), in the dtype policy class, in the calibrator class, in the driver
-that calibrates a model and in one extra AWQ variable of input scales that
-the quantized weight divides out. `GPTQStrategy` and `AWQStrategy`, at the
-end of this module, declare these differences.
+packed), in the calibrator class, and in one extra AWQ variable of input
+scales that the quantized weight divides out. `GPTQStrategy` and
+`AWQStrategy`, at the end of this module, declare these differences as
+class attributes.
 """
 
 import math
@@ -106,6 +106,38 @@ class CalibrationStrategy(QuantizationStrategy):
 
     # The `Calibrator` class that solves this mode for one layer.
     calibrator_cls = None
+
+    def calibrate(self, config, structure, filters=None):
+        """Runs this mode's calibration over `structure` and writes back.
+
+        Args:
+            config: The mode's config, with its dataset and tokenizer.
+            structure: Dict with keys `"pre_block_layers"` and
+                `"sequential_blocks"`, as `Model.quantize` resolved it.
+            filters: Optional filters that exclude layers from quantization.
+        """
+        # Imported here to avoid an import cycle: `calibration_run` imports
+        # the layers, which import the strategies.
+        from keras.src.quantizers.calibration_run import CalibrationRun
+        from keras.src.quantizers.calibration_run import get_dataloader
+
+        if config.dataset is None or config.tokenizer is None:
+            raise ValueError(
+                f"{self.name.upper()} quantization requires a dataset and a "
+                "tokenizer. Please provide them in the "
+                f"`{self.config_cls.__name__}`."
+            )
+        dataloader = get_dataloader(
+            config.tokenizer,
+            config.sequence_length,
+            config.dataset,
+            num_samples=config.num_samples,
+        )
+        CalibrationRun(self, config, structure, filters).run(dataloader)
+
+    def finalize_model_quantization(self, model, config, structure, filters):
+        del model
+        self.calibrate(config, structure, filters)
 
     # --- Variables --------------------------------------------------------
 
@@ -301,12 +333,6 @@ class GPTQStrategy(CalibrationStrategy):
     policy_cls = GPTQDTypePolicy
     calibrator_cls = GPTQCalibrator
 
-    def finalize_model_quantization(self, model, config, structure, filters):
-        from keras.src.quantizers.calibration_run import gptq_quantize
-
-        del model
-        gptq_quantize(config, structure, filters=filters)
-
 
 class AWQStrategy(CalibrationStrategy):
     """AWQ post-training quantization (activation-aware, 4-bit).
@@ -321,9 +347,3 @@ class AWQStrategy(CalibrationStrategy):
     calibrator_cls = AWQCalibrator
     # Per-input-row scales from the activation magnitudes.
     input_scales_name = "awq_scales"
-
-    def finalize_model_quantization(self, model, config, structure, filters):
-        from keras.src.quantizers.awq_core import awq_quantize
-
-        del model
-        awq_quantize(config, structure, filters=filters)
