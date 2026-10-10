@@ -838,6 +838,42 @@ class CalibrationRunModelTest(testing.TestCase):
         self.assertLess(error, 0.05)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_a_run_that_raises_keeps_a_valid_model(self, mode):
+        # A failure inside the run leaves the layers solved before it
+        # quantized and the rest float. The report lists the quantized
+        # layers, the model drops its compiled functions and still saves,
+        # and a second call completes the run with its own config.
+        model, config = _tiny_model(mode)
+        block = config.quantization_layer_structure["sequential_blocks"][0]
+        first, second = block.layers
+        model.predict(np.stack(config.dataset)[:, 0], verbose=0)
+        calibrator_cls = strategy_registry.get_strategy(mode).calibrator_cls
+        solve = calibrator_cls.quantize
+
+        def quantize(calibrator):
+            if calibrator.layer is second:
+                raise RuntimeError("solve failed")
+            return solve(calibrator)
+
+        with mock.patch.object(
+            calibrator_cls, "quantize", autospec=True, side_effect=quantize
+        ):
+            with self.assertRaisesRegex(RuntimeError, "solve failed"):
+                model.quantize(mode, config=config)
+        _assert_calibrated(self, first, mode)
+        _assert_float(self, second)
+        report = model._quantization_report
+        self.assertEqual([path for path, *_ in report.quantized], [first.path])
+        self.assertIsNone(model.predict_function)
+        path = os.path.join(self.get_temp_dir(), "partial.weights.h5")
+        model.save_weights(path)
+        model.load_weights(path)
+
+        report = model.quantize(mode, config=config)
+        self.assertEqual([path for path, *_ in report.quantized], [second.path])
+        _assert_calibrated(self, second, mode)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_under_a_bfloat16_policy(self, mode):
         # The solve runs in float32 when the variables are `bfloat16`.
         model, config = _tiny_model(mode, dtype="bfloat16")
