@@ -114,6 +114,10 @@ class Layer(BackendLayer, Operation):
             to differ. Defaults to `None`. `None` means to use
             `keras.config.dtype_policy()`, which is a `float32` policy unless
             set to different value (via `keras.config.set_dtype_policy()`).
+            A quantized policy, such as `"int8_from_float32"`, builds the
+            quantized variables for loading saved weights and does not
+            quantize weights; see `keras.dtype_policies.QuantizedDTypePolicy`.
+            To quantize a layer, call `quantize()`.
 
     Attributes:
         name: The name of the layer (string).
@@ -1451,10 +1455,10 @@ class Layer(BackendLayer, Operation):
     def _strategy_owns_weight_storage(self):
         """Whether the quantization strategy creates the weight storage.
 
-        A strategy that owns its weight storage (int8, int4) creates the
-        quantized variables in `quantized_build`, so `build` must not add
-        the floating-point weight. Float8 and the unquantized layer keep
-        the floating-point weight.
+        A strategy that owns its weight storage (every mode but float8)
+        creates the quantized variables in `quantized_build`, so `build`
+        must not add the floating-point weight. Float8 and the unquantized
+        layer keep the floating-point weight.
 
         Returns:
             A boolean.

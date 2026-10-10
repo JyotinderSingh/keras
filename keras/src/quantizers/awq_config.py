@@ -45,9 +45,11 @@ class AWQConfig(QuantizationConfig):
             reproduce one-sample-at-a-time results. Defaults to 8.
         sequence_length: The sequence length to use for each calibration
             sample. Defaults to 512.
-        group_size: The size of weight groups to quantize together. A
-            `group_size` of -1 indicates per-channel quantization.
-            Defaults to 128.
+        group_size: The number of input rows of the kernel that share a
+            scale and a zero point. `-1` puts all the input rows in one
+            group (one group per batch index of a kernel with a batch
+            axis): one scale and zero point per output channel. Defaults
+            to 128.
         num_grid_points: The number of grid search points for finding optimal
             per-channel scales, `ratio = i / num_grid_points` for `i` below
             it. Higher values may find better scales but take longer.
@@ -127,8 +129,8 @@ class AWQConfig(QuantizationConfig):
             raise ValueError("sequence_length must be a positive integer.")
         if group_size < -1 or group_size == 0:
             raise ValueError(
-                "Invalid group_size. Supported values are -1 (per-channel) "
-                f"or a positive integer, but got {group_size}."
+                "Invalid group_size. Supported values are -1 (one group of "
+                f"all input rows) or a positive integer, but got {group_size}."
             )
         if num_grid_points <= 0:
             raise ValueError("num_grid_points must be a positive integer.")
