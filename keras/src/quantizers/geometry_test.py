@@ -178,6 +178,41 @@ class ContractionViewTest(testing.TestCase):
             )
 
 
+class KernelMatrixTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("matmul", "ab,bc->ac", (None, 8), (6,)),
+        ("gemma_q", "btd,ndh->btnh", (None, 5, 8), (None, 2, 4)),
+        ("expert_gate", "btd,edi->btei", (None, 5, 8), (None, 3, 4)),
+        ("two_contracted", "abcd,cde->abe", (None, 4, 3, 5), (None, 6)),
+        ("one_expert", "btei,eid->bted", (None, 5, 1, 7), (None, 1, 8)),
+    )
+    def test_matches_the_contraction_view_without_batch_problems(
+        self, equation, input_shape, output_shape
+    ):
+        # int4 folds batch axes into the columns and GPTQ/AWQ stack them
+        # along the rows; without batch problems the two layouts agree.
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        geometry = layer._quantization_geometry()
+        kernel = (
+            np.random.default_rng(0)
+            .standard_normal(geometry.weight_shape)
+            .astype("float32")
+        )
+        permutation, rows, columns = geometry.kernel_axes.matrix(
+            kernel.shape, batch_in="columns"
+        )
+        view = geometry.contraction_view()
+        self.assertEqual(view.batch, 1)
+        self.assertAllEqual(
+            np.reshape(np.transpose(kernel, permutation), (rows, columns)),
+            np.reshape(
+                ops.convert_to_numpy(view.kernel_to_view(kernel)),
+                (view.rows, view.columns),
+            ),
+        )
+
+
 class KernelAxesTest(testing.TestCase):
     def test_the_two_matrices_of_a_kernel_with_a_batch_axis(self):
         # `btei,eid->bted`: `e` is a batch axis, `i` contracted, `d` free.
