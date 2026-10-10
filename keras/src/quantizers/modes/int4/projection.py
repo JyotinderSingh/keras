@@ -5,6 +5,7 @@ import math
 from keras.src import ops
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import dequantize_and_contract
 from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
@@ -99,16 +100,18 @@ class Int4ProjectionHandlers:
 
     def _call_projection(self, layer, geometry, inputs, training=None):
         view = self._get_projection_quantized_weight(layer, geometry)
+        if layer.inputs_quantizer is None:
+            return dequantize_and_contract(layer, geometry, view, inputs)
 
+        # Only a per-channel kernel has an activation quantizer
+        # (`Int4QuantizationConfig` refuses one with groups).
         @ops.custom_gradient
         def contract_with_inputs_gradient(inputs, *tensors):
-            """Dequantizes the int4 kernel and contracts in float.
+            """Contracts the quantized inputs against the dequantized kernel.
 
-            `tensors` are the view's stored tensors: the codes and the scale,
-            then the zero point and the group index of a grouped scheme.
-            Autodiff cannot differentiate through the packed kernel, so the
-            gradient with respect to the inputs is taken through the
-            dequantized kernel.
+            `tensors` are the view's stored tensors. The gradient with
+            respect to the inputs is taken straight through the rounding of
+            the inputs.
             """
             quantized_weight = view.with_tensors(tensors)
 
@@ -119,16 +122,13 @@ class Int4ProjectionHandlers:
                 inputs_grad = geometry.contract_grad(upstream, float_kernel)
                 return (inputs_grad,) + (None,) * len(tensors)
 
+            inputs_q, inputs_scale = layer.inputs_quantizer(
+                inputs, axis=geometry.inputs_quantization_axis
+            )
             float_kernel = quantized_weight.dequantize(layer.compute_dtype)
-            if layer.inputs_quantizer:
-                inputs_q, inputs_scale = layer.inputs_quantizer(
-                    inputs, axis=geometry.inputs_quantization_axis
-                )
-                x = geometry.contract(inputs_q, float_kernel)
-                x = ops.cast(x, layer.compute_dtype)
-                x = ops.divide(x, geometry.align_inputs_scale(inputs_scale))
-            else:
-                x = geometry.contract(inputs, float_kernel)
+            x = geometry.contract(inputs_q, float_kernel)
+            x = ops.cast(x, layer.compute_dtype)
+            x = ops.divide(x, geometry.align_inputs_scale(inputs_scale))
             return x, grad_fn
 
         # Read inside the autocast scope: on TensorFlow eager the gradient
