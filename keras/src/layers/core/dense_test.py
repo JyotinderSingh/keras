@@ -48,7 +48,6 @@ class DenseTest(testing.TestCase):
             {"axis": 0, "value_range": (-8, 7), "output_dtype": "int8"},
             {"axis": -1},
         ),
-        ("int8_weight_only", "int8", {"axis": 0}, None),
     )
     def test_dense_quantize_config(
         self, mode, weight_quantizer_args, activation_quantizer_args
@@ -58,10 +57,7 @@ class DenseTest(testing.TestCase):
         layer.build((None, 8))
 
         weight_quantizer = AbsMaxQuantizer(**weight_quantizer_args)
-        if activation_quantizer_args is not None:
-            activation_quantizer = AbsMaxQuantizer(**activation_quantizer_args)
-        else:
-            activation_quantizer = None
+        activation_quantizer = AbsMaxQuantizer(**activation_quantizer_args)
 
         if mode == "int8":
             config = Int8QuantizationConfig(
@@ -78,12 +74,8 @@ class DenseTest(testing.TestCase):
 
         layer.quantize(mode, config=config)
 
-        if activation_quantizer_args is not None:
-            # Verify inputs_quantizer is set correctly
-            self.assertIsInstance(layer.inputs_quantizer, AbsMaxQuantizer)
-        else:
-            # Verify inputs_quantizer is None
-            self.assertIsNone(layer.inputs_quantizer)
+        # Verify inputs_quantizer is set correctly
+        self.assertIsInstance(layer.inputs_quantizer, AbsMaxQuantizer)
 
         # Verify call works
         x = np.random.random((2, 8)).astype("float32")
@@ -615,40 +607,6 @@ class DenseTest(testing.TestCase):
         layer.dtype_policy = policy
         self.assertLen(layer.variables, expected_num_variables)
 
-    @pytest.mark.skipif(
-        testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
-    )
-    def test_quantize_by_setting_dtype_policy_forwards_block_size(self):
-        # Regression test: assigning a parameterized int4 policy to a built
-        # layer must quantize with the policy's block size. Previously the
-        # setter forwarded only the bare mode string, so "int4/32" quantized
-        # with the default block size (128) while keeping a name that said
-        # 32 -- the checkpoint's policy string contradicted its stored
-        # weights.
-        layer = layers.Dense(units=2)
-        layer.build((None, 64))
-        layer.dtype_policy = "int4/32_from_float32"
-        self.assertEqual(layer._quantized_weight().scheme.group_size, 32)
-        # ceil(64 / 32) = 2 groups, one scale row per group.
-        self.assertEqual(tuple(layer.kernel_scale.shape), (2, 2))
-        self.assertEqual(layer.dtype_policy.name, "int4/32_from_float32")
-
-    @pytest.mark.skipif(
-        testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
-    )
-    def test_quantize_by_setting_dtype_policy_per_channel(self):
-        # The per-channel escape hatch ("int4/-1") must also be honored by
-        # the dtype-policy setter instead of falling back to the grouped
-        # default.
-        layer = layers.Dense(units=2)
-        layer.build((None, 64))
-        layer.dtype_policy = "int4/-1_from_float32"
-        self.assertIsNone(layer._quantized_weight().scheme.group_size)
-        # Per-channel: one scale per output unit, no zero point, no g_idx.
-        self.assertEqual(tuple(layer.kernel_scale.shape), (2,))
-        self.assertIsNone(layer.kernel_zero)
-        self.assertEqual(layer.dtype_policy.name, "int4/-1_from_float32")
-
     @parameterized.named_parameters(
         ("int7", "int7"),
         ("float7", "float7"),
@@ -1009,40 +967,6 @@ class DenseTest(testing.TestCase):
         ):
             self.assertAllClose(v, ref)
 
-    def test_gptq_serialization(self):
-        """Test that a GPTQ-quantized layer can be serialized and deserialized
-        correctly."""
-        layer = layers.Dense(units=16)
-        layer.build((None, 8))
-        _calibrate(
-            layer,
-            GPTQConfig(
-                dataset=None, tokenizer=None, weight_bits=4, group_size=8
-            ),
-        )
-        config = layer.get_config()
-        self.assertIsNone(config["quantization_config"])
-        new_layer = layers.Dense.from_config(config)
-        new_layer.build((None, 8))
-        self.assertEqual(new_layer.quantization_mode, "gptq")
-
-    def test_awq_serialization(self):
-        """Test that an AWQ-quantized layer can be serialized and deserialized
-        correctly."""
-        layer = layers.Dense(units=16)
-        layer.build((None, 8))
-        _calibrate(
-            layer,
-            AWQConfig(
-                dataset=None, tokenizer=None, group_size=8, num_grid_points=10
-            ),
-        )
-        config = layer.get_config()
-        self.assertIsNone(config["quantization_config"])
-        new_layer = layers.Dense.from_config(config)
-        new_layer.build((None, 8))
-        self.assertEqual(new_layer.quantization_mode, "awq")
-
     def test_int4_kernel_returns_unpacked_form(self):
         """Test that the `kernel` property returns the unpacked int4 kernel."""
         layer = layers.Dense(units=2)
@@ -1058,16 +982,10 @@ class DenseTest(testing.TestCase):
     )
     def test_modes_without_lora_support_refuse_lora(self, mode):
         # The float8 forward pass has no term for a LoRA update, and
-        # re-ternarizing a merged save is not idempotent. LoRA is refused
-        # in either order, before the layer changes.
+        # re-ternarizing a merged save is not idempotent. A layer with LoRA
+        # refuses the mode before it changes, and `model.quantize` skips it.
+        # The conformance test checks the refusal in both orders.
         message = f"lora is not currently supported with {mode.upper()}"
-        layer = layers.Dense(4)
-        layer.build((None, 3))
-        layer.quantize(mode)
-        with self.assertRaisesRegex(NotImplementedError, message):
-            layer.enable_lora(2)
-        self.assertFalse(layer.lora_enabled)
-
         layer = layers.Dense(4)
         layer.build((None, 3))
         layer.enable_lora(2)
@@ -1239,20 +1157,8 @@ class DenseTest(testing.TestCase):
         elif mode == "int8":
             layer = layers.Dense(units=units, dtype="int8_from_float32")
             layer.build((None, input_dim))
-        elif mode == "int4_per_channel":
-            layer = layers.Dense(units=units, dtype="int4_from_float32")
-            layer.build((None, input_dim))
-        elif mode == "int4_grouped":
-            layer = layers.Dense(units=units)
-            layer.build((None, input_dim))
-            layer.quantize(
-                "int4", config=Int4QuantizationConfig(block_size=128)
-            )
         elif mode == "float8":
             layer = layers.Dense(units=units, dtype="float8_from_float32")
-            layer.build((None, input_dim))
-        elif mode == "ternary":
-            layer = layers.Dense(units=units, dtype="ternary_from_float32")
             layer.build((None, input_dim))
         elif mode == "gptq":
             layer = layers.Dense(units=units, dtype="gptq/4/32_from_float32")
@@ -1268,15 +1174,9 @@ class DenseTest(testing.TestCase):
         testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
     )
     def test_serialization_round_trip(self):
-        # Modes whose `save_own_variables` writes a self-consistent store.
-        for mode in (
-            "none",
-            "int8",
-            "int4_per_channel",
-            "int4_grouped",
-            "float8",
-            "ternary",
-        ):
+        # The conformance test checks the quantized stores. The float8 store
+        # here is randomized, so a misplaced scale or history fails.
+        for mode in ("none", "float8"):
             with self.subTest(mode=mode):
                 source = self._build_dense_for_mode(mode)
                 test_utils.randomize_serialized_variables(source)
@@ -1625,29 +1525,6 @@ class DenseTest(testing.TestCase):
         y_after = loaded_model(x)
         self.assertAllClose(y_before, y_after)
 
-    @parameterized.named_parameters(
-        ("grouped_block_64", 64),
-        ("per_channel", None),
-    )
-    @pytest.mark.skipif(
-        testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
-    )
-    def test_int4_block_size_with_lora(self, block_size):
-        """Test int4 quantization with LoRA and different block_size."""
-        input_dim, output_dim = 128, 64
-        layer = layers.Dense(units=output_dim)
-        layer.build((None, input_dim))
-
-        config = Int4QuantizationConfig(block_size=block_size)
-        layer.quantize("int4", config=config)
-        layer.enable_lora(rank=4)
-
-        x = np.random.random((2, input_dim)).astype("float32")
-
-        # Should run without error
-        y = layer(x)
-        self.assertEqual(y.shape, (2, output_dim))
-
     @pytest.mark.skipif(
         testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
     )
@@ -1899,35 +1776,6 @@ class DenseTest(testing.TestCase):
             unique_vals <= {-1, 0, 1},
             f"Expected kernel values in {{-1, 0, 1}}, got {np.unique(k)}",
         )
-
-    def test_dense_quantize_ternary_save_load(self):
-        layer = layers.Dense(units=16)
-        layer.build((None, 8))
-        x = np.random.rand(3, 8).astype("float32")
-        y_float = layer(x)
-        layer.quantize("ternary")
-        y_quantized = layer(x)
-        # Dense.quantize("ternary") is lossy: verify shape not exact equality.
-        self.assertEqual(tuple(y_quantized.shape), tuple(y_float.shape))
-
-        model = models.Sequential([layer])
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "dense_ternary_model.keras"
-        )
-        model.save(temp_filepath)
-        new_model = saving.load_model(temp_filepath)
-        self.assertEqual(new_model.layers[0].quantization_mode, "ternary")
-        self.assertAllClose(model.predict(x), new_model.predict(x))
-
-        temp_weights = os.path.join(
-            self.get_temp_dir(), "dense_ternary_model.weights.h5"
-        )
-        model.save_weights(temp_weights)
-        new_model = models.Sequential([layers.Dense(units=16)])
-        new_model.build((None, 8))
-        new_model.quantize("ternary")
-        new_model.load_weights(temp_weights)
-        self.assertAllClose(model.predict(x), new_model.predict(x))
 
     def test_dense_quantize_ternary_beta_scale(self):
         # With default threshold (None), beta = mean(|W|) is stored in

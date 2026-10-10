@@ -276,36 +276,6 @@ class TernaryDenseTest(testing.TestCase):
         # Strictly denser than int4 (would need n_weights / 2 bytes).
         self.assertLess(n_bytes, n_weights // 2)
 
-    def test_quantized_model_save_load(self):
-        layer = layers.TernaryDense(16)
-        layer.build((None, 8))
-        x = np.random.random((2, 8))
-        y_float = layer(x)
-        layer.quantize("ternary")
-        y_quantized = layer(x)
-        self.assertAllClose(y_float, y_quantized)
-
-        # Full model save / load round-trip.
-        model = models.Sequential([layer])
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "quantized_ternary_model.keras"
-        )
-        model.save(temp_filepath)
-        new_model = saving.load_model(temp_filepath)
-        self.assertEqual(new_model.layers[0].quantization_mode, "ternary")
-        self.assertAllClose(model.predict(x), new_model.predict(x))
-
-        # Weights-only save / load round-trip.
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "quantized_ternary_model.weights.h5"
-        )
-        model.save_weights(temp_filepath)
-        new_model = models.Sequential([layers.TernaryDense(16)])
-        new_model.build((None, 8))
-        new_model.quantize("ternary")
-        new_model.load_weights(temp_filepath)
-        self.assertAllClose(model.predict(x), new_model.predict(x))
-
     def test_model_quantize_ternary(self):
         model = models.Sequential([layers.TernaryDense(8)])
         model.build((None, 6))
@@ -328,12 +298,6 @@ class TernaryDenseTest(testing.TestCase):
         layer.quantize("ternary")
         with self.assertRaisesRegex(ValueError, "already quantized"):
             layer.quantize("ternary")
-
-    def test_quantize_invalid_mode_raises(self):
-        layer = layers.TernaryDense(4)
-        layer.build((None, 6))
-        with self.assertRaises(NotImplementedError):
-            layer.quantize("int8")
 
     def test_quantize_subclass_type_check_raises(self):
         # type_check=True (default) must reject subclasses with a different

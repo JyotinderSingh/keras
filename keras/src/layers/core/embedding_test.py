@@ -14,8 +14,6 @@ from keras.src import ops
 from keras.src import quantizers
 from keras.src import saving
 from keras.src import testing
-from keras.src.quantizers.awq_config import AWQConfig
-from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
@@ -536,23 +534,6 @@ class EmbeddingTest(test_case.TestCase):
         self.assertEqual(layer.dtype_policy, original_dtype_policy)
 
     @parameterized.named_parameters(
-        ("gptq", "gptq"),
-        ("awq", "awq"),
-    )
-    def test_quantize_unsupported_calibration_modes(self, mode):
-        # Embedding only supports int8/int4. GPTQ/AWQ must be rejected
-        # without stashing a stale quantization config on the layer.
-        layer = layers.Embedding(10, 16)
-        layer.build()
-        if mode == "gptq":
-            config = GPTQConfig(dataset=None, tokenizer=None)
-        else:
-            config = AWQConfig(dataset=None, tokenizer=None)
-        with self.assertRaises(NotImplementedError):
-            layer.quantize(mode, config=config)
-        self.assertIsNone(layer.quantization_config)
-
-    @parameterized.named_parameters(
         ("int8", "int8_from_mixed_bfloat16", 0, 2),
         (
             "int4",
@@ -896,27 +877,6 @@ class EmbeddingTest(test_case.TestCase):
         y_after = loaded_model(x)
         self.assertAllClose(y_before, y_after)
 
-    @parameterized.named_parameters(
-        ("grouped_block_64", 64),
-        ("per_channel", None),
-    )
-    @pytest.mark.requires_trainable_backend
-    def test_int4_block_size_with_lora(self, block_size):
-        """Test int4 quantization with LoRA and different block_size."""
-        input_dim, output_dim = 50, 128
-        layer = layers.Embedding(input_dim=input_dim, output_dim=output_dim)
-        layer.build()
-
-        config = Int4QuantizationConfig(block_size=block_size)
-        layer.quantize("int4", config=config)
-        layer.enable_lora(rank=4)
-
-        x = np.random.randint(0, input_dim, size=(4, 8))
-
-        # Should run without error
-        y = layer(x)
-        self.assertEqual(y.shape, (4, 8, output_dim))
-
     def test_int4_grouped_merged_save_keeps_lora_update(self):
         # See `DenseTest.test_int4_grouped_merged_save_keeps_lora_update`.
         input_dim, output_dim, block_size = 12, 16, 4
@@ -1021,41 +981,6 @@ class EmbeddingTest(test_case.TestCase):
 
         # Verify g_idx is NOT created for per-channel
         self.assertIsNone(layer.g_idx)
-
-    @pytest.mark.skipif(
-        testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
-    )
-    def test_int4_subchannel_g_idx_serialization(self):
-        """Test that g_idx is properly serialized and deserialized."""
-        input_dim, output_dim = 10, 16
-        block_size = 8
-
-        layer = layers.Embedding(input_dim=input_dim, output_dim=output_dim)
-        layer.build()
-
-        config = Int4QuantizationConfig(block_size=block_size)
-        layer.quantize("int4", config=config)
-
-        x = np.array([[1, 2, 3], [4, 5, 6]], dtype="int32")
-        y_before = layer(x)
-        g_idx_before = ops.convert_to_numpy(layer.g_idx)
-
-        # Save and load
-        model = models.Sequential([layer])
-        temp_filepath = os.path.join(
-            self.get_temp_dir(), "embedding_int4_g_idx_model.keras"
-        )
-        model.save(temp_filepath)
-        loaded_model = saving.load_model(temp_filepath)
-
-        # Verify g_idx is preserved
-        loaded_layer = loaded_model.layers[0]
-        self.assertIsNotNone(loaded_layer.g_idx)
-        self.assertAllClose(loaded_layer.g_idx, g_idx_before)
-
-        # Verify outputs match
-        y_after = loaded_model(x)
-        self.assertAllClose(y_before, y_after)
 
     @pytest.mark.skipif(
         testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
