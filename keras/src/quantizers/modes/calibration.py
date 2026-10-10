@@ -7,9 +7,16 @@ packed), in the calibrator class, and in one extra AWQ variable of input
 scales that the quantized weight divides out. `GPTQStrategy` and
 `AWQStrategy`, at the end of this module, declare these differences as
 class attributes.
+
+A LoRA update trains against the dequantized weight, as it does for int8
+and int4: the forward pass adds it to the contraction, the calibrators
+quantize the base kernel so the update stays a separate term, and a
+merged save rounds the merged weight onto the calibrated grid
+(`merge_lora_delta`).
 """
 
 import math
+import warnings
 
 from keras.src import ops
 from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
@@ -27,6 +34,10 @@ from keras.src.quantizers.quantized_weight import NoPack
 from keras.src.quantizers.quantized_weight import QuantizedWeight
 from keras.src.quantizers.quantized_weight import WeightScheme
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
+
+# Fraction of the codes a LoRA-merged save may clip to the calibrated range
+# before it warns.
+LORA_MERGE_CLIP_WARNING_FRACTION = 0.01
 
 
 class CalibrationStrategy(QuantizationStrategy):
@@ -255,6 +266,45 @@ class CalibrationStrategy(QuantizationStrategy):
 
         layer._swap_quantized(self, config, swap)
 
+    # --- LoRA merge -------------------------------------------------------
+
+    def merge_lora_delta(self, layer, delta):
+        """Rounds the merged weight onto the calibrated grid.
+
+        The scale, zero point, group index and AWQ's `awq_scales` are the
+        calibration's result and stay as they are. Only the codes change:
+        the merged weight is rounded to the nearest code under those
+        parameters, in `float32`, so a zero delta keeps every code. A
+        weight the delta pushes past its group's range clips to it, and a
+        merge that clips more than `LORA_MERGE_CLIP_WARNING_FRACTION` of
+        the codes warns.
+        """
+        quantized_weight = self.quantized_weight(layer)
+        merged = ops.add(
+            quantized_weight.dequantize("float32"), ops.cast(delta, "float32")
+        )
+        codes = ops.round(quantized_weight.code_image(merged))
+        low, high = quantized_weight.scheme.code_range
+        outside = ops.logical_or(ops.less(codes, low), ops.greater(codes, high))
+        clipped = float(
+            ops.convert_to_numpy(ops.mean(ops.cast(outside, "float32")))
+        )
+        if clipped > LORA_MERGE_CLIP_WARNING_FRACTION:
+            warnings.warn(
+                f"Merging the LoRA update into layer '{layer.name}' clipped "
+                f"{clipped:.1%} of its {self.name.upper()} codes to the "
+                "range its calibrated scale and zero point cover. The saved "
+                "weights keep the calibration but lose that part of the "
+                "update; for a large update, apply the update to the float "
+                "model and calibrate it again.",
+                stacklevel=2,
+            )
+        return (
+            quantized_weight.pack_image(codes),
+            quantized_weight.scale,
+            quantized_weight.zero_point,
+        )
+
     @staticmethod
     def _get_pack_layout(bits, columns):
         """How `columns` codes of `bits` bits pack along the output axis."""
@@ -303,6 +353,7 @@ class CalibrationStrategy(QuantizationStrategy):
         geometry = self.require_geometry(layer)
         W = self.quantized_weight(layer).dequantize(layer.compute_dtype)
         y = geometry.contract(inputs, W)
+        y = geometry.add_lora_delta(inputs, y)
         return apply_bias_activation(layer, y)
 
 

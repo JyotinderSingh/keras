@@ -1559,8 +1559,8 @@ class Layer(BackendLayer, Operation):
         Without a `QuantizedWeight` view this is the float property `name`
         (which merges any LoRA update itself) with no scale or zero point.
         Otherwise it is the stored codes, scale and zero point, or, with
-        LoRA enabled, the mode's `encode` of the dequantized weight plus
-        the LoRA update `lora_{name}_a @ lora_{name}_b`.
+        LoRA enabled, the mode's `merge_lora_delta` of the LoRA update
+        `lora_{name}_a @ lora_{name}_b`.
         """
         quantized_weight = self._quantized_weight()
         if quantized_weight is None:
@@ -1574,11 +1574,8 @@ class Layer(BackendLayer, Operation):
         lora_delta = (self.lora_alpha / self.lora_rank) * ops.matmul(
             getattr(self, f"lora_{name}_a"), getattr(self, f"lora_{name}_b")
         )
-        merged = ops.add(
-            quantized_weight.dequantize(self.variable_dtype), lora_delta
-        )
         strategy = strategy_registry.get_strategy(self.quantization_mode)
-        return strategy.encode(self, merged, self.quantization_config)
+        return strategy.merge_lora_delta(self, lora_delta)
 
     def _save_serialized_variables(self, store, name):
         """Saves the variables `variable_serialization_spec` lists.
@@ -1595,7 +1592,8 @@ class Layer(BackendLayer, Operation):
         if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
         value, scale, zero_point = self._get_weight_with_merged_lora(name)
-        merged = {name: value}
+        # The calibration modes store the codes as `quantized_<name>`.
+        merged = {name: value, f"quantized_{name}": value}
         if scale is not None:
             merged[f"{name}_scale"] = scale
         if zero_point is not None:
