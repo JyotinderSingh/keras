@@ -11,11 +11,11 @@ from absl import logging
 from keras.src import ops
 from keras.src import utils as keras_utils
 from keras.src.quantizers.awq import AWQ
-from keras.src.quantizers.gptq_core import _execution_stages
-from keras.src.quantizers.gptq_core import calibration_no_grad_scope
-from keras.src.quantizers.gptq_core import find_layers_in_block
-from keras.src.quantizers.gptq_core import get_calibration_call_attribute
-from keras.src.quantizers.gptq_core import get_dataloader
+from keras.src.quantizers.calibration_run import _execution_stages
+from keras.src.quantizers.calibration_run import calibration_no_grad_scope
+from keras.src.quantizers.calibration_run import find_layers_in_block
+from keras.src.quantizers.calibration_run import get_calibration_call_attribute
+from keras.src.quantizers.calibration_run import get_dataloader
 from keras.src.quantizers.utils import should_quantize_layer
 
 
