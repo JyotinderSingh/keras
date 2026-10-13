@@ -438,12 +438,15 @@ def _set_weights(
         weight_values: values of the weights to load,
         skip_mismatch: Boolean, whether to skip loading of weights
             where there is a mismatch in the shape of the weights,
+            and of the whole instance when the write check of a weight
+            refuses its value,
         name: name used to identify the group.
 
     Raises:
         ValueError: in case of mismatch between provided
-            model/layer and weights.
+            model/layer and weights, before the first write.
     """
+    writes = []
     for i, weight_value in enumerate(weight_values):
         expected_shape = symbolic_weights[i].shape
         received_shape = weight_value.shape
@@ -466,7 +469,28 @@ def _set_weights(
                 "Received saved weight "
                 f"with shape {received_shape}"
             )
-        symbolic_weights[i].assign(weight_value)
+        writes.append((symbolic_weights[i], weight_value))
+    # A quantization mode can fix the value of a variable. Its check
+    # (`_assign_check`) refuses another value. Every check runs before the
+    # first write, so a refused load leaves the layer as it was. Under
+    # `skip_mismatch`, a refused value skips the layer with a warning.
+    for variable, weight_value in writes:
+        check = getattr(variable, "_assign_check", None)
+        if check is None:
+            continue
+        try:
+            check(weight_value)
+        except ValueError as e:
+            if not skip_mismatch:
+                raise
+            warnings.warn(
+                f"Skipping loading weights for {name} because the value "
+                f"of weight {variable.path} is refused: {e}",
+                stacklevel=2,
+            )
+            return
+    for variable, weight_value in writes:
+        variable.assign(weight_value)
 
     if hasattr(instance, "finalize_state") and symbolic_weights:
         instance.finalize_state()
