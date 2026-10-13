@@ -1,4 +1,5 @@
 import math
+import os
 import warnings
 from unittest import mock
 
@@ -308,6 +309,21 @@ class TestDataloaderReproducibility(testing.TestCase):
         self.assertAllClose(out[0, 0], np.arange(88, 96))
 
 
+def _assert_calibrated(test, layer, mode):
+    """`layer` holds `mode`'s codes, no float kernel and no config."""
+    test.assertEqual(layer.quantization_mode, mode)
+    test.assertFalse(hasattr(layer, "_kernel"))
+    test.assertIsNone(layer.quantization_config)
+
+
+def _assert_float(test, layer):
+    """`layer` is float, with its kernel and no config."""
+    test.assertIsNone(layer.quantization_mode)
+    test.assertFalse(layer._is_quantized)
+    test.assertTrue(hasattr(layer, "_kernel"))
+    test.assertIsNone(layer.quantization_config)
+
+
 def _tiny_model(mode, num_samples=4, dtype=None, block_layers=None, **kwargs):
     """Embedding -> block -> pooled head.
 
@@ -377,13 +393,13 @@ class CalibrationRunTest(testing.TestCase):
             )
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
-    def test_calibrate_requires_a_dataset(self, mode):
+    def test_run_requires_a_dataset(self, mode):
         strategy = strategy_registry.get_strategy(mode)
         with self.assertRaisesRegex(
             ValueError, f"{mode.upper()} quantization requires a dataset"
         ):
-            strategy.calibrate(
-                calibration_config(mode), {"sequential_blocks": [1]}
+            CalibrationRun(
+                strategy, calibration_config(mode), {"sequential_blocks": [1]}
             )
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
@@ -426,24 +442,29 @@ class CalibrationRunTest(testing.TestCase):
         config = calibration_config(mode, **kwargs)
         config.quantization_layer_structure = structure
         rng = np.random.default_rng(0)
-        dataset = [
+        config.dataset = [
             rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
             for _ in range(4)
         ]
-        for block in blocks:
-            for dense in block.layers:
-                dense.quantize(mode, config=config)
-                self.assertTrue(dense.calibration_pending)
+        config.tokenizer = lambda text: text
 
         strategy = strategy_registry.get_strategy(mode)
         run = CalibrationRun(strategy, config, structure)
         self.assertEqual(run.batch_size, 2)
-        run.run(dataset)
-        self.assertEqual(run.num_samples, 3)
-        for block in blocks:
-            for dense in block.layers:
-                self.assertFalse(dense.calibration_pending)
-        outputs = ops.convert_to_numpy(model(dataset[0]))
+        denses = [dense for block in blocks for dense in block.layers]
+        for dense in denses:
+            self.assertTrue(run.covers(dense))
+            run.add(dense)
+        self.assertFalse(run.covers(embedding))
+        # Handing a layer over changes nothing on it.
+        for dense in denses:
+            self.assertIsNone(dense.quantization_mode)
+        run.run()
+        self.assertEqual(len(run.dataloader), 3)
+        self.assertEqual(run.quantized, denses)
+        for dense in denses:
+            _assert_calibrated(self, dense, mode)
+        outputs = ops.convert_to_numpy(model(config.dataset[0]))
         self.assertTrue(np.isfinite(outputs).all())
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
@@ -464,16 +485,19 @@ class CalibrationRunTest(testing.TestCase):
         x = embedding(np.zeros((1, seq_len), "int32"))
         for block in blocks:
             block(x)
-            block.dense.quantize(mode, config=config)
         rng = np.random.default_rng(1)
-        dataset = [
+        config.dataset = [
             rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
             for _ in range(2)
         ]
+        config.tokenizer = lambda text: text
         strategy = strategy_registry.get_strategy(mode)
-        CalibrationRun(strategy, config, structure).run(dataset)
+        run = CalibrationRun(strategy, config, structure)
         for block in blocks:
-            self.assertFalse(block.dense.calibration_pending)
+            run.add(block.dense)
+        run.run()
+        for block in blocks:
+            _assert_calibrated(self, block.dense, mode)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_skips_blocks_without_quantizable_layers(self, mode):
@@ -492,15 +516,18 @@ class CalibrationRunTest(testing.TestCase):
             config.num_grid_points = 3
         x = embedding(np.zeros((1, seq_len), "int32"))
         block(empty(x))
-        block.layers[0].quantize(mode, config=config)
         rng = np.random.default_rng(2)
-        dataset = [
+        config.dataset = [
             rng.integers(0, vocab_size, (1, seq_len)).astype("int32")
             for _ in range(2)
         ]
+        config.tokenizer = lambda text: text
         strategy = strategy_registry.get_strategy(mode)
-        CalibrationRun(strategy, config, structure).run(dataset)
-        self.assertFalse(block.layers[0].calibration_pending)
+        run = CalibrationRun(strategy, config, structure)
+        self.assertFalse(run.covers(empty.ln))
+        run.add(block.layers[0])
+        run.run()
+        _assert_calibrated(self, block.layers[0], mode)
 
 
 @pytest.mark.requires_trainable_backend
@@ -560,7 +587,7 @@ class CalibrationRunModelTest(testing.TestCase):
         # A layer that observed nothing is not also undersampled.
         self.assertFalse([m for m in messages if "undersampled" in m])
         for layer in (block.observed, block.training_only):
-            self.assertFalse(layer.calibration_pending)
+            _assert_calibrated(self, layer, mode)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_calibration_runs_without_grad_tracking(self, mode):
@@ -610,13 +637,13 @@ class CalibrationRunModelTest(testing.TestCase):
             "sequential_blocks": [first, second],
         }
         model.quantize(mode, config=config)
-        self.assertFalse(first.layers[0].calibration_pending)
-        self.assertFalse(second.layers[1].calibration_pending)
+        _assert_calibrated(self, first.layers[0], mode)
+        _assert_calibrated(self, second.layers[1], mode)
         outputs = ops.convert_to_numpy(model(config.dataset[0]))
         self.assertTrue(np.isfinite(outputs).all())
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
-    def test_run_calibrates_only_layers_left_pending(self, mode):
+    def test_run_calibrates_only_float_layers(self, mode):
         # A layer quantized in another mode, or already calibrated, is
         # left as it is instead of failing inside the solve.
         model, config = _tiny_model(mode)
@@ -624,22 +651,41 @@ class CalibrationRunModelTest(testing.TestCase):
         int8_layer, calibrated_layer = block.layers
         int8_layer.quantize("int8")
         int8_codes = ops.convert_to_numpy(int8_layer._kernel)
-        model.quantize(mode, config=config)
+        report = model.quantize(mode, config=config)
         self.assertEqual(int8_layer.quantization_mode, "int8")
         self.assertAllEqual(int8_layer._kernel, int8_codes)
-        self.assertEqual(calibrated_layer.quantization_mode, mode)
-        self.assertFalse(calibrated_layer.calibration_pending)
+        _assert_calibrated(self, calibrated_layer, mode)
+        self.assertEqual(
+            [path for path, *_ in report.quantized], [calibrated_layer.path]
+        )
 
-        # A second call finds nothing pending and runs no forward pass.
+        # A second call finds no float layer and runs no forward pass.
         codes = ops.convert_to_numpy(calibrated_layer.quantized_kernel)
         with mock.patch.object(CalibrationRun, "_prefix_outputs") as prefix:
-            model.quantize(mode, config=config)
+            report = model.quantize(mode, config=config)
         prefix.assert_not_called()
+        self.assertEqual(report.quantized, [])
         self.assertAllEqual(calibrated_layer.quantized_kernel, codes)
 
-    def test_run_solves_a_pending_layer_with_its_own_config(self):
-        # A layer quantized with its own config ahead of the run is solved
-        # with that config, which its variables were allocated for.
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_refused_call_leaves_the_model_untouched(self, mode):
+        # The run refuses a missing dataset or structure before the walk,
+        # so no layer changes and the model still saves.
+        for missing in ("dataset", "tokenizer", "quantization_layer_structure"):
+            model, config = _tiny_model(mode)
+            block = config.quantization_layer_structure["sequential_blocks"][0]
+            setattr(config, missing, None)
+            with self.assertRaises(ValueError):
+                model.quantize(mode, config=config)
+            for layer in block.layers:
+                _assert_float(self, layer)
+            model.save_weights(
+                os.path.join(self.get_temp_dir(), "untouched.weights.h5")
+            )
+
+    def test_a_layer_refused_on_its_own_is_calibrated_by_the_run(self):
+        # `layer.quantize("gptq")` raises and leaves the layer float; the
+        # run then solves it with the run's config, like its neighbours.
         model, config = _tiny_model("gptq", weight_bits=8)
         layer = config.quantization_layer_structure["sequential_blocks"][0]
         layer = layer.layers[0]
@@ -647,18 +693,18 @@ class CalibrationRunModelTest(testing.TestCase):
         layer_config = GPTQConfig(
             dataset=None, tokenizer=None, weight_bits=4, group_size=8
         )
-        layer.quantize("gptq", config=layer_config)
+        with self.assertRaisesRegex(ValueError, "model.quantize"):
+            layer.quantize("gptq", config=layer_config)
+        _assert_float(self, layer)
         with _spy_on_observe("gptq") as observe:
             model.quantize("gptq", config=config)
         for call in observe.call_args_list:
-            calibrator = call.args[0]
-            expected = layer_config if calibrator.layer is layer else config
-            self.assertIs(calibrator.config, expected)
-        self.assertFalse(layer.calibration_pending)
-        self.assertEqual(layer.dtype_policy.name, "gptq/4/8_from_float32")
+            self.assertIs(call.args[0].config, config)
+        _assert_calibrated(self, layer, "gptq")
+        self.assertEqual(layer.dtype_policy.name, "gptq/8/8_from_float32")
         weight = layer._quantized_weight().dequantize("float32")
         error = np.linalg.norm(weight - kernel) / np.linalg.norm(kernel)
-        self.assertLess(error, 0.2)
+        self.assertLess(error, 0.05)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_run_under_a_bfloat16_policy(self, mode):
@@ -667,7 +713,7 @@ class CalibrationRunModelTest(testing.TestCase):
         model.quantize(mode, config=config)
         block = config.quantization_layer_structure["sequential_blocks"][0]
         for layer in block.layers:
-            self.assertFalse(layer.calibration_pending)
+            _assert_calibrated(self, layer, mode)
         outputs = ops.convert_to_numpy(
             ops.cast(model(config.dataset[0]), "float32")
         )

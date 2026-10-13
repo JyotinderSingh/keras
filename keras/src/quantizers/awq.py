@@ -411,8 +411,8 @@ class AWQCalibrator(Calibrator):
 
     Args:
         strategy: The `awq` mode's `CalibrationStrategy`.
-        layer: A layer with a projection geometry (`Dense`, `EinsumDense`)
-            that supports the `awq` mode.
+        layer: A float layer with a projection geometry (`Dense`,
+            `EinsumDense`) that supports the `awq` mode.
         config: `AWQConfig` instance with quantization parameters.
     """
 
