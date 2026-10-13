@@ -22,11 +22,20 @@ the policy and the library versions, and never a tensor value:
 5. The route is available: its device and shape checks pass, and under
    `"auto"` its library version is in its tested range (`tested`).
 6. No Keras distribution is active, and no operand is a DTensor.
-7. The route supports the compute dtype.
+7. The route supports the compute dtype. The inputs of a `matrix` route
+   have the compute dtype: a layer with `autocast=False` leaves its
+   inputs uncast.
 8. Under `"auto"`, `_ALLOW_LIST` has a row for the backend, the device
    class, the compute dtype and the M bucket. A row holds measured
    routes only, as an ordered tuple of `(route, configuration)`. The
    selection takes the first route of the row whose gates pass.
+
+N5 (`"n5"`) is the one route in backend-agnostic `keras.ops`. It
+contracts the inputs with the exact small integers `q - z` of each
+group, and the group scale multiplies the float32 partial sum. It reads
+the group of row `k` as `k // G`, so `run_route` runs it only when
+`g_idx` holds those groups, and the reference path otherwise (GPTQ's
+activation order).
 
 The policy is private. `"auto"` (the default) runs the route of the
 allow-list row, `"off"` runs the reference path, and `"require"` runs
@@ -51,6 +60,7 @@ from packaging.version import Version
 
 from keras.src import backend
 from keras.src import ops
+from keras.src.backend.common import standardize_dtype
 from keras.src.distribution import distribution_lib
 from keras.src.quantizers.geometry import EinsumProjectionGeometry
 from keras.src.quantizers.geometry import ProjectionGeometry
@@ -61,6 +71,8 @@ from keras.src.utils.module_utils import tensorflow as tf
 if backend.backend() == "torch":
     import torch
     from torch.distributed.tensor import DTensor
+
+    from keras.src.backend.torch.ops.core import get_device
 elif backend.backend() == "jax":
     import jax
 
@@ -68,7 +80,18 @@ POLICIES = ("auto", "off", "require")
 # The largest M of each bucket; a larger M is in the bucket "257+".
 _M_BUCKETS = ((16, "1-16"), (64, "17-64"), (256, "65-256"))
 # (backend, device class, compute dtype, M bucket) -> ((route, config), ...)
-_ALLOW_LIST = {}
+# Each row names the JSON lines file of `quant-tooling/kernels/results/`
+# that measured it.
+_ALLOW_LIST = {
+    # 2026-10-22-m1pro-torch-cpu-n5.jsonl (Apple M1 Pro, torch eager). Six
+    # shapes per row; the bfloat16 rows above `M = 64` have three.
+    ("torch", "cpu-arm64", "float32", "1-16"): (("n5", None),),
+    ("torch", "cpu-arm64", "float16", "1-16"): (("n5", None),),
+    ("torch", "cpu-arm64", "bfloat16", "1-16"): (("n5", None),),
+    ("torch", "cpu-arm64", "bfloat16", "17-64"): (("n5", None),),
+    ("torch", "cpu-arm64", "bfloat16", "65-256"): (("n5", None),),
+    ("torch", "cpu-arm64", "bfloat16", "257+"): (("n5", None),),
+}
 # backend -> {device type of `list_devices`: the kernel of `"require"`}
 _REQUIRED = {}
 # The selections per route name, "reference" included. On JAX a selection
@@ -98,7 +121,8 @@ class RouteSource:
     `available(m, k, n, quantized_weight)` its device and shape checks
     (gate 5). `version()` returns the installed library version, or the
     `(jax, jaxlib)` pair, and `tested_versions` holds the release
-    prefixes of the tested range.
+    prefixes of the tested range. A source with `contiguous_groups`
+    reads the group of row `k` as `k // G`, so `run_route` guards it.
     """
 
     fn: object
@@ -107,6 +131,7 @@ class RouteSource:
     available: object = None
     version: object = None
     tested_versions: tuple = ()
+    contiguous_groups: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,9 +157,77 @@ def _reference(layer, geometry, quantized_weight, inputs, config=None):
     return geometry.contract(inputs, float_kernel)
 
 
+def _sum_then_scale(layer, geometry, quantized_weight, inputs, config=None):
+    """N5: the `(M, K)` inputs against the 4-bit codes, scaled per group.
+
+    The low and high nibbles of the codes hold the even and the odd
+    columns. For each plane, a batched float32 matmul contracts the
+    inputs of each group, in the values of the compute dtype, with the
+    small integers `q - z`, so each product is exact. The group scale
+    multiplies the partial sum of its group. Per-channel int4 is one group
+    with no zero point, and its scale divides the result. AWQ divides the
+    inputs by its input scales in the compute dtype.
+    """
+    view, dtype = quantized_weight, layer.compute_dtype
+    rows, columns = view.codes.shape[0], view.layout.orig_len
+    grouped = view.g_idx is not None
+    groups = rows // min(view.scheme.group_size, rows) if grouped else 1
+    if standardize_dtype(view.codes.dtype) == "int8":
+        # The arithmetic shifts sign-extend each nibble.
+        low = ops.right_shift(ops.left_shift(view.codes, 4), 4)
+    else:
+        low = ops.bitwise_and(view.codes, 15)
+    planes = (low, ops.right_shift(view.codes, 4))
+    if view.input_scales is not None:
+        inputs = ops.divide(inputs, view.input_scales)
+    # `(groups, M, G)`: the inputs of each group.
+    x = ops.reshape(inputs, (-1, groups, rows // groups))
+    x = ops.cast(ops.transpose(x, (1, 0, 2)), "float32")
+    scale = ops.cast(view.scale, "float32")
+    if grouped:
+        # `(groups, 1, N / 2, 2)`: the even and odd columns of each group.
+        halves = (groups, 1, columns // 2, 2)
+        zero = ops.cast(ops.reshape(view.zero_point, halves), "float32")
+        group_scale = ops.reshape(scale, halves)
+    outputs = []
+    for i, plane in enumerate(planes):
+        w = ops.reshape(plane, (groups, rows // groups, columns // 2))
+        w = ops.cast(w, "float32")
+        if grouped:
+            # After the cast: a subtraction in uint8 would wrap.
+            w = ops.subtract(w, zero[..., i])
+            partial = ops.multiply(ops.matmul(x, w), group_scale[..., i])
+        else:
+            partial = ops.matmul(x, w)
+        outputs.append(ops.sum(partial, axis=0))
+    y = ops.reshape(ops.stack(outputs, axis=-1), (-1, columns))
+    if not grouped:
+        y = ops.divide(y, scale)
+    return ops.cast(y, dtype)
+
+
+def _n5_available(m, k, n, view):
+    """Gate 5 of N5: whole groups or one group, an even `N`, and eager
+    execution on torch and TensorFlow."""
+    group = view.scheme.group_size
+    if n % 2 or (group is not None and k % group and k > group):
+        return False
+    if backend.backend() == "torch":
+        return not torch.compiler.is_compiling()
+    return backend.backend() != "tensorflow" or tf.executing_eagerly()
+
+
 # Route name -> `RouteSource`. "reference_wrapped" runs the reference path
 # as a route, through `force_route` only.
-_ROUTES = {"reference_wrapped": RouteSource(_reference, matrix=False)}
+_ROUTES = {
+    "reference_wrapped": RouteSource(_reference, matrix=False),
+    "n5": RouteSource(
+        _sum_then_scale,
+        dtypes=("bfloat16", "float16", "float32"),
+        available=_n5_available,
+        contiguous_groups=True,
+    ),
+}
 
 
 def set_policy(value):
@@ -151,8 +244,8 @@ def set_policy(value):
 def policy(value, route=None):
     """Runs a block, or decorates a function, under the policy `value`.
 
-    `route` is for tests only: it forces that route where gates 2, 3, 4
-    and 7 pass.
+    `route` is for tests only: it forces that route where gates 2, 3, 4,
+    5 (without the version range) and 7 pass.
     """
     _check_policy(value, route)
     previous = (_state.policy, _state.route)
@@ -164,7 +257,8 @@ def policy(value, route=None):
 
 
 def force_route(name):
-    """Test helper: runs the route `name` where gates 2, 3, 4 and 7 pass."""
+    """Test helper: runs the route `name` where gates 2, 3, 4, 5 (without
+    the version range) and 7 pass."""
     return policy("auto", route=name)
 
 
@@ -222,7 +316,8 @@ def _select(layer, geometry, view, inputs):
     if any(dim is None for dim in free) or math.prod(free) < 1:  # Gate 2.
         return None
     m, dtype = math.prod(free), layer.compute_dtype
-    # A forced route skips gates 5, 6 and 8, and `"require"` gate 8.
+    # A forced route skips gates 6 and 8, and `"require"` gate 8. Both
+    # skip the version range of gate 5.
     if forced:
         candidates = ((forced, None),)
     elif _distributed(inputs, view):  # Gate 6.
@@ -230,14 +325,14 @@ def _select(layer, geometry, view, inputs):
     elif _state.policy == "require":
         candidates = ((_required_route(), None),)
     else:
-        device = str(inputs.device) if backend.backend() == "torch" else None
-        key = (backend.backend(), _device_class(device), dtype, _m_bucket(m))
-        candidates = _ALLOW_LIST.get(key, ())
+        candidates = _candidates(_ALLOW_LIST, dtype, m)
     for name, config in candidates:
         source = _ROUTES[name]
-        if source.dtypes and dtype not in source.dtypes:  # Gate 7.
+        if (source.dtypes and dtype not in source.dtypes) or (  # Gate 7.
+            source.matrix and standardize_dtype(inputs.dtype) != dtype
+        ):
             continue
-        if forced or _available(source, m, rows, math.prod(columns), view):
+        if _available(source, m, rows, math.prod(columns), view):
             return Route(name, source, config, rows, contracted, columns)
     return None
 
@@ -246,9 +341,24 @@ def _available(source, m, k, n, view):
     """Gate 5: the device and shape checks, and the tested version range."""
     if source.available is not None and not source.available(m, k, n, view):
         return False
-    if _state.policy == "require" or source.version is None:
+    if _state.route or _state.policy == "require" or source.version is None:
         return True
     return tested(source.version(), source.tested_versions)
+
+
+def _candidates(allow_list, dtype, m):
+    """Gate 8: the `(route, config)` pairs of the row of this call.
+
+    The M bucket comes from the input shape, so it is read only where the
+    platform has a row. Elsewhere, a compiled call does not guard on it
+    and does not compile again for a new bucket.
+    """
+    # torch ops move every operand to the device of `get_device()`.
+    device = get_device() if backend.backend() == "torch" else None
+    platform = (backend.backend(), _device_class(device), dtype)
+    if not any(key[:3] == platform for key in allow_list):
+        return ()
+    return allow_list.get(platform + (_m_bucket(m),), ())
 
 
 def _contraction(layer, geometry, view):
@@ -330,8 +440,8 @@ def _m_bucket(m):
 def _device_class(device):
     """`cuda-sm<major><minor>`, `tpu-<kind>`, `mps` or `cpu-<machine>`.
 
-    `device` is the device of a torch operand. The other backends read
-    their default device.
+    `device` is the torch device that the call runs on. The other
+    backends read their default device.
     """
     kind = "cpu"
     if backend.backend() == "torch":
@@ -357,9 +467,12 @@ def _distributed(inputs, view):
     """Gate 6: a Keras distribution is active, or an operand is a DTensor."""
     if distribution_lib.distribution() is not None:
         return True
-    return backend.backend() == "torch" and any(
-        isinstance(tensor, DTensor) for tensor in (inputs, view.codes)
-    )
+    if backend.backend() != "torch":
+        return False
+    # The view of a GPTQ or AWQ call, or of a lookup table, holds the
+    # layer's variables.
+    codes = getattr(view.codes, "value", view.codes)
+    return any(isinstance(tensor, DTensor) for tensor in (inputs, codes))
 
 
 def tested(installed, prefixes):
@@ -382,16 +495,42 @@ def tested(installed, prefixes):
 
 
 def run_route(route, layer, geometry, quantized_weight, inputs):
-    """Runs `route` forward only."""
+    """Runs `route` forward only, with the group guard when it needs one.
+
+    A route with `contiguous_groups` runs on a grouped weight only when
+    `g_idx[k] == k // G` for every row `k`, and the reference path runs
+    otherwise. Under a JAX trace, `ops.cond` traces both. An eager call
+    branches in Python: an eager `lax.cond` would trace and compile both
+    branches again on each call, because each call gives it new functions.
+    """
     source = route.source
     if not source.matrix:
         return source.fn(
             layer, geometry, quantized_weight, inputs, route.config
         )
-    free = ops.shape(inputs)[: len(inputs.shape) - route.contracted]
-    x = ops.reshape(inputs, (-1, route.rows))
-    y = source.fn(layer, geometry, quantized_weight, x, route.config)
-    return ops.reshape(y, tuple(free) + route.columns)
+
+    def routed():
+        free = ops.shape(inputs)[: len(inputs.shape) - route.contracted]
+        x = ops.reshape(inputs, (-1, route.rows))
+        y = source.fn(layer, geometry, quantized_weight, x, route.config)
+        return ops.reshape(y, tuple(free) + route.columns)
+
+    def reference():
+        return _reference(layer, geometry, quantized_weight, inputs)
+
+    g_idx = quantized_weight.g_idx
+    if not source.contiguous_groups or g_idx is None:
+        return routed()
+    group = min(quantized_weight.scheme.group_size, route.rows)
+    groups = ops.floor_divide(ops.arange(route.rows), group)
+    contiguous = ops.all(ops.equal(ops.cast(g_idx, "int32"), groups))
+    if backend.backend() == "jax" and not isinstance(
+        contiguous, jax.core.Tracer
+    ):
+        return routed() if contiguous else reference()
+    # Under a JAX trace this is a `lax.cond`; torch and TensorFlow eager
+    # branch in Python.
+    return ops.cond(contiguous, routed, reference)
 
 
 def contract_quantized(layer, geometry, quantized_weight, inputs):
@@ -490,20 +629,17 @@ def _select_lookup(layer, table, orientation, inputs):
     d, v = table.layout.orig_len, table.shape[1 - d_axis]
     if forced:
         candidates = ((forced, None),)
-    # Gate 6, on the tensors that the stored variables hold.
-    elif _distributed(inputs, table.with_tensors(table.read_tensors())):
+    elif _distributed(inputs, table):  # Gate 6.
         return None
     elif _state.policy == "require":
         candidates = ((_required_route(), None),)
     else:
-        device = str(inputs.device) if backend.backend() == "torch" else None
-        key = (backend.backend(), _device_class(device), dtype, _m_bucket(m))
-        candidates = _LOOKUP_ALLOW_LIST.get(key, ())
+        candidates = _candidates(_LOOKUP_ALLOW_LIST, dtype, m)
     for name, config in candidates:
         source = _LOOKUP_ROUTES.get(name)
         if source is None or (source.dtypes and dtype not in source.dtypes):
             continue  # No reverse lookup in the route, or gate 7.
-        if forced or _available(source, m, d, v, table):
+        if _available(source, m, d, v, table):
             return Route(name, source, config, d, 1, (v,))
     return None
 
