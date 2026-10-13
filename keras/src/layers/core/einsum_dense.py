@@ -724,8 +724,3 @@ class EinsumAxes:
             for i in kernel_axes
             if self.kernel[i] in self.inputs
         )
-
-    @property
-    def gradient_equation(self):
-        """The einsum that produces the inputs gradient."""
-        return f"{self.output},{self.kernel}->{self.inputs}"

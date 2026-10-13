@@ -5,6 +5,9 @@ import math
 from keras.src import ops
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import (
+    contract_with_float_kernel_gradient,
+)
 from keras.src.quantizers.modes.int4.block_size import int4_scheme
 from keras.src.quantizers.modes.int4.block_size import is_per_channel
 from keras.src.quantizers.packing import pack_int4
@@ -94,25 +97,7 @@ class Int4ProjectionHandlers:
     def _call_projection(self, layer, geometry, inputs, training=None):
         view = self._get_projection_quantized_weight(layer, geometry)
 
-        @ops.custom_gradient
-        def contract_with_inputs_gradient(inputs, *tensors):
-            """Dequantizes the int4 kernel and contracts in float.
-
-            `tensors` are the view's stored tensors: the codes and the scale,
-            then the zero point and the group index of a grouped scheme.
-            Autodiff cannot differentiate through the packed kernel, so the
-            gradient with respect to the inputs is taken through the
-            dequantized kernel.
-            """
-            quantized_weight = view.with_tensors(tensors)
-
-            def grad_fn(*args, upstream=None):
-                if upstream is None:
-                    (upstream,) = args
-                float_kernel = quantized_weight.dequantize(layer.compute_dtype)
-                inputs_grad = geometry.contract_grad(upstream, float_kernel)
-                return (inputs_grad,) + (None,) * len(tensors)
-
+        def contract_dequantized(inputs, quantized_weight):
             float_kernel = quantized_weight.dequantize(layer.compute_dtype)
             if layer.inputs_quantizer:
                 inputs_q, inputs_scale = layer.inputs_quantizer(
@@ -123,11 +108,11 @@ class Int4ProjectionHandlers:
                 x = ops.divide(x, geometry.align_inputs_scale(inputs_scale))
             else:
                 x = geometry.contract(inputs, float_kernel)
-            return x, grad_fn
+            return x
 
-        # Read inside the autocast scope: on TensorFlow eager the gradient
-        # runs after it, and the scale variable would then read float32.
-        x = contract_with_inputs_gradient(inputs, *view.read_tensors())
+        x = contract_with_float_kernel_gradient(
+            layer, geometry, view, inputs, contract_dequantized
+        )
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 
