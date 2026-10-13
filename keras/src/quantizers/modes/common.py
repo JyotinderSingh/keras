@@ -27,13 +27,8 @@ class GeometryDispatchStrategy(QuantizationStrategy):
     - `_get_reverse_<family>_quantized_weight`, for a reversible family
       whose layer is untied and has a view: the reverse table's view.
 
-    A mode implements every handler of a family it supports.
-    `check_quantizable` resolves the quantize, build, call and view
-    handlers before `Layer.quantize` changes the layer, so a mode missing
-    one of them is refused with `NotImplementedError` and the layer stays
-    as it was. A missing encode or reverse view handler raises only when
-    its verb runs. A subclass that overrides a verb itself needs no
-    handlers for it.
+    A mode implements every handler of each family it lists in
+    `geometry_families`.
     """
 
     # The handler that each verb calls, by geometry family.
@@ -60,15 +55,6 @@ class GeometryDispatchStrategy(QuantizationStrategy):
         geometry = self.require_geometry(layer)
         handler = self._handler("quantize", geometry.family, layer)
         handler(layer, geometry, config)
-
-    def check_quantizable(self, layer):
-        geometry = self.require_geometry(layer)
-        for verb in ("quantize", "build", "call", "quantized_weight"):
-            # A subclass that overrides the verb itself needs no handler.
-            if getattr(type(self), verb) is getattr(
-                GeometryDispatchStrategy, verb
-            ):
-                self._handler(verb, geometry.family, layer)
 
     def encode(self, layer, weight, config=None):
         geometry = self.require_geometry(layer)
