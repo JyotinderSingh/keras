@@ -1,6 +1,7 @@
 """Route selection for a 4-bit weight-only contraction (`kernels.py`).
 
-The tests run the reference path as a route
+The library has one route in `keras.ops`, `"sum_then_scale"`. The tests
+also run the reference path as a route
 (`force_route("reference_wrapped")`) and the `"matrix"` route, which
 contracts the `(M, K)` inputs with the stored matrix, both from
 `kernels_test_utils`. The route suites run each kernel route of the
@@ -27,17 +28,23 @@ from keras.src import distribution
 from keras.src import layers
 from keras.src import models
 from keras.src import ops
+from keras.src import saving
 from keras.src import testing
 from keras.src.backend import config
+from keras.src.backend.common.backend_utils import M_BUCKET_NAMES
 from keras.src.backend.common.global_state import clear_session
 from keras.src.backend.common.quantized_kernels import Kernel
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.export.saved_model import ExportArchive
 from keras.src.quantizers import kernels
+from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.capture import calibration_scope
+from keras.src.quantizers.kernels_test_utils import BUCKET_ROWS
 from keras.src.quantizers.kernels_test_utils import admitted
 from keras.src.quantizers.kernels_test_utils import counts
 from keras.src.quantizers.kernels_test_utils import device_type
 from keras.src.quantizers.kernels_test_utils import direct
+from keras.src.quantizers.kernels_test_utils import first_tested_route
 from keras.src.quantizers.kernels_test_utils import floor_and_bound
 from keras.src.quantizers.kernels_test_utils import matrix_route
 from keras.src.quantizers.kernels_test_utils import route_tables
@@ -58,6 +65,14 @@ from keras.src.utils.module_utils import torch_xla
 
 if backend.backend() == "jax":
     import jax
+
+    if is_nnx_enabled():
+        from flax import nnx
+elif backend.backend() == "tensorflow":
+    import tensorflow as tf
+elif backend.backend() == "torch":
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
 
 # name -> (equation, or `None` for `Dense`; output shape or units; inputs).
 # Each equation is reshape-compatible. `dense_aligned` and `qkv_aligned`
@@ -209,6 +224,38 @@ def _check_route(test, layer, x, name):
     return y, reference
 
 
+def _contiguous(layer):
+    """Whether `g_idx[k] == k // G` for every stored row `k`. A view with
+    no `g_idx` has these groups."""
+    view = layer._quantized_weight()
+    if view.g_idx is None:
+        return True
+    rows = view.codes.shape[0]
+    groups = np.arange(rows) // min(view.scheme.group_size, rows)
+    return np.array_equal(_numpy(view.g_idx), groups)
+
+
+def _host_tensors(fn):
+    """Runs `fn` and returns how many tensors torch makes from host data
+    (`aten.lift_fresh`), for example from a Python number operand.
+
+    Torch copies such a tensor to the device on each call, and a CUDA
+    graph capture refuses the copy. The op runs on the CPU device too.
+    """
+    count = 0
+
+    class HostTensors(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            nonlocal count
+            if func is torch.ops.aten.lift_fresh.default:
+                count += 1
+            return func(*args, **(kwargs or {}))
+
+    with HostTensors():
+        fn()
+    return count
+
+
 def _exact_inputs(input_shape, rows, rng):
     """Inputs with eight nonzero entries of 1 or -1 per contracted row."""
     x = np.zeros((math.prod(input_shape) // rows, rows), "float32")
@@ -219,8 +266,8 @@ def _exact_inputs(input_shape, rows, rng):
 
 class RouteSuiteTest(testing.TestCase):
     """Each route that a call admits, against the float64 oracle and the
-    reference path: `"reference_wrapped"`, `"matrix"` and the kernel
-    routes of this process (`kernels_test_utils.admitted`).
+    reference path: `"reference_wrapped"`, `"matrix"`, `"sum_then_scale"`
+    and the kernel routes of this process (`kernels_test_utils.admitted`).
     `dense_aligned` and `qkv_aligned` pass the shape checks of each
     kernel."""
 
@@ -330,12 +377,17 @@ class RouteSuiteTest(testing.TestCase):
         )
     )
     def test_calibrated(self, case, mode, dtype):
-        """GPTQ and AWQ codes (uint8 storage)."""
+        """GPTQ and AWQ codes (uint8 storage). With groups that are not
+        contiguous, the guard of a route that reads the group of row `k`
+        as `k // G` gives the reference path's output."""
         layer = _calibrated(ROUTABLE[case], mode, dtype)
         x = _random(ROUTABLE[case][2])
         with route_tables():
             for name in self.routes(layer, x):
-                _check_route(self, layer, x, name)
+                y, reference = _check_route(self, layer, x, name)
+                route = kernels._ROUTES[name]
+                if route.contiguous_groups and not _contiguous(layer):
+                    self.assertAllEqual(y, reference)
 
     @parameterized.named_parameters(
         named_product(
@@ -374,6 +426,549 @@ class RouteSuiteTest(testing.TestCase):
                     input_gradient(layer, x), expected, atol=bound, rtol=0
                 )
 
+    @parameterized.named_parameters(
+        named_product(dtype=["float32", "mixed_bfloat16"])
+    )
+    def test_guard_runs_the_reference_path(self, dtype):
+        """GPTQ with activation order scatters the groups, so each route
+        that reads the group of row `k` as `k // G` runs the reference
+        path, eagerly and under `jax.jit`."""
+        layer = _calibrated(ROUTABLE["dense_aligned"], "gptq_act_order", dtype)
+        x = _random(ROUTABLE["dense_aligned"][2])
+        self.assertFalse(_contiguous(layer))
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        names = [
+            name
+            for name in admitted(layer, x)
+            if kernels._ROUTES[name].contiguous_groups
+        ]
+        self.assertIn("sum_then_scale", names)
+        for name in names:
+            with kernels.force_route(name):
+                self.assertEqual(counts(layer, x), {name: 1})
+                self.assertAllEqual(_numpy(layer(x)), expected)
+                if backend.backend() == "jax":
+                    # `ops.cond` traces both branches.
+                    y = jax.jit(lambda v: layer(v))(x)
+                    self.assertAllEqual(_numpy(y), expected)
+
+
+class SumThenScaleTest(testing.TestCase):
+    """The sum-then-scale route through `force_route`, and under `"auto"`
+    with a row."""
+
+    @parameterized.named_parameters(
+        named_product(
+            block_size=[32, 64, 128, 256],
+            groups=[1, 2, 8],
+            dtype=["float32", "mixed_bfloat16"],
+        )
+    )
+    def test_grouped_shapes(self, block_size, groups, dtype):
+        """int4 codes (int8 storage) with `K` of 1, 2 and 8 groups."""
+        rows = groups * block_size
+        layer = _layer((None, 10, (1, rows)), block_size, dtype)
+        for m in (1, 3, 16, 17, 33, 130):
+            _check_route(
+                self, layer, _random((m, rows), seed=m), "sum_then_scale"
+            )
+
+    @parameterized.named_parameters(
+        named_product(
+            case=[("per_channel", -1, 200), ("short_group", 128, 48)],
+            dtype=["float32", "mixed_bfloat16", "mixed_float16"],
+        )
+    )
+    def test_rows_without_whole_groups(self, case, dtype):
+        """Per-channel int4 has no groups, and a block longer than `K` is
+        one group."""
+        _, block_size, rows = case
+        layer = _layer((None, 10, (1, rows)), block_size, dtype)
+        _check_route(self, layer, _random((5, rows)), "sum_then_scale")
+
+    @parameterized.named_parameters(
+        named_product(
+            mode=["gptq", "gptq_per_channel", "awq"],
+            dtype=["float32", "mixed_bfloat16"],
+        )
+    )
+    def test_exact_data(self, mode, dtype):
+        """uint8 storage: small integers and power-of-two scales give the
+        oracle exactly."""
+        layer = _calibrated(ROUTABLE["dense"], mode, dtype)
+        view = layer._quantized_weight()
+        rng = np.random.default_rng(2)
+        rows, columns = view.codes.shape[0], view.layout.orig_len
+        codes = rng.integers(7, 10, (rows, columns)).astype("uint8")
+        layer.quantized_kernel.assign(pack_int4(codes, -1, "uint8")[0])
+        zero = rng.integers(7, 10, layer.kernel_zero.shape)
+        layer.kernel_zero.assign(zero.astype("uint8"))
+        powers = rng.integers(1, 4, layer.kernel_scale.shape)
+        layer.kernel_scale.assign(2.0**-powers)
+        if mode == "awq":
+            layer.awq_scales.assign(2.0 ** rng.integers(0, 2, rows))
+        x = _exact_inputs(ROUTABLE["dense"][2], rows, rng)
+        oracle = _oracle(layer, x).astype("float32")
+        with kernels.policy("off"):
+            self.assertAllEqual(_numpy(layer(x)), oracle)
+        with kernels.force_route("sum_then_scale"):
+            self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+            self.assertAllEqual(_numpy(layer(x)), oracle)
+
+    @parameterized.named_parameters(
+        ("odd_columns", (None, 7, (2, 64)), 32),
+        ("partial_group", (None, 10, (2, 200)), 32),
+        ("no_rows", (None, 10, (0, 64)), 32),
+    )
+    def test_refusals(self, case, block_size):
+        """Odd `N` and a partial last group fail the shape check, and
+        `M = 0` the row check, so the reference path runs."""
+        layer = _layer(case, block_size)
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        with kernels.force_route("sum_then_scale"):
+            self.assertEqual(counts(layer, x), {"reference": 1})
+            self.assertAllEqual(_numpy(layer(x)), expected)
+
+    @parameterized.named_parameters(
+        ("int4", None), ("gptq", "gptq"), ("awq", "awq")
+    )
+    def test_auto_row(self, mode):
+        """Under `"auto"`, a row runs the route in its M bucket, and the
+        layer output equals a direct call of the route (G8)."""
+        case = ROUTABLE["dense"]
+        layer = _layer(case) if mode is None else _calibrated(case, mode)
+        with route_tables({row_key("float32", "1-16"): ("sum_then_scale",)}):
+            x = _random((4, 256))
+            self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+            self.assertAllEqual(_numpy(layer(x)), _numpy(direct(layer, x)))
+            self.assertEqual(
+                counts(layer, _random((17, 256))), {"reference": 1}
+            )
+
+    @parameterized.named_parameters(("grouped", 32), ("per_channel", -1))
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Compiles with `jax.jit`."
+    )
+    def test_jax_jit_runs_the_route(self, block_size):
+        layer = _layer(ROUTABLE["dense"], block_size)
+        x = _random(ROUTABLE["dense"][2])
+        oracle = _oracle(layer, x)
+        with kernels.policy("off"):
+            reference = _numpy(layer(x))
+        kernels.route_counts.clear()
+        with kernels.force_route("sum_then_scale"):
+            y = _numpy(jax.jit(lambda v: layer(v))(x))
+        self.assertEqual(dict(kernels.route_counts), {"sum_then_scale": 1})
+        err = _err(y, oracle)
+        self.assertLessEqual(err, 1.25 * _err(reference, oracle) + 1e-6)
+        self.assertLessEqual(err, 1e-5)
+
+    @parameterized.named_parameters(
+        ("contiguous_groups", None), ("activation_order", "gptq_act_order")
+    )
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Counts JAX compilations."
+    )
+    def test_jax_eager_call_compiles_once(self, mode):
+        """An eager call branches on the guard in Python, so a second call
+        with the same shapes compiles nothing. An eager `lax.cond` would
+        compile both branches again on each call."""
+        case = ROUTABLE["dense"]
+        layer = _layer(case) if mode is None else _calibrated(case, mode)
+        x = _random(case[2])
+        compiles = []
+
+        def count(event, duration_secs, **kwargs):
+            if event == "/jax/core/compile/backend_compile_duration":
+                compiles.append(duration_secs)
+
+        kernels.route_counts.clear()
+        with kernels.force_route("sum_then_scale"):
+            first = _numpy(layer(x))
+            jax.monitoring.register_event_duration_secs_listener(count)
+            try:
+                second = _numpy(layer(x))
+            finally:
+                jax.monitoring.unregister_event_duration_listener(count)
+        self.assertEqual(dict(kernels.route_counts), {"sum_then_scale": 2})
+        self.assertEqual(compiles, [])
+        self.assertAllEqual(second, first)
+
+    @pytest.mark.skipif(
+        backend.backend() != "tensorflow", reason="Traces a `tf.function`."
+    )
+    def test_tensorflow_graphs_run_the_reference_path(self):
+        """The route runs eagerly only on TensorFlow."""
+        layer = _layer(ROUTABLE["dense"])
+        x = _random(ROUTABLE["dense"][2])
+        for jit_compile in (False, True):
+            call = tf.function(lambda v: layer(v), jit_compile=jit_compile)
+            kernels.route_counts.clear()
+            with kernels.force_route("sum_then_scale"):
+                call(x)
+            self.assertEqual(dict(kernels.route_counts), {"reference": 1})
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Builds a DTensor variable."
+    )
+    def test_dtensor_codes_run_the_reference_path(self):
+        """The distribution check reads the value of a variable that the
+        view of a GPTQ call holds."""
+        layer = _calibrated(ROUTABLE["dense"], "gptq")
+        geometry = layer._quantization_geometry()
+        view = layer._quantized_weight()
+        x = ops.convert_to_tensor(_random((4, 256)))
+        if torch.distributed.is_initialized():
+            self.skipTest("Another test holds the default process group.")
+        store = os.path.join(self.get_temp_dir(), "store")
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{store}", rank=0, world_size=1
+        )
+        try:
+            mesh = distribution.DeviceMesh((1,), ["x"], ["cpu:0"])
+            layout = distribution.TensorLayout(("x", None), mesh)
+            with distribution.ModelParallel(
+                layout_map=distribution.LayoutMap(mesh)
+            ).scope():
+                codes = backend.Variable(
+                    ops.convert_to_numpy(view.codes),
+                    dtype="uint8",
+                    trainable=False,
+                    layout=layout,
+                )
+            tensors = (codes,) + view.read_tensors()[1:]
+            with route_tables(
+                {row_key("float32", "1-16"): ("sum_then_scale",)}
+            ):
+                route = kernels.select_route(layer, geometry, view, x)
+                self.assertEqual(route.name, "sum_then_scale")
+                sharded = view.with_tensors(tensors)
+                self.assertIsNone(
+                    kernels.select_route(layer, geometry, sharded, x)
+                )
+        finally:
+            torch.distributed.destroy_process_group()
+
+    @parameterized.named_parameters(
+        ("int4_grouped", None, 32),
+        ("int4_per_channel", None, -1),
+        ("gptq", "gptq", None),
+        ("awq", "awq", None),
+    )
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Records the torch dispatch."
+    )
+    def test_torch_call_makes_no_host_tensor(self, mode, block_size):
+        """A call of the route and of its group guard makes no tensor from
+        host data, which a CUDA graph capture refuses."""
+        case = ROUTABLE["dense"]
+        if mode is None:
+            layer = _layer(case, block_size)
+        else:
+            layer = _calibrated(case, mode)
+        x = ops.convert_to_tensor(_random(case[2]))
+        with kernels.force_route("sum_then_scale"):
+            self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+            self.assertEqual(_host_tensors(lambda: layer(x)), 0)
+
+
+# Modes whose mode fixes the groups, so that their view has no `g_idx`:
+# `None` is int4.
+FIXED = (None, "awq", "gptq_per_channel")
+
+
+def _quantized(case, mode):
+    return _layer(case) if mode is None else _calibrated(case, mode)
+
+
+def _other_groups(layer):
+    """The groups of the layer's `g_idx` in another order."""
+    groups = np.asarray(_numpy(layer.g_idx))
+    if not groups.any():
+        groups[:3] = [1.0, 2.0, 3.0]
+        return groups
+    return np.random.default_rng(3).permutation(groups)
+
+
+def _set_g_idx(layer, g_idx):
+    weights = layer.get_weights()
+    weights[[v.name for v in layer.weights].index("g_idx")] = g_idx
+    layer.set_weights(weights)
+
+
+def _model(layer, case):
+    return models.Sequential([layers.Input(case[2][1:]), layer])
+
+
+class GroupIndexTest(testing.TestCase):
+    """int4, AWQ and GPTQ with one group fix their groups, so their view
+    has no `g_idx`, no path reads the stored one, and no route needs the
+    guard. GPTQ with several groups reads `g_idx` and keeps the guard on
+    the value of each call."""
+
+    @parameterized.named_parameters(
+        ("int4", "dense", None),
+        ("awq", "dense", "awq"),
+        ("gptq_one_group", "dense", "gptq_per_channel"),
+        ("gptq_one_group_einsum", "qkv_dnh", "gptq_per_channel"),
+        ("int4_reversible_tied", "reversible_tied", None),
+        ("int4_reversible_untied", "reversible_untied", None),
+    )
+    def test_no_path_reads_the_stored_g_idx(self, case, mode):
+        """The load-bearing invariant of a mode that fixes its groups: no
+        path reads the stored `g_idx`. Nothing checks a write of it, so a
+        write of other groups through any path (`assign`, `set_weights`,
+        a load, a torch `load_state_dict`, a TF checkpoint restore, an
+        NNX update) must change no output. Here the write skips `assign`,
+        and it changes neither the reference path nor the sum-then-scale
+        route, bit for bit. A
+        grouped int4 `ReversibleEmbedding` runs its forward and its
+        reverse lookup, which have no route in `keras.ops`."""
+        if case.startswith("reversible"):
+            layer = layers.ReversibleEmbedding(
+                50, 64, tie_weights=case == "reversible_tied"
+            )
+            layer.build()
+            config = Int4QuantizationConfig(block_size=16)
+            layer.quantize("int4", config=config)
+            strategy = strategy_registry.get_strategy(layer.quantization_mode)
+            views = strategy.quantized_weights(layer)
+            self.assertLen(views, 1 if layer.tie_weights else 2)
+            x = np.random.default_rng(2).integers(0, 50, (4, 7))
+
+            def call():
+                hidden = layer(x)
+                return [hidden, layer(hidden, reverse=True)]
+
+        else:
+            case = ROUTABLE[case]
+            layer = _quantized(case, mode)
+            views = (layer._quantized_weight(),)
+            x = _random(case[2])
+
+            def call():
+                return [layer(x)]
+
+        for view in views:
+            self.assertIsNone(view.g_idx)
+
+        def outputs():
+            with kernels.policy("off"):
+                reference = [_numpy(y) for y in call()]
+            if len(reference) > 1:
+                return reference
+            with kernels.force_route("sum_then_scale"):
+                self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+                return reference + [_numpy(layer(x))]
+
+        before = outputs()
+        other = _other_groups(layer)
+        layer.g_idx._direct_assign(ops.convert_to_tensor(other, "float32"))
+        self.assertAllEqual(_numpy(layer.g_idx), other)
+        for y, expected in zip(outputs(), before):
+            self.assertAllEqual(y, expected)
+
+    @pytest.mark.skipif(backend.backend() != "jax", reason="Reads a jaxpr.")
+    def test_jit_traces_the_guard_only_where_g_idx_is_read(self):
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        for mode in FIXED + ("gptq", "gptq_act_order"):
+            layer = _quantized(case, mode)
+            with kernels.force_route("sum_then_scale"):
+                jaxpr = str(jax.make_jaxpr(lambda v: layer(v))(x))
+            guarded = mode in ("gptq", "gptq_act_order")
+            self.assertEqual(
+                layer._quantized_weight().g_idx is not None, guarded
+            )
+            self.assertEqual("cond[" in jaxpr, guarded, msg=mode)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Runs `stateless_call` in `jit`."
+    )
+    def test_stateless_call_reads_the_g_idx_it_is_given(self):
+        """GPTQ: the guard reads the `g_idx` of the call on the device.
+        The state of an activation-order model, given to a layer whose own
+        groups are contiguous, gives the output of the reference path, in
+        an eager call and under `jax.jit`."""
+        case = ROUTABLE["dense"]
+        source = _calibrated(case, "gptq_act_order")
+        layer = _calibrated(case, "gptq")
+        self.assertTrue(_contiguous(layer))
+        self.assertFalse(_contiguous(source))
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+        state = [v.value for v in source.non_trainable_variables]
+
+        def call(state, v):
+            return layer.stateless_call([], state, v)[0]
+
+        with kernels.force_route("sum_then_scale"):
+            eager = _numpy(call(state, x))
+            jitted = _numpy(jax.jit(call)(state, x))
+        for y in (eager, jitted):
+            self.assertTrue(np.all(np.isfinite(y)))
+            self.assertAllEqual(y, expected)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Compiles a JAX executable."
+    )
+    def test_compiled_executable_after_a_write(self):
+        """An executable compiled before a write. For GPTQ, after a
+        `set_weights` from an activation-order model, it gives the output
+        of the reference path. For int4, AWQ and GPTQ with one group, a
+        `set_weights` of other groups passes and the output does not
+        change."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        source = _calibrated(case, "gptq_act_order")
+        for mode in FIXED + ("gptq",):
+            layer = _quantized(case, mode)
+
+            def call(state, v):
+                return layer.stateless_call([], state, v)[0]
+
+            def state():
+                return [v.value for v in layer.non_trainable_variables]
+
+            with kernels.force_route("sum_then_scale"):
+                compiled = jax.jit(call).lower(state(), x).compile()
+            with kernels.policy("off"):
+                reference = jax.jit(call).lower(state(), x).compile()
+            before = _numpy(compiled(state(), x))
+            if mode == "gptq":
+                layer.set_weights(source.get_weights())
+                y = _numpy(compiled(state(), x))
+                self.assertTrue(np.all(np.isfinite(y)))
+                self.assertAllClose(y, _numpy(reference(state(), x)))
+                self.assertNotAllClose(y, before)
+                continue
+            _set_g_idx(layer, _other_groups(layer))
+            self.assertAllEqual(_numpy(compiled(state(), x)), before)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Exports with `jax.export`."
+    )
+    def test_exported_artifact_with_other_state(self):
+        """A `jax.export` artifact of a GPTQ layer whose groups are
+        contiguous holds the guard, so the state of an activation-order
+        model gives the output of the reference path."""
+        case = ROUTABLE["dense"]
+        source = _calibrated(case, "gptq_act_order")
+        layer = _calibrated(case, "gptq")
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+
+        def call(state, v):
+            return layer.stateless_call([], state, v)[0]
+
+        state = [v.value for v in layer.non_trainable_variables]
+        specs = [jax.ShapeDtypeStruct(v.shape, v.dtype) for v in state]
+        x_spec = jax.ShapeDtypeStruct(x.shape, x.dtype)
+        with kernels.force_route("sum_then_scale"):
+            exported = jax.export.export(jax.jit(call))(specs, x_spec)
+        source_state = [v.value for v in source.non_trainable_variables]
+        y = _numpy(exported.call(source_state, x))
+        self.assertTrue(np.all(np.isfinite(y)))
+        self.assertAllClose(y, expected)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax" or not is_nnx_enabled(),
+        reason="Runs NNX updates.",
+    )
+    def test_nnx_update_with_other_state(self):
+        """`nnx.update` writes the state of another model without
+        `assign`. GPTQ with the state of an activation-order model gives
+        the output of the reference path, eager, under `nnx.jit` and in
+        `predict`. For int4 and AWQ, other groups in the stored `g_idx`
+        change no output."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        source = _model(_calibrated(case, "gptq_act_order"), case)
+        target = _model(_calibrated(case, "gptq"), case)
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+        nnx.update(target, nnx.state(source))
+        call = nnx.jit(lambda model, v: model(v))
+        with kernels.force_route("sum_then_scale"):
+            outputs = (
+                _numpy(target(x)),
+                _numpy(call(target, x)),
+                target.predict(x, verbose=0),
+            )
+        for y in outputs:
+            self.assertTrue(np.all(np.isfinite(y)))
+            self.assertAllClose(y, expected)
+        for mode in (None, "awq"):
+            model = _model(_quantized(case, mode), case)
+            with kernels.force_route("sum_then_scale"):
+                before = (_numpy(model(x)), _numpy(call(model, x)))
+            other = _model(_quantized(case, mode), case)
+            other_layer = other.layers[0]
+            other_layer.g_idx._direct_assign(
+                ops.convert_to_tensor(_other_groups(other_layer), "float32")
+            )
+            nnx.update(model, nnx.state(other))
+            self.assertAllEqual(
+                _numpy(model.layers[0].g_idx), _numpy(other_layer.g_idx)
+            )
+            with kernels.force_route("sum_then_scale"):
+                self.assertAllEqual(_numpy(model(x)), before[0])
+                self.assertAllEqual(_numpy(call(model, x)), before[1])
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Counts JAX compilations."
+    )
+    def test_load_does_not_trace_other_models_again(self):
+        """A GPTQ load into one model compiles nothing again for another
+        GPTQ model, whose sum-then-scale route holds the guard: no state
+        outside the variables describes the groups."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        model = _model(_calibrated(case, "gptq"), case)
+        with kernels.force_route("sum_then_scale"):
+            model.predict(x, verbose=0)
+        saved = _model(_calibrated(case, "gptq_act_order"), case)
+        path = os.path.join(self.get_temp_dir(), "gptq.keras")
+        saved.save(path)
+        compiles = []
+
+        def count(event, duration_secs, **kwargs):
+            if event == "/jax/core/compile/backend_compile_duration":
+                compiles.append(duration_secs)
+
+        saving.load_model(path)
+        jax.monitoring.register_event_duration_secs_listener(count)
+        try:
+            with kernels.force_route("sum_then_scale"):
+                model.predict(x, verbose=0)
+        finally:
+            jax.monitoring.unregister_event_duration_listener(count)
+        self.assertEqual(compiles, [])
+
+    def test_activation_order_round_trip(self):
+        """A saved GPTQ model in activation order loads its `g_idx`, and
+        the sum-then-scale route under the guard gives the output of the
+        reference path."""
+        case = ROUTABLE["dense"]
+        layer = _calibrated(case, "gptq_act_order")
+        model = _model(layer, case)
+        path = os.path.join(self.get_temp_dir(), "act_order.keras")
+        model.save(path)
+        loaded = saving.load_model(path)
+        x = _random(case[2])
+        self.assertAllEqual(_numpy(loaded.layers[0].g_idx), _numpy(layer.g_idx))
+        with kernels.policy("off"):
+            expected = _numpy(model(x))
+        with kernels.force_route("sum_then_scale"):
+            y = _numpy(loaded(x))
+        self.assertTrue(np.all(np.isfinite(y)))
+        self.assertAllEqual(y, expected)
+
 
 class FallbackTest(testing.TestCase):
     """Each gate refusal runs the reference path."""
@@ -409,9 +1004,25 @@ class FallbackTest(testing.TestCase):
         with kernels.force_route("reference_wrapped"):
             self.assertEqual(counts(layer, x), {"reference_wrapped": 1})
             self.assertAllEqual(_numpy(layer(x)), expected)
+        with kernels.force_route("sum_then_scale"):
+            self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+            self.assertAllClose(_numpy(layer(x)), expected, atol=1e-5)
 
     def test_empty_inputs(self):
         self.assertReference(_layer(ROUTABLE["dense"]), np.ones((0, 256)))
+
+    def test_inputs_in_another_dtype(self):
+        """A layer with `autocast=False` leaves its inputs uncast, and a
+        `matrix` route serves only inputs in the compute dtype."""
+        layer = _float_layer(ROUTABLE["dense"], "mixed_bfloat16")
+        layer.autocast = False
+        layer.quantize("int4", config=Int4QuantizationConfig(block_size=32))
+        x = _random((3, 256))
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        with kernels.force_route("sum_then_scale"):
+            self.assertEqual(counts(layer, x), {"reference": 1})
+            self.assertAllEqual(_numpy(layer(x)), expected)
 
     def test_standard_third_party_layer_gets_the_route(self):
         layer = StandardProjection(8, use_bias=False)
@@ -469,6 +1080,30 @@ class FallbackTest(testing.TestCase):
             call(x)
             call(x + 1)
         self.assertEqual(dict(kernels.route_counts), {"reference_wrapped": 1})
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Compiles with `torch.compile`."
+    )
+    def test_torch_compile_does_not_recompile(self):
+        """The sum-then-scale route runs eagerly only, so a compiled call
+        with its row runs the reference path."""
+        layer = _layer(ROUTABLE["dense"])
+        x = _random(ROUTABLE["dense"][2])
+        torch._dynamo.reset()
+        call = torch.compile(lambda v: layer(v), backend="eager")
+        kernels.route_counts.clear()
+        with route_tables({row_key("float32", "1-16"): ("sum_then_scale",)}):
+            # The first call compiles. The calls with new values reuse its
+            # code.
+            outputs = [_numpy(call(ops.convert_to_tensor(x)))]
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                for i in (1, 2):
+                    outputs.append(_numpy(call(ops.convert_to_tensor(x + i))))
+            self.assertEqual(dict(kernels.route_counts), {})
+            self.assertEqual(counts(layer, x), {"sum_then_scale": 1})
+        for i, y in enumerate(outputs):
+            with kernels.policy("off"):
+                self.assertAllEqual(y, _numpy(layer(x + i)))
 
     @pytest.mark.skipif(
         backend.backend() not in ("tensorflow", "jax"),
@@ -571,6 +1206,64 @@ class MeasuredRowsTest(testing.TestCase):
             self.skipTest("The default device is not a CPU.")
         cpu = f"cpu-{platform.machine()}"
         self.assertEqual(kernels._device_class(), cpu)
+
+    def test_rows_can_pass_their_gates(self):
+        """Each row of both measured tables has a backend, a device class of
+        `_device_class`, a compute dtype and an M bucket. Its routes serve
+        that backend, device class and compute dtype, so
+        a row cannot name a cell that its routes refuse."""
+        buckets = M_BUCKET_NAMES
+        backends = ("jax", "numpy", "tensorflow", "torch")
+        device_classes = r"^(cuda-sm\d+|tpu-.+|mps|cpu-.+|gpu)$"
+        tables = (
+            (kernels._MEASURED_ROWS, kernels._ROUTES, ("sum_then_scale",)),
+            (kernels._MEASURED_LOGITS_ROWS, kernels._LOGITS_ROUTES, ()),
+        )
+        for measured_rows, sources, names in tables:
+            for key, routes in measured_rows.items():
+                backend_name, device_class, dtype, bucket = key
+                self.assertIn(backend_name, backends)
+                self.assertRegex(device_class, device_classes)
+                self.assertIn(dtype, ("bfloat16", "float16", "float32"))
+                self.assertIn(bucket, buckets)
+                self.assertNotEqual(len(routes), 0, key)
+                for name in routes:
+                    self.assertIn(name, names, key)
+                    source = sources[name]
+                    if source.dtypes:
+                        self.assertIn(dtype, source.dtypes, key)
+
+    def test_rows_of_this_platform(self):
+        """Under `"auto"`, each row of this backend and device runs its
+        first route that this process has in its tested version range,
+        and the layer output equals a direct call of the route (G8). With
+        no such route, the reference path runs. The layer passes the
+        shape gates of every route: `K = 256`, `N = 128` and groups of
+        128."""
+        platform_key = row_key("float32", "1-16")[:2]
+        rows = {
+            key: routes
+            for key, routes in kernels._MEASURED_ROWS.items()
+            if key[:2] == platform_key
+        }
+        if not rows:
+            self.skipTest("No measured row has this platform.")
+        policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
+        for (_, _, dtype, bucket), routes in rows.items():
+            with self.subTest(dtype=dtype, bucket=bucket):
+                case = (None, 128, (BUCKET_ROWS[bucket], 256))
+                layer = _layer(case, 128, policy.get(dtype, dtype))
+                x = _random(case[2])
+                expected = first_tested_route(routes, kernels._ROUTES)
+                # Only `"auto"` reads the measured rows.
+                with kernels.policy("auto"):
+                    self.assertEqual(counts(layer, x), {expected: 1})
+                    y = _numpy(layer(x))
+                    if expected != "reference":
+                        self.assertAllEqual(y, _numpy(direct(layer, x)))
+                if expected == "reference":
+                    with kernels.policy("off"):
+                        self.assertAllEqual(y, _numpy(layer(x)))
 
 
 class PolicyTest(testing.TestCase):
