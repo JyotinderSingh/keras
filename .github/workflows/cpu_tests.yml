@@ -35,6 +35,7 @@ jobs:
 
     env:
       KERAS_HOME: .github/workflows/config/${{ matrix.backend }}
+      TRITON_INTERPRET: ${{ matrix.backend == 'torch' && '1' || '0' }}
 
     steps:
       - name: Install binary dependencies
@@ -68,6 +69,10 @@ jobs:
           pip install -r requirements.txt
           pip install --no-deps tf_keras
           pip uninstall -y keras
+
+      - name: Install Triton for the Triton interpreter tests
+        if: ${{ matrix.backend == 'torch' }}
+        run: pip install "$(python .github/workflows/scripts/torch_triton_requirement.py)"
 
       - name: Run Tests for applications
         if: ${{ steps.filter.outputs.applications == 'true' && matrix.nnx_enabled == false }}
