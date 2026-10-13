@@ -91,7 +91,6 @@ class Int4ProjectionHandlers:
             scale_axes=(1,) if layer.g_idx is None else None,
             permutation=permutation,
             zero_point=layer.kernel_zero,
-            g_idx=layer.g_idx,
         )
 
     def _call_projection(self, layer, geometry, inputs, training=None):

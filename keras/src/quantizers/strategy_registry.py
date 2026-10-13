@@ -71,7 +71,7 @@ axes (`KernelAxes`). A projection also stores its `bias` in every mode.
              embeddings_zero and g_idx).
              Per channel, the weight is `codes / scale`. Grouped, it is
              `(codes - zero) * scale`, with the zero point and the scale
-             of the group that `g_idx` gives each position.
+             of group `i // block_size` for position `i`.
     float8   projection: kernel (the float kernel stays), and a scale and
              an amax history each for the inputs, the kernel and the
              output gradient. No codes: kernel_scale is a delayed-scaling
@@ -87,6 +87,15 @@ axes (`KernelAxes`). A projection also stores its `bias` in every mode.
              and the scale of the group that `g_idx` gives each row.
     awq      projection: as gptq, and awq_scales (one per row). The weight
              is that of gptq divided by `awq_scales`, per row.
+
+A mode that fixes its groups (int4 in groups, awq, and gptq with one group
+per problem) puts position `k` in group `k // G`. Its `g_idx` stores that
+index for the saved format, and no forward pass reads it: the view of the
+weight (`QuantizedWeight`) has no `g_idx`, and its `group_index()`
+computes the groups. gptq with several groups reads `g_idx`, which its
+activation order permutes. So do stacked problems (an einsum batch axis of
+gptq or awq) whose last group is partial: the groups of each problem are
+numbered after those of the problem before.
 
 `test_stored_variables_follow_the_scale_convention` in `conformance_test.py`
 recomputes the weight of each mode that stores codes from its stored
