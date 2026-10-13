@@ -7,9 +7,11 @@ from keras.src.export.export_utils import get_input_signature
 from keras.src.export.export_utils import make_tf_tensor_spec
 from keras.src.export.saved_model import DEFAULT_ENDPOINT_NAME
 from keras.src.export.saved_model import ExportArchive
+from keras.src.quantizers import kernels
 from keras.src.utils import io_utils
 
 
+@kernels.policy("off")
 def export_openvino(
     model, filepath, verbose=None, input_signature=None, **kwargs
 ):
