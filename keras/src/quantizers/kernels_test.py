@@ -1456,7 +1456,7 @@ class PolicyTest(testing.TestCase):
     def test_require_raises_without_a_kernel(self):
         """The test takes this backend's kernels out of the route table,
         because a GPU host can have one: the Triton kernels on a CUDA host
-        with Triton (torch)."""
+        with Triton (torch), and the Mosaic GPU kernels on JAX."""
         with route_tables(required=()):
             with self.assertRaisesRegex(ValueError, "needs a platform with"):
                 with kernels.policy("require"):

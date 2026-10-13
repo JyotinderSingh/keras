@@ -95,6 +95,7 @@ jobs:
         run: pytest keras --ignore keras/src/applications --cov=keras --cov-config=pyproject.toml
 
       - name: Run the Triton and quantization tests under the "require" kernel policy
+        # JAX joins on Python 3.12: on 3.11 (this image) JAX stops at 0.10.2, without `plgpu.mma`.
         if: ${{ matrix.backend == 'torch' }}
         run: |
           pytest --kernel-policy=require \

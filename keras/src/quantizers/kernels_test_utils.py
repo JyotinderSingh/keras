@@ -7,9 +7,10 @@ Importing this module registers test routes in both route tables:
   call takes the path of a selected route (the selection, the count and,
   for the reverse lookup, the custom gradient), so its outputs must equal
   those of the reference path bit for bit.
-- The interpret route of the torch backend under the Triton
-  interpreter, `"triton_interpret"`. It runs the kernel of the backend on
-  a CPU host and has no `kernel`, so `"require"` does not run it.
+- The interpret routes of the backend: `"mosaic_gpu_interpret"` on JAX
+  (the matmul table only) and `"triton_interpret"` on torch under the
+  Triton interpreter. They run the kernels of the backend on a CPU host
+  and have no `kernel`, so `"require"` does not run them.
 
 `route_tables` adds the `"matrix"` routes, which contract the `(M, K)`
 inputs with the stored matrix.
@@ -35,10 +36,13 @@ from keras.src import backend
 from keras.src import distribution
 from keras.src import ops
 from keras.src.backend.common import AutocastScope
+from keras.src.backend.common.backend_utils import m_bucket
 from keras.src.quantizers import kernels
 from keras.src.quantizers import strategy_registry
 
-if backend.backend() == "torch":
+if backend.backend() == "jax":
+    from keras.src.backend.jax.ops import quantized_test_utils
+elif backend.backend() == "torch":
     from keras.src.backend.torch.ops import quantized_test_utils
 else:
     quantized_test_utils = None
@@ -155,6 +159,12 @@ def route_tables(
 def row_key(dtype, bucket):
     """The measured row key of this backend and device."""
     return (backend.backend(), kernels._device_class(), dtype, bucket)
+
+
+def row(dtype, m, route):
+    """A measured row of this backend and device that runs `route` for a
+    call with `m` rows."""
+    return {row_key(dtype, m_bucket(m)): (route,)}
 
 
 # An `M` in each M bucket.
