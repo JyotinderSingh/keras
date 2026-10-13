@@ -1,26 +1,40 @@
 """The calibration modes' shared chassis, tested once per mode."""
 
+import math
 import os
 import warnings
 
+import ml_dtypes
 import numpy as np
 import pytest
 from absl.testing import parameterized
 
+from keras.src import backend
 from keras.src import layers
 from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
+from keras.src.quantizers import kernels
+from keras.src.quantizers.capture import calibration_scope
 from keras.src.quantizers.geometry import ContractionView
 from keras.src.quantizers.geometry import KernelAxes
 from keras.src.quantizers.geometry import ProjectionGeometry
+from keras.src.quantizers.kernels_test import _numpy
+from keras.src.quantizers.kernels_test import _routes
 from keras.src.quantizers.quantization_test_utils import assert_calibrated
 from keras.src.quantizers.quantization_test_utils import assert_float
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import calibration_statistic
 from keras.src.testing.test_utils import named_product
+
+if backend.backend() == "jax":
+    import jax
+elif backend.backend() == "tensorflow":
+    import tensorflow as tf
+elif backend.backend() == "torch":
+    import torch
 
 MODES = ["gptq", "awq"]
 
@@ -1086,3 +1100,248 @@ class CalibrationLoRATest(testing.TestCase):
         self.assertFalse(hasattr(layer, "_kernel"))
         self.assertLen(layer.trainable_weights, 3)
         self.assertLen(layer.non_trainable_weights, 4 if mode == "gptq" else 5)
+
+
+# name -> (equation, or `None` for `Dense`; output shape or units; inputs).
+# Each equation is reshape-compatible, so a forced route serves it. A
+# `_lora` case also has a bias, an activation and LoRA.
+ROUTED = {
+    "dense": (None, 24, (3, 128)),
+    "dense_lora": (None, 24, (2, 3, 128)),
+    "qkv_dnh_lora": ("btd,dnh->btnh", (None, 2, 8), (2, 3, 128)),
+    "query_ndh": ("btd,ndh->btnh", (None, 2, 8), (2, 3, 128)),
+    "output_nhd": ("btnh,nhd->btd", (None, 24), (2, 3, 2, 64)),
+}
+# name -> (mode, group size, activation order).
+ROUTED_MODES = {
+    "gptq": ("gptq", 64, False),
+    "gptq_per_channel": ("gptq", -1, False),
+    "gptq_act_order": ("gptq", 64, True),
+    "awq": ("awq", 64, False),
+}
+
+
+def _routed_layer(case, mode, dtype="float32"):
+    """A layer of `case` calibrated in `mode`, and inputs for it."""
+    equation, output, input_shape = ROUTED[case]
+    extras = case.endswith("_lora")
+    activation = "relu" if extras else None
+    if equation is None:
+        layer = layers.Dense(
+            output, activation=activation, use_bias=extras, dtype=dtype
+        )
+    else:
+        layer = layers.EinsumDense(
+            equation,
+            output,
+            activation=activation,
+            bias_axes=equation[-1] if extras else None,
+            dtype=dtype,
+        )
+    layer.build(input_shape)
+    rng = np.random.default_rng(0)
+    layer.kernel.assign(rng.standard_normal(layer.kernel.shape) * 0.1)
+    if extras:
+        layer.bias.assign(rng.standard_normal(layer.bias.shape))
+    mode, group_size, activation_order = ROUTED_MODES[mode]
+    kwargs = {"activation_order": True} if activation_order else {}
+    x = rng.standard_normal((16,) + input_shape[1:]).astype("float32")
+    _calibrate(layer, mode, x, group_size=group_size, **kwargs)
+    if extras:
+        layer.enable_lora(2)
+        _set_adapter(layer, rng, scale=0.1)
+    return layer, x[: input_shape[0]]
+
+
+def _vjp(layer, x, upstream, compiled):
+    """The outputs of `layer` at `x`, and the input gradient for the output
+    gradient `upstream`, eagerly or compiled."""
+    if backend.backend() == "jax":
+
+        def vjp(v, u):
+            y, pullback = jax.vjp(layer, v)
+            return y, pullback(ops.cast(u, y.dtype))[0]
+
+        y, grad = jax.jit(vjp)(x, upstream) if compiled else vjp(x, upstream)
+        return _numpy(y), _numpy(grad)
+    if backend.backend() == "torch":
+        call = layer
+        if compiled:
+            torch._dynamo.reset()
+            call = torch.compile(lambda v: layer(v), backend="aot_eager")
+        v = torch.tensor(x, requires_grad=True)
+        y = call(v)
+        y.backward(ops.cast(upstream, y.dtype))
+        return _numpy(y.detach()), _numpy(v.grad)
+
+    def vjp(v, u):
+        with tf.GradientTape() as tape:
+            tape.watch(v)
+            y = layer(v)
+        return y, tape.gradient(y, v, output_gradients=ops.cast(u, y.dtype))
+
+    if compiled:
+        vjp = tf.function(vjp, jit_compile=True)
+    y, grad = vjp(tf.constant(x), tf.constant(upstream))
+    return _numpy(y), _numpy(grad)
+
+
+class CalibrationRouteTest(testing.TestCase):
+    """GPTQ and AWQ through a route.
+
+    No kernel route exists yet. `force_route("reference_wrapped")` runs the
+    reference path as a route, inside the custom gradient, and `matrix` (a
+    route of `kernels_test.py`) contracts the `(M, K)` inputs with the
+    stored matrix.
+    """
+
+    @parameterized.named_parameters(
+        named_product(
+            case=sorted(ROUTED), mode=sorted(ROUTED_MODES), dtype=["float32"]
+        )
+        + named_product(
+            case=sorted(ROUTED), mode=MODES, dtype=["mixed_bfloat16"]
+        )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "numpy", reason="NumPy has no gradients."
+    )
+    def test_wrapped_reference(self, case, mode, dtype):
+        """The outputs equal the reference path's bit for bit. The input
+        gradient is the backward of the custom gradient: for an eager
+        `Dense` it equals autodiff's bit for bit, and for an einsum it can
+        sum in another order, within 8 ulps of the largest entry."""
+        layer, x = _routed_layer(case, mode, dtype)
+        rng = np.random.default_rng(1)
+        upstream = rng.standard_normal(_numpy(layer(x)).shape)
+        upstream = upstream.astype("float32")
+        mantissa = ml_dtypes.finfo(layer.compute_dtype).nmant
+        for compiled in (False, True):
+            with kernels.policy("off"):
+                y, expected = _vjp(layer, x, upstream, compiled)
+            kernels.route_counts.clear()
+            with kernels.force_route("reference_wrapped"):
+                outputs, gradient = _vjp(layer, x, upstream, compiled)
+            if not compiled:
+                counts = dict(kernels.route_counts)
+                self.assertEqual(counts, {"reference_wrapped": 1})
+            self.assertAllEqual(outputs, y)
+            # Compiled, XLA can round autodiff's gradient of the reference
+            # path another way (JAX 0.11.2 and newer, mixed_bfloat16), so a
+            # compiled `Dense` gets the bound of an einsum.
+            if ROUTED[case][0] is None and not compiled:
+                self.assertAllEqual(gradient, expected)
+            else:
+                peak = np.max(np.abs(expected))
+                ulp = 2.0 ** (np.floor(np.log2(peak)) - mantissa)
+                self.assertLessEqual(
+                    np.max(np.abs(gradient - expected)), 8 * ulp
+                )
+            # A route replaces the forward only.
+            with _routes(), kernels.force_route("matrix"):
+                _, routed = _vjp(layer, x, upstream, compiled)
+            self.assertAllEqual(routed, gradient)
+
+    @parameterized.named_parameters(
+        named_product(case=["dense_lora", "query_ndh"], mode=MODES)
+    )
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Reads the residuals of `jax.vjp`."
+    )
+    def test_jax_residuals_hold_the_stored_tensors(self, case, mode):
+        """Autodiff keeps the float kernel for the backward pass. The custom
+        gradient keeps the stored tensors and fewer bytes."""
+        layer, x = _routed_layer(case, mode)
+        kernel_size = math.prod(layer.kernel.shape)
+
+        def residuals(scope):
+            with scope:
+                _, pullback = jax.vjp(layer, x)
+            leaves = jax.tree_util.tree_leaves(pullback)
+            return [leaf for leaf in leaves if hasattr(leaf, "nbytes")]
+
+        def float_kernels(leaves):
+            return [
+                leaf
+                for leaf in leaves
+                if leaf.size == kernel_size
+                and jax.numpy.issubdtype(leaf.dtype, jax.numpy.floating)
+            ]
+
+        expected = residuals(kernels.policy("off"))
+        wrapped = residuals(kernels.force_route("reference_wrapped"))
+        self.assertNotEmpty(float_kernels(expected))
+        # The default policy has no route here, so autodiff keeps the
+        # float kernel too.
+        self.assertNotEmpty(float_kernels(residuals(kernels.policy("auto"))))
+        self.assertEmpty(float_kernels(wrapped))
+        codes = layer.quantized_kernel
+        self.assertTrue(
+            any(
+                leaf.shape == codes.shape and leaf.dtype == codes.dtype
+                for leaf in wrapped
+            )
+        )
+        self.assertLess(
+            sum(leaf.nbytes for leaf in wrapped),
+            sum(leaf.nbytes for leaf in expected),
+        )
+
+    @parameterized.named_parameters(named_product(mode=MODES))
+    def test_reference_path_constructs_no_custom_gradient(self, mode):
+        """NumPy warns when it constructs a custom gradient. The reference
+        path constructs none, and the wrapped reference does."""
+        layer, x = _routed_layer("dense", mode)
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        for scope, warns in (
+            (kernels.policy("auto"), False),
+            (kernels.policy("off"), False),
+            (
+                kernels.force_route("reference_wrapped"),
+                backend.backend() == "numpy",
+            ),
+        ):
+            with warnings.catch_warnings(record=True) as caught, scope:
+                warnings.simplefilter("always")
+                y = layer(x)
+            self.assertAllEqual(_numpy(y), expected)
+            messages = [str(w.message) for w in caught]
+            self.assertEqual(
+                any("`custom_gradient`" in m for m in messages), warns
+            )
+
+    @parameterized.named_parameters(named_product(mode=MODES))
+    def test_calibration_capture_runs_once_per_call(self, mode):
+        layer, x = _routed_layer("dense", mode)
+        seen = []
+        with _routes(), calibration_scope({layer: seen.append}):
+            for scope in (
+                kernels.policy("off"),
+                kernels.policy("auto"),
+                kernels.force_route("reference_wrapped"),
+                kernels.force_route("matrix"),
+            ):
+                with scope:
+                    layer(x)
+        self.assertLen(seen, 4)
+        for inputs in seen:
+            self.assertAllEqual(_numpy(inputs), x)
+
+    @parameterized.named_parameters(
+        ("two_bit", "dense", 2),
+        ("three_bit", "dense", 3),
+        ("eight_bit", "dense", 8),
+        ("batch_axis", "batched", 4),
+    )
+    def test_refusals_run_the_reference_path(self, kind, bits):
+        """Codes that do not pack two per byte and a batch axis keep the
+        reference path under a forced route."""
+        layer, x = _make_layer(kind, np.random.default_rng(0))
+        _calibrate(layer, "gptq", x, weight_bits=bits, group_size=4)
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        kernels.route_counts.clear()
+        with kernels.force_route("reference_wrapped"):
+            self.assertAllEqual(_numpy(layer(x)), expected)
+        self.assertEqual(dict(kernels.route_counts), {"reference": 1})
