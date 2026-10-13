@@ -77,7 +77,8 @@ def _get_weight_scale(weights, group_size):
 
     Args:
         weights: Weight matrix `[out_features, in_features]`.
-        group_size: Quantization group size (`-1` for per-channel).
+        group_size: Quantization group size (`-1` for one group of all input
+            rows).
 
     Returns:
         Per-in-channel weight statistic `[in_features]`.
@@ -164,7 +165,8 @@ def awq_search_optimal_scales(
         hessian: `2 mean(x x^T)` over the calibration rows
             [in_features, in_features].
         num_grid_points: Number of grid search points. Defaults to 20.
-        group_size: Group size for quantization (-1 for per-channel).
+        group_size: Group size for quantization (-1 for one group of all
+            input rows).
 
     Returns:
         best_scales: Optimal per-channel scales [in_features].
@@ -212,7 +214,8 @@ def awq_search_best_clip(weights_scaled, hessian, awq_scales, *, group_size):
         hessian: `2 mean(x x^T)` over the calibration rows
             [in_features, in_features], for the unscaled inputs.
         awq_scales: The per-input-channel scales [in_features].
-        group_size: Quantization group size (-1 for per-channel).
+        group_size: Quantization group size (-1 for one group of all input
+            rows).
 
     Returns:
         The bound of every group, `[out_features, n_groups, 1]`.
@@ -305,7 +308,8 @@ def awq_quantize_matrix(
         hessian: `2 mean(x x^T)` over the calibration rows
             [in_features, in_features].
         num_grid_points: Grid points of the scale search.
-        group_size: Quantization group size (-1 for per-channel).
+        group_size: Quantization group size (-1 for one group of all input
+            rows).
         apply_clip: Whether to run the clipping search.
 
     Returns:

@@ -30,6 +30,16 @@ class DTypePolicyMap(DTypePolicy, MutableMapping):
             return config
     ```
 
+    A config that holds only such a map keeps each sub-layer's quantization
+    mode and the parameters of its policy: the int4 block size, the GPTQ
+    and AWQ bit width and group size, and the float8 amax history length.
+    It does not keep a sub-layer's `quantization_config`. A sub-layer that
+    is built again from the map builds its mode's variables with the mode's
+    default quantizers, so a quantizer that only the config held is lost.
+    For example, an int8 sub-layer quantized with
+    `Int8QuantizationConfig(activation_quantizer=None)` is rebuilt with the
+    default `AbsMaxQuantizer` for its inputs.
+
     Internally, `DTypePolicyMap` uses a string as a key and a `DTypePolicy`
     as the value. Typically, the key used for querying is the `Layer.path`.
     However, it is also possible to set a regex as the key. See the docstring of
