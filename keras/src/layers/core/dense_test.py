@@ -1199,10 +1199,15 @@ class DenseTest(testing.TestCase):
         target = self._build_dense_for_mode(mode)
         target.load_own_variables(test_utils.positional_store(source))
         test_utils.assert_serialized_variables_equal(self, source, target)
-        # A layer built from its policy runs from its variables.
-        x = np.random.rand(2, target.kernel_shape[0]).astype("float32")
+        # A layer built from its policy runs from its variables. A route can
+        # add in another order, so the bound is relative to the largest
+        # output.
+        rng = np.random.default_rng(0)
+        x = rng.random((2, target.kernel_shape[0])).astype("float32")
         weight = target._quantized_weight().dequantize("float32")
-        self.assertAllClose(target(x), ops.matmul(x, weight) + target.bias)
+        expected = ops.convert_to_numpy(ops.matmul(x, weight) + target.bias)
+        atol = 1e-5 * np.max(np.abs(expected))
+        self.assertAllClose(target(x), expected, atol=atol, rtol=0)
 
     @parameterized.parameters("gptq", "awq")
     def test_gptq_awq_unbuilt_layer_reports_no_variables(self, mode):
