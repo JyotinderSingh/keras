@@ -479,7 +479,7 @@ def _count(selection):
 
 
 def _device_class():
-    """The device class of the call: `cuda-sm<major><minor>`,
+    """The device class of the call: `cuda-sm<major><minor>`, `tpu-<kind>`,
     `mps`, `gpu` or `cpu-<machine>`.
 
     The kernel module of the backend says it. A backend with no kernel
@@ -556,10 +556,12 @@ def _kernel_routes(kernel):
     `None`.
 
     Each route unpacks the stored tensors of a `QuantizedWeight` for the
-    kernel.
+    kernel. A kernel with `contiguous_groups` takes no `g_idx`: the
+    `run_route` guard stands in for it.
     """
 
     def matmul(view, inputs, dtype):
+        groups = {} if kernel.contiguous_groups else {"g_idx": view.g_idx}
         return kernel.matmul(
             inputs,
             view.codes,
@@ -569,7 +571,7 @@ def _kernel_routes(kernel):
             signed=standardize_dtype(view.codes.dtype) == "int8",
             per_channel=view.scheme.group_size is None,
             input_scales=view.input_scales,
-            g_idx=view.g_idx,
+            **groups,
         )
 
     def logits(table, inputs, dtype):
@@ -596,6 +598,7 @@ def _kernel_routes(kernel):
         dtypes=kernel.dtypes,
         available=available(kernel.available),
         tested=kernel.tested,
+        contiguous_groups=kernel.contiguous_groups,
         kernel=kernel,
     )
     if kernel.logits is None:

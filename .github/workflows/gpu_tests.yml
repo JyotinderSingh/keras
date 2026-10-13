@@ -100,7 +100,9 @@ jobs:
             --group ${{ matrix.shard }}
 
       - name: Run the Triton and quantization tests under the "require" kernel policy
-        # One shard runs it: the step selects its own files.
+        # One shard runs it: the step selects its own files. JAX joins on
+        # Python 3.12: on 3.11 (this image) JAX stops at 0.10.2, without
+        # `plgpu.mma`.
         if: ${{ matrix.backend == 'torch' && matrix.shard == 1 }}
         run: |
           pytest --kernel-policy=require \
