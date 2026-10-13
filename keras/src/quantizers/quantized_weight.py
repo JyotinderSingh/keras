@@ -338,6 +338,50 @@ class QuantizedWeight:
         The codes are cast to `dtype` before the arithmetic, and the result
         is cast to `dtype` after it.
         """
+        return self._restore_shape(self._dequantize_stored(dtype))
+
+    def dequantize_rows(self, indices, dtype):
+        """Returns the rows `indices` of `dequantize(dtype)`.
+
+        The stored rows are gathered first, and only they are unpacked and
+        dequantized, so a lookup does not read the whole table. The codes
+        must be stored as the weight, without a permutation or a reshape,
+        and packed along an axis other than the rows; the scale and the
+        zero point must have one row per row of the weight.
+        """
+        rows = copy.copy(self)
+        for name in ("codes", "scale", "zero_point"):
+            tensor = getattr(self, name)
+            if tensor is not None:
+                setattr(rows, name, ops.take(tensor, indices, axis=0))
+        return rows._dequantize_stored(dtype)
+
+    def apply_scale(self, outputs, inputs_scale=None):
+        """Applies the stored scale to the inputs contracted with the codes.
+
+        `outputs` is the contraction of the inputs with `unpack()`. The
+        weight has no zero point, and its stored scale broadcasts against
+        `outputs` (it runs along the axes the contraction keeps).
+        `inputs_scale` is the divisor scale of quantized inputs, laid out
+        against `outputs`.
+        """
+        if self.zero_point is not None:
+            raise ValueError(
+                "A zero point cannot be applied after the contraction. "
+                f"Received: scheme={self.scheme!r}"
+            )
+        if self.scheme.scale_form == "divisor":
+            scale = self.scale
+            if inputs_scale is not None:
+                scale = ops.multiply(inputs_scale, scale)
+            return ops.divide(outputs, scale)
+        outputs = ops.multiply(outputs, self.scale)
+        if inputs_scale is not None:
+            outputs = ops.divide(outputs, inputs_scale)
+        return outputs
+
+    def _dequantize_stored(self, dtype):
+        """`dequantize(dtype)` in the stored coordinates."""
         codes = ops.cast(self.layout.unpack(self.codes), dtype)
         if self.g_idx is not None:
             weight = dequantize_with_sz_map(
@@ -359,7 +403,7 @@ class QuantizedWeight:
             weight = ops.divide(
                 weight, self._along_axis(self.input_scales, weight)
             )
-        return self._restore_shape(ops.cast(weight, dtype))
+        return ops.cast(weight, dtype)
 
     def code_image(self, weight):
         """Returns the unrounded codes of a real-valued `weight`.
