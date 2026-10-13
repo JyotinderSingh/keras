@@ -273,24 +273,6 @@ class RecipeOnlyProjection(layers.Layer):
         self._load_serialized_variables(store, "kernel")
 
 
-class KernelPropertyProjection(RecipeOnlyProjection):
-    """`RecipeOnlyProjection` with a `kernel` property.
-
-    The calibrator reads the float weight through the property.
-    """
-
-    @property
-    def kernel(self):
-        quantized_weight = self._quantized_weight()
-        if quantized_weight is None:
-            return self._kernel
-        return quantized_weight.unpack()
-
-    def _quantization_geometry(self):
-        # A subclass is quantizable only by its own declaration.
-        return ProjectionGeometry(self)
-
-
 class SamePathBlock(layers.Layer):
     """A block whose two `Dense` layers share the name, and so the path."""
 
@@ -1013,21 +995,37 @@ class CalibrationRunModelTest(testing.TestCase):
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_third_party_projection_in_a_block_is_calibrated(self, mode):
         # A layer that lists the mode in its `variable_serialization_spec`
-        # is calibrated like the `Dense` next to it, and a model built
-        # under the calibrated policies loads its weights.
-        custom = KernelPropertyProjection(16, activation="relu")
+        # is calibrated like the `Dense` it replaces, without a `kernel`
+        # property, and a model built under the calibrated policies loads
+        # its weights.
+        reference, reference_config = _tiny_model(mode)
+        custom = RecipeOnlyProjection(16, activation="relu")
         dense = layers.Dense(8)
         model, config = _tiny_model(mode, block_layers=[custom, dense])
+        model.set_weights(reference.get_weights())
         report = model.quantize(mode, config=config)
+        reference.quantize(mode, config=reference_config)
         self.assertIn(custom.path, [path for path, *_ in report.quantized])
         assert_calibrated(self, custom, mode)
+        # The same weights and data, so the run stores the same values.
+        reference_block = reference_config.quantization_layer_structure[
+            "sequential_blocks"
+        ][0]
+        for layer, reference_layer in zip(
+            [custom, dense], reference_block.layers
+        ):
+            self.assertEqual(len(layer.weights), len(reference_layer.weights))
+            for variable, expected in zip(
+                layer.weights, reference_layer.weights
+            ):
+                self.assertAllEqual(variable, expected)
 
         filepath = os.path.join(self.get_temp_dir(), "custom.weights.h5")
         model.save_weights(filepath)
         twin, _ = _tiny_model(
             mode,
             block_layers=[
-                KernelPropertyProjection(
+                RecipeOnlyProjection(
                     16, activation="relu", dtype=custom.dtype_policy.name
                 ),
                 layers.Dense(8, dtype=dense.dtype_policy.name),
@@ -1036,20 +1034,6 @@ class CalibrationRunModelTest(testing.TestCase):
         twin.load_weights(filepath)
         x = config.dataset[0]
         self.assertAllClose(twin(x), model(x))
-
-    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
-    def test_a_layer_without_a_kernel_property_is_skipped(self, mode):
-        # The calibrator reads the float weight through `kernel`, so the
-        # walk skips a layer without one, and the run calibrates the rest.
-        custom = RecipeOnlyProjection(16)
-        dense = layers.Dense(8)
-        model, config = _tiny_model(mode, block_layers=[custom, dense])
-        report = model.quantize(mode, config=config)
-        self.assertIn(
-            (custom.path, QuantizationReport.SKIP_NO_SUPPORT), report.skipped
-        )
-        assert_float(self, custom)
-        assert_calibrated(self, dense, mode)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_layers_that_share_a_path_are_both_calibrated(self, mode):
