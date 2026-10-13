@@ -172,12 +172,18 @@ class QuantizationStrategy:
 
         `Layer.quantize` calls it before the layer changes, so a refused
         layer stays as it was. The default requires a quantization
-        geometry.
+        geometry, and raises `ValueError` when the `kernel_axes` of a
+        projection do not partition the axes of its kernel.
 
         Args:
             layer: The layer about to be quantized.
         """
-        self.require_geometry(layer)
+        geometry = self.require_geometry(layer)
+        if geometry.family == "projection":
+            # The modes lay the kernel out from `kernel_axes`, so a
+            # declaration that does not fit the kernel fails here, with an
+            # error that names it, instead of deep inside the mode.
+            geometry.kernel_axes.validate(len(geometry.weight_shape))
 
     def check_compute_dtype(self, compute_dtype):
         """Raises `NotImplementedError` if this mode cannot use `compute_dtype`.

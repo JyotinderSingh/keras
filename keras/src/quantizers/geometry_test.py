@@ -7,6 +7,12 @@ from keras.src import testing
 from keras.src.layers.core.einsum_dense import EinsumAxes
 from keras.src.quantizers.geometry import ContractionView
 from keras.src.quantizers.geometry import KernelAxes
+from keras.src.quantizers.geometry import ProjectionGeometry
+from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import Pointwise1D
+from keras.src.quantizers.quantization_test_utils import ThirdPartyProjection
+from keras.src.quantizers.quantization_test_utils import assert_float
 
 
 def _expert_slices(x):
@@ -298,3 +304,241 @@ class EinsumAxesTest(testing.TestCase):
         self.assertEqual(
             axes.gradient_equation, f"{output},{axes.kernel}->{inputs}"
         )
+
+    @parameterized.named_parameters(
+        ("matmul", "ab,bc->ac", (None, 8), (6,), (None, 1), (1, 6)),
+        (
+            "qkv",
+            "btd,dnh->btnh",
+            (None, 5, 4),
+            (None, 2, 3),
+            (None, None, 1, 2),
+            (1, 1, 2, 3),
+        ),
+        (
+            "gemma_q",
+            "btd,ndh->btnh",
+            (None, 5, 4),
+            (None, 2, 3),
+            (None, None, 0, 2),
+            (1, 1, 2, 3),
+        ),
+        (
+            "batch_axis",
+            "btei,eid->bted",
+            (None, 5, 3, 7),
+            (None, 3, 6),
+            (None, None, 0, 2),
+            (1, 1, 3, 6),
+        ),
+        # The free axis `g` has size one and keeps its own place.
+        (
+            "size_one_free_axis",
+            "acd,gecd->aeg",
+            (None, 4, 5),
+            (6, 1),
+            (None, 1, 0),
+            (1, 6, 1),
+        ),
+    )
+    def test_int8_scale_is_stored_in_the_outputs_layout(
+        self, equation, input_shape, output_shape, scale_axes, scale_shape
+    ):
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        geometry = layer._quantization_geometry()
+        self.assertEqual(geometry.kernel_scale_axes, scale_axes)
+        x = (
+            np.random.default_rng(0)
+            .standard_normal((2,) + tuple(input_shape[1:]))
+            .astype("float32")
+        )
+        y = ops.convert_to_numpy(layer(x))
+        # Weight-only, so the outputs depend on the stored scale alone.
+        layer.quantize(
+            "int8", config=Int8QuantizationConfig(activation_quantizer=None)
+        )
+        self.assertEqual(tuple(layer.kernel_scale.shape), scale_shape)
+        self.assertAllClose(layer(x), y, atol=0.1 * np.abs(y).max())
+
+
+class MinimalGeometry(ProjectionGeometry):
+    """The `(1, in, out)` kernel of `Pointwise1D`, with three overrides."""
+
+    @property
+    def kernel_axes(self):
+        return KernelAxes(contracted=(0, 1), free=(2,))
+
+    def contract(self, inputs, kernel):
+        return ops.einsum("btc,kcd->btd", inputs, kernel)
+
+    def contract_grad(self, upstream, float_kernel):
+        return ops.einsum("btd,kcd->btc", upstream, float_kernel)
+
+
+class MinimalPointwise(Pointwise1D):
+    def _quantization_geometry(self):
+        return MinimalGeometry(self)
+
+
+class ContractOnlyGeometry(ProjectionGeometry):
+    """`MinimalGeometry` that keeps the 2-D default of `kernel_axes`."""
+
+    contract = MinimalGeometry.contract
+    contract_grad = MinimalGeometry.contract_grad
+
+
+class NegativeAxesGeometry(MinimalGeometry):
+    kernel_axes = KernelAxes(contracted=(-3, -2), free=(-1,))
+
+
+class ExpertsGeometry(ProjectionGeometry):
+    """A mixture-of-experts kernel `(experts, in, out)`.
+
+    The inputs `(experts, tokens, in)` and the outputs
+    `(experts, tokens, out)` lead with the expert axis.
+    """
+
+    @property
+    def kernel_axes(self):
+        return KernelAxes(contracted=(1,), free=(2,), batch=(0,))
+
+    def contract(self, inputs, kernel):
+        return ops.einsum("etc,ecd->etd", inputs, kernel)
+
+    def contract_grad(self, upstream, float_kernel):
+        return ops.einsum("etd,ecd->etc", upstream, float_kernel)
+
+
+class ScaledExpertsGeometry(ExpertsGeometry):
+    # The stored scale `(experts, 1, out)` lines up with the outputs.
+    kernel_scale_axes = (0, None, 2)
+
+
+class Experts(ThirdPartyProjection):
+    """One `(in, out)` kernel per index of the first axis of the inputs."""
+
+    def float_kernel_shape(self, input_shape):
+        return (input_shape[0], input_shape[-1], self.units)
+
+    def _quantization_geometry(self):
+        return ExpertsGeometry(self)
+
+
+def _with_geometry(layer_cls, geometry_cls):
+    """A subclass of `layer_cls` whose geometry is `geometry_cls`."""
+
+    class Declared(layer_cls):
+        def _quantization_geometry(self):
+            return geometry_cls(self)
+
+    return Declared
+
+
+class CustomProjectionTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("int8", "int8", None, (6,)),
+        ("int4_grouped", "int4", 4, (2, 6)),
+        ("int4_per_channel", "int4", -1, (6,)),
+    )
+    def test_nd_kernel_describes_its_axes_once(
+        self, mode, block_size, scale_shape
+    ):
+        # A 3-D kernel overrides `kernel_axes`, `contract` and
+        # `contract_grad`. The stored layout of each mode, and the
+        # calibration view, derive from `kernel_axes`.
+        layer = MinimalPointwise(6, use_bias=False)
+        layer.build((None, 5, 8))
+        kernel = ops.convert_to_numpy(layer._kernel)
+        view = layer._quantization_geometry().contraction_view()
+        self.assertEqual((view.batch, view.rows, view.columns), (1, 8, 6))
+        x = (
+            np.random.default_rng(0)
+            .standard_normal((2, 5, 8))
+            .astype("float32")
+        )
+        if mode == "int8":
+            config = Int8QuantizationConfig(activation_quantizer=None)
+        else:
+            config = Int4QuantizationConfig(block_size=block_size)
+        layer.quantize(mode, config=config)
+        self.assertEqual(tuple(layer.kernel_scale.shape), scale_shape)
+
+        # The view reads the stored scale in its layout, and the forward
+        # pass uses the same weight.
+        weight = layer._quantized_weight().dequantize("float32")
+        self.assertAllClose(weight, kernel, atol=0.1 * np.abs(kernel).max())
+        self.assertAllClose(
+            layer(x),
+            ops.einsum("btc,kcd->btd", x, weight),
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    @parameterized.named_parameters(
+        ("default_axes_int8", ContractOnlyGeometry, "int8"),
+        ("default_axes_int4", ContractOnlyGeometry, "int4"),
+        ("negative_axes_int8", NegativeAxesGeometry, "int8"),
+        ("negative_axes_int4", NegativeAxesGeometry, "int4"),
+    )
+    def test_kernel_axes_must_fit_the_kernel(self, geometry_cls, mode):
+        # `kernel_axes` left at the 2-D default for a 3-D kernel, or with
+        # negative axes, is refused before the layer changes.
+        layer = _with_geometry(Pointwise1D, geometry_cls)(6, use_bias=False)
+        layer.build((None, 5, 8))
+        kernel = ops.convert_to_numpy(layer._kernel)
+        with self.assertRaisesRegex(
+            ValueError, r"rank-3 kernel.*kernel_axes=KernelAxes"
+        ):
+            layer.quantize(mode)
+        assert_float(self, layer)
+        self.assertAllEqual(layer._kernel, kernel)
+
+    def test_batch_axes_need_a_scale_axes_override(self):
+        # As many tokens as experts, so a scale laid out for the wrong
+        # axis would still broadcast. The default `kernel_scale_axes`
+        # cannot place the expert axis in the outputs, so int8 refuses the
+        # layer and leaves it as it was.
+        x = (
+            np.random.default_rng(0)
+            .standard_normal((4, 4, 8))
+            .astype("float32")
+        )
+        layer = Experts(6, use_bias=False)
+        layer.build(x.shape)
+        kernel = ops.convert_to_numpy(layer._kernel)
+        with self.assertRaisesRegex(
+            NotImplementedError, "must override `kernel_scale_axes`"
+        ):
+            layer.quantize("int8")
+        assert_float(self, layer)
+        self.assertAllEqual(layer._kernel, kernel)
+
+        # With the outputs' layout given, int8 stays within the error
+        # bound of the int8 rows of the conformance test.
+        layer = _with_geometry(Experts, ScaledExpertsGeometry)(
+            6, use_bias=False
+        )
+        layer.build(x.shape)
+        y = ops.convert_to_numpy(layer(x))
+        layer.quantize("int8")
+        self.assertEqual(tuple(layer.kernel_scale.shape), (4, 1, 6))
+        error = ops.convert_to_numpy(layer(x)) - y
+        self.assertLess(np.linalg.norm(error) / np.linalg.norm(y), 0.05)
+
+    def test_default_scale_axes_follow_the_kernel_axes(self):
+        class Geometry(ProjectionGeometry):
+            kernel_axes = KernelAxes(contracted=(1,), free=(2, 0))
+
+        self.assertEqual(Geometry(None).kernel_scale_axes, (0, 2))
+        self.assertEqual(ProjectionGeometry(None).kernel_scale_axes, (1,))
+
+    def test_replaced_hook_is_refused(self):
+        with self.assertRaisesRegex(
+            TypeError, "`kernel_reduced_axes` with `kernel_axes`"
+        ):
+
+            class Stale(ProjectionGeometry):
+                @property
+                def kernel_reduced_axes(self):
+                    return (0, 1)
