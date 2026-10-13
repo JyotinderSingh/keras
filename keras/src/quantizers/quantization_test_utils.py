@@ -788,6 +788,25 @@ def input_gradient(layer, x):
     return tape.gradient(y, v).numpy()
 
 
+def reordered_sum_bound(magnitude, terms):
+    """How far apart two float32 sums of the same products can be.
+
+    In any order, a float32 sum of `n = terms` products is at most
+    `gamma * magnitude` from the exact sum. `magnitude` is the sum of the
+    absolute products, `gamma = n * u / (1 - n * u)` and `u = 2**-24`
+    (Higham, "Accuracy and Stability of Numerical Algorithms", 2nd ed.,
+    eq. 3.5). So two orders are at most `2 * gamma * magnitude` apart.
+
+    Autodiff and a custom gradient can take the same input gradient with
+    different kernels. For example, with oneDNN on x86, TensorFlow runs
+    a `MatMul` that transposes its second operand and a `MatMul` after a
+    `Transpose` as different gemm calls, which can sum in another order.
+    """
+    unit = 2.0**-24
+    gamma = terms * unit / (1 - terms * unit)
+    return 2 * gamma * magnitude
+
+
 def oracle_contract(
     inputs,
     codes,

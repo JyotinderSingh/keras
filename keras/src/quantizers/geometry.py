@@ -37,10 +37,11 @@ and `Pointwise1D`) and `TokenTable` in
      matmul contracts against the last axis of the inputs.
    - A `ProjectionGeometry` subclass for another kernel or contraction. It
      overrides `contract` and `contract_grad`, and `add_lora_delta` when
-     the layer has LoRA. int8 and int4 take the input gradient from
-     `contract_grad`; the other modes differentiate `contract`. A kernel
-     whose axes are not `(input_dim, units)` gives their roles in
-     `kernel_axes` (`KernelAxes(contracted, free, batch)`), and
+     the layer has LoRA. int8, int4 and a routed GPTQ or AWQ call take
+     the input gradient from `contract_grad`; the other calls
+     differentiate `contract`. A kernel whose axes are not
+     `(input_dim, units)` gives their roles in `kernel_axes`
+     (`KernelAxes(contracted, free, batch)`), and
      `quantize()` refuses roles that do not name each kernel axis once
      (every mode but ternary, which does not read them).
      `PermutedGeometry` and `PointwiseGeometry` in the fixture module are
@@ -422,8 +423,8 @@ class ProjectionGeometry(QuantizationGeometry):
     `matrix_contraction` when a 4-bit route may stand in for `contract`.
     The defaults of `kernel_scale_axes` and `contraction_view` derive
     from `kernel_axes`; their docstrings say when a layer overrides them
-    too. int8 and int4 take the input gradient from `contract_grad`, and
-    the other modes differentiate `contract`.
+    too. int8, int4 and a routed GPTQ or AWQ call take the input gradient
+    from `contract_grad`, and the other calls differentiate `contract`.
     """
 
     family = "projection"
@@ -493,8 +494,9 @@ class ProjectionGeometry(QuantizationGeometry):
     def contract_grad(self, upstream, float_kernel):
         """Gradient of `contract` with respect to its inputs.
 
-        The custom gradients of int8 and int4 read it. It may return a
-        gradient that broadcasts to the shape of the inputs.
+        The custom gradients of int8, int4 and a routed GPTQ or AWQ call
+        read it. It may return a gradient that broadcasts to the shape of
+        the inputs.
         """
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
