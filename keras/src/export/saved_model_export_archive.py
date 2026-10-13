@@ -6,6 +6,7 @@ from keras.src import backend
 from keras.src import layers
 from keras.src import tree
 from keras.src.export.export_utils import make_tf_tensor_spec
+from keras.src.quantizers import kernels
 from keras.src.utils.module_utils import tensorflow as tf
 
 
@@ -97,6 +98,7 @@ class BaseSavedModelExportArchive:
             f"`ExportArchive` is not supported by backend {backend.backend()}."
         )
 
+    @kernels.policy("off")
     def add_endpoint(self, name, fn, input_signature=None, **kwargs):
         if name in self._endpoint_names:
             raise ValueError(f"Endpoint name '{name}' is already taken.")
@@ -241,6 +243,7 @@ class BaseSavedModelExportArchive:
         )
         setattr(self._tf_trackable, name, list(variables))
 
+    @kernels.policy("off")
     def write_out(self, filepath, options=None, verbose=True):
         """Write the corresponding SavedModel to disk.
 
