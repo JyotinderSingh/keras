@@ -300,9 +300,11 @@ class ProjectionGeometry(QuantizationGeometry):
     """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul.
 
     A kernel of another layout overrides `kernel_axes`, plus `contract`,
-    `contract_grad` and `add_lora_delta` for its own contraction. The
-    defaults of `kernel_scale_axes` and `contraction_view` derive from
-    `kernel_axes`; their docstrings say when a layer overrides them too.
+    `contract_grad` and `add_lora_delta` for its own contraction
+    (`contract_grad` only for int8, and int4 with an activation
+    quantizer). The defaults of `kernel_scale_axes` and
+    `contraction_view` derive from `kernel_axes`; their docstrings say
+    when a layer overrides them too.
     """
 
     family = "projection"
@@ -355,7 +357,11 @@ class ProjectionGeometry(QuantizationGeometry):
         return ops.matmul(inputs, kernel)
 
     def contract_grad(self, upstream, float_kernel):
-        """Gradient of `contract` with respect to its inputs."""
+        """Gradient of `contract` with respect to its inputs.
+
+        The custom gradients of int8, and of int4 with an activation
+        quantizer, read it. The other modes differentiate `contract`.
+        """
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
     @property

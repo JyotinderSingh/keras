@@ -1,8 +1,9 @@
 """Shared building blocks for the built-in quantization modes.
 
-The helpers here are pure code motion: each one emits exactly the op
-sequence its call sites emitted inline, so modes that adopt them keep
-producing identical traced programs.
+`GeometryDispatchStrategy` is the base class of the modes that write one
+handler per geometry family (int8, int4). The functions below are steps
+that several modes share: the group index variable, the bias and
+activation, and the weight-only forward pass of a projection.
 """
 
 from keras.src import ops
@@ -114,3 +115,16 @@ def apply_bias_activation(layer, x):
     if layer.activation is not None:
         x = layer.activation(x)
     return x
+
+
+def dequantize_and_contract(layer, geometry, quantized_weight, inputs):
+    """The weight-only forward pass of a projection.
+
+    Contracts the inputs against the weight dequantized to the compute
+    dtype, then adds the LoRA update, the bias and the activation. The
+    input gradient is autodiff's, through the dequantized weight.
+    """
+    weight = quantized_weight.dequantize(layer.compute_dtype)
+    x = geometry.contract(inputs, weight)
+    x = geometry.add_lora_delta(inputs, x)
+    return apply_bias_activation(layer, x)
