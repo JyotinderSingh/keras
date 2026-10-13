@@ -1080,8 +1080,8 @@ class DenseTest(testing.TestCase):
             "2": np.random.random((1, 16)).astype("float32"),  # scale
             "3": np.random.random((1, 16)).astype("uint8"),  # zero
             "4": np.random.random((8,)).astype("float32"),  # awq_scales
-            # g_idx saved as int32 by a newer checkpoint; the cast on load
-            # brings it into the float32 storage variable (see above).
+            # g_idx saved as int32 by a newer checkpoint; the float32
+            # storage variable converts it on assign (see above).
             "5": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="int32"),
         }
 
@@ -1145,7 +1145,7 @@ class DenseTest(testing.TestCase):
         self.assertAllClose(layer.kernel_zero, awq_store["3"])
         self.assertAllClose(layer.awq_scales, awq_store["4"])
         self.assertAllClose(layer.g_idx, awq_store["5"])
-        # The int32-saved g_idx is cast to the float32 variable on load.
+        # The int32-saved g_idx loads into the float32 variable.
         self.assertDType(layer.g_idx, "float32")
 
     @staticmethod
