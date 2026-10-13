@@ -1,8 +1,10 @@
 """Shared building blocks for the built-in quantization modes.
 
-The helpers here are pure code motion: each one emits exactly the op
-sequence its call sites emitted inline, so modes that adopt them keep
-producing identical traced programs.
+`GeometryDispatchStrategy` is the base class of the modes that write one
+handler per geometry family (int8, int4). The functions below are steps
+that several modes share: the group index variable, the bias and
+activation, and the custom input gradient of a projection, which int8
+and int4 take against the dequantized kernel.
 """
 
 from keras.src import ops
@@ -156,3 +158,36 @@ def apply_bias_activation(layer, x):
     if layer.activation is not None:
         x = layer.activation(x)
     return x
+
+
+def contract_with_float_kernel_gradient(layer, geometry, view, inputs, forward):
+    """Runs `forward(inputs, quantized_weight)` with a custom input gradient.
+
+    `view` is the layer's `QuantizedWeight`, and `forward` contracts the
+    inputs against the weight it is given. The gradient with respect to
+    the inputs is `geometry.contract_grad` against the kernel dequantized
+    to the compute dtype, broadcast to the shape of the inputs. It passes
+    straight through a rounding of the inputs, and the backward pass
+    dequantizes the kernel again, so only the stored tensors are kept for
+    it.
+    """
+
+    @ops.custom_gradient
+    def contract(inputs, *tensors):
+        quantized_weight = view.with_tensors(tensors)
+
+        def grad_fn(*args, upstream=None):
+            if upstream is None:
+                (upstream,) = args
+            float_kernel = quantized_weight.dequantize(layer.compute_dtype)
+            inputs_grad = ops.broadcast_to(
+                geometry.contract_grad(upstream, float_kernel),
+                ops.shape(inputs),
+            )
+            return (inputs_grad,) + (None,) * len(tensors)
+
+        return forward(inputs, quantized_weight), grad_fn
+
+    # Read inside the autocast scope: on TensorFlow eager the gradient
+    # runs after it, and the scale variable would then read float32.
+    return contract(inputs, *view.read_tensors())
