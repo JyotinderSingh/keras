@@ -8,7 +8,7 @@ no generic quantization support). The strategies in
 quantized values, and run quantized forward passes, so layer classes hold no
 per-mode methods.
 
-Two geometry families exist today:
+Two geometry families exist:
 
 - Projection: a float kernel contracted against the inputs. A strategy writes
   one projection implementation and the geometry supplies what differs per
@@ -25,72 +25,179 @@ Two geometry families exist today:
 Making a layer quantizable
 --------------------------
 
-Return a geometry, and list the modes the layer supports:
+A layer, built-in or custom, becomes quantizable with the built-in modes by
+the steps below. `ThirdPartyProjection` (with its subclasses `PermutedDense`
+and `Pointwise1D`) and `TokenTable` in
+`keras.src.quantizers.quantization_test_utils` follow them, and
+`conformance_test.py` runs them through every mode they list.
 
-```python
-class MyProjection(Layer):
-    def _quantization_geometry(self):
-        return ProjectionGeometry(self)
+1. Geometry. `_quantization_geometry()` returns the layer's geometry:
 
-    @property
-    def variable_serialization_spec(self):
-        # Doubles as the capability declaration: a mode absent from this
-        # mapping is rejected for this layer.
-        return {
-            None: ["kernel", "bias"],
-            "int8": ["kernel", "bias", "kernel_scale"],
-        }
-```
+   - `ProjectionGeometry` for a 2-D `(input_dim, units)` kernel that a
+     matmul contracts against the last axis of the inputs.
+   - A `ProjectionGeometry` subclass for another kernel or contraction. It
+     overrides `contract` and `contract_grad`, and `add_lora_delta` when
+     the layer has LoRA. int8 and int4 take the input gradient from
+     `contract_grad`; the other modes differentiate `contract`. A kernel
+     whose axes are not `(input_dim, units)` gives their roles in
+     `kernel_axes` (`KernelAxes(contracted, free, batch)`), and
+     `quantize()` refuses roles that do not name each kernel axis once
+     (every mode but ternary, which does not read them).
+     `PermutedGeometry` and `PointwiseGeometry` in the fixture module are
+     examples.
+   - `LookupGeometry` for an embeddings table, and
+     `ReversibleLookupGeometry` for a table that also projects back
+     (`call(inputs, reverse=True)`).
 
-A mode refuses a layer whose geometry family it does not handle
-(`QuantizationStrategy.geometry_families`): int8 and int4 handle
-projections and lookups; float8, ternary, GPTQ and AWQ handle projections
-only, and ternary only a 2-D kernel.
+   Two projection hooks derive from `kernel_axes` and need an override
+   only in these cases. `kernel_scale_axes` (int8) is the free axes in
+   the kernel's order: override it for a kernel with batch axes, for
+   which the default raises `NotImplementedError`, or when the outputs do
+   not end with the free axes in that order. `contraction_view` (GPTQ,
+   AWQ) reads every contracted position from the last axis of the
+   inputs: override it for a kernel with batch axes, for which the
+   default raises `NotImplementedError`, or for inputs laid out another
+   way. An activation quantizer (int8, and int4 with one) reduces over
+   `inputs_quantization_axis` (the last input axis) and lines its scale
+   up with the outputs in `align_inputs_scale` (no change): override
+   these when the inputs are contracted over other axes.
 
-The geometry is a thin adapter, so the strategies still read
-state directly off the layer. Beyond what `Layer` already provides, a
-quantizable layer must define:
+2. Spec. `variable_serialization_spec` maps `None` and each mode that the
+   layer supports to the ordered names of the variables that the save and
+   the load write. The modes in it are the layer's capability
+   declaration: `quantize()` refuses a mode that is not in it. A mode also
+   refuses a geometry family that it does not handle
+   (`QuantizationStrategy.geometry_families`): int8 and int4 handle
+   projections and lookups; float8, ternary, GPTQ and AWQ handle
+   projections only, and ternary only a 2-D kernel. The names are those
+   of `Dense` for a projection and of `Embedding` for a lookup
+   (`PROJECTION_SPEC` and `LOOKUP_SPEC` in the fixture module). GPTQ and
+   AWQ store no float kernel: their entries are `bias`,
+   `quantized_kernel`, `kernel_scale`, `kernel_zero`, `g_idx`, and for AWQ
+   `awq_scales` before `g_idx`. An untied reversible lookup appends
+   `reverse_embeddings` to every entry, and `reverse_embeddings_scale`
+   and, for int4, `reverse_embeddings_zero` to the entries of int8 and
+   int4 (see `ReversibleEmbedding.variable_serialization_spec`); the mode
+   creates the last two. The order of the names is the checkpoint format
+   of the mode.
 
-- Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
-  shape, recorded in `build()`), `bias` and `activation` (either may be
-  `None`). `EinsumProjectionGeometry` additionally relies on the
-  `einsum_axes` record `EinsumDense` derives from its equation in
-  `build()`.
-- Lookups: `_embeddings`, `input_dim` and `output_dim`. A reversible
-  lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
-  `reverse_embeddings` variables.
+3. Build. `build()` follows `Dense.build`:
 
-LoRA is optional: `Layer` defines `lora_enabled = False`. A layer that
-supports it defines `enable_lora()`, which calls
-`Layer._enable_lora("kernel", rank, ...)` (a lookup passes
-`"embeddings"`), and `_lora_weight_shape()`, which returns the float
-weight's shape. `_enable_lora` creates `lora_kernel_a` and
-`lora_kernel_b` (`lora_embeddings_a` and `lora_embeddings_b` for a
-lookup), freezes the float weight and sets `lora_enabled`, `lora_rank`
-and `lora_alpha`. The `<name>_constraint` and `<name>_regularizer`
-attributes (`kernel_*`, or `embeddings_*` for a lookup) are optional.
+   - record `kernel_shape`, the float kernel's shape (a projection);
+   - when `self._strategy_owns_weight_storage()` is true (a quantized
+     policy of any mode but float8), call `self.quantized_build(shape,
+     mode=self.quantization_mode, config=self.quantization_config)` with
+     the float weight's shape: the mode's variables stand in for the
+     float weight. Otherwise create the float weight `_<name>`
+     (`_kernel`, `_embeddings`);
+   - create the other float weights (`bias`, which may be `None`);
+   - under float8 (`self.quantization_mode` is set, and the strategy does
+     not own the storage), call `quantized_build` last. `weights` then
+     lists the float weights and then the float8 variables, as
+     `quantize()` gives them, so `set_weights` works between a layer
+     built from the policy and a quantized one.
 
-The rest comes from `Layer` itself: strategies read `compute_dtype`,
-`dtype_policy` and `path`, create their quantized variables through
-`add_weight`, and re-enter through `Layer.quantized_build`, which routes
-straight back to the strategy. A layer never needs to know which mode is
-running, and implements none of these itself.
+   `Dense`, `EinsumDense` and `ThirdPartyProjection` follow this order. A
+   lookup calls `quantized_build` first (`Embedding.build`), because
+   float8 does not support lookups. An untied reversible lookup also
+   creates the float `reverse_embeddings`, shape `(output_dim,
+   input_dim)`, when the strategy does not own the storage. A projection
+   also sets `activation`, which may be `None`. `quantize()` refuses a
+   layer whose `build()` did not set the geometry's `build_attributes`.
+
+4. Weight property. A public weight property (`kernel`, `embeddings`)
+   reads `self._quantized_weight()`: the integer codes in the weight's
+   shape (`unpack()`) when it returns a view, else the float `_<name>`.
+   No mode reads the property.
+
+5. Forward pass. Under a quantized policy, `Operation._dispatch_call`
+   runs `quantized_call`, the forward pass of the mode, in place of the
+   layer's `call()`. For a projection the mode computes
+   `activation(contract(inputs, W) + lora + bias)`, with `W` the weight
+   that the mode stores and `lora` the update of step 8. For a lookup it
+   computes `take(table, inputs)` and the LoRA update, cast to the
+   compute dtype; a reversible lookup also computes the reverse matmul
+   (`call(inputs, reverse=True)`) and the soft cap. The layer's `call()`
+   must compute exactly that, or the outputs change when the layer
+   quantizes. Other work (a residual, a fixed activation, a scale)
+   belongs outside the layer.
+
+6. Save and load. Two one-liners route the store through the spec:
+
+   ```python
+   def save_own_variables(self, store):
+       self._save_serialized_variables(store, "kernel")
+
+   def load_own_variables(self, store):
+       self._load_serialized_variables(store, "kernel")
+   ```
+
+   A lookup passes `"embeddings"`. The save stores the entries in spec
+   order under "0", "1", ... For `<name>` it reads the float weight at
+   `_<name>`, or the codes of the mode's `QuantizedWeight` view.
+   `quantized_<name>`, and `<name>_scale` and `<name>_zero` when the view
+   has them, also come from the view. Every other entry is the layer
+   attribute of that name, and an entry whose value is `None` is skipped.
+   The load assigns the store back to the same variables in the same
+   order.
+
+7. Attributes. The geometry is a thin adapter, so the modes also read
+   these attributes of the layer:
+
+   - a projection: `_kernel`, `kernel_shape`, `bias` and `activation`
+     (`EinsumProjectionGeometry` also reads `equation` and the
+     `einsum_axes` that `EinsumDense.build` records);
+   - a lookup: `_embeddings`, `input_dim` and `output_dim`;
+   - a reversible lookup, in addition: `tie_weights`, `reverse_dtype`
+     (the dtype of the reverse projection, or `None` for the compute
+     dtype), `logit_soft_cap` (or `None`) and, when untied, the
+     `reverse_embeddings` variable.
+
+8. LoRA (optional). `Layer` defines `lora_enabled = False`. A layer with
+   LoRA defines `enable_lora(rank, lora_alpha=None)`, which calls
+   `self._enable_lora("kernel", rank, lora_alpha=lora_alpha)` (a lookup
+   passes `"embeddings"`), and `_lora_weight_shape()`, which returns the
+   float weight's shape (`kernel_shape` for a projection).
+   `_enable_lora` calls `_check_lora_supported` (float8 and ternary
+   refuse LoRA), creates `lora_kernel_a` (shape `kernel_shape[:-1] +
+   (rank,)`) and `lora_kernel_b` (`(rank, kernel_shape[-1])`), freezes
+   the float weight and sets `lora_enabled`, `lora_rank` and
+   `lora_alpha`. A lookup's factors are `lora_embeddings_a` and
+   `lora_embeddings_b`. The `<name>_constraint` and `<name>_regularizer`
+   attributes are optional. The save merges the update
+   `lora_alpha / lora_rank * lora_<name>_a @ lora_<name>_b` into the
+   stored weight, and the load sets the factors to zero.
+
+9. Config (optional). `get_config` serializes `quantization_config` and
+   `from_config` deserializes it, so that a `.keras` round trip keeps a
+   quantizer that is not the mode's default.
+
+The rest comes from `Layer` itself: the modes and the calibration run read
+`compute_dtype`, `variable_dtype`, the layer's own policy
+(`_own_dtype_policy`), `path` and `name`, create their variables through
+`add_weight`, and re-enter through
+`Layer.quantized_build`, which routes back to the strategy. The layer holds
+no code for one mode: its build, weight property, save and load are the
+same for every mode.
 
 Defining `_quantization_geometry()` on a subclass also makes that subclass
 the owner of its quantization support: `Layer.quantize`'s type check
-accepts instances of the exact class that defines the method. A `Dense`
-subclass therefore opts in by defining it; without it the subclass is
-skipped by `Model.quantize` and remains reachable through
-`quantize(..., type_check=False)`.
+accepts instances of the exact class that defines the method. `quantize()`
+refuses an instance of a subclass that does not define it, and its error
+names the two ways out: `quantize(..., type_check=False)`, or
+`_quantization_geometry()` on the subclass. A `Dense` subclass therefore
+opts in by defining it, for example to return `ProjectionGeometry(self)`;
+without it, `Model.quantize` skips the subclass and reports it.
 
 Customizing what a strategy does to a layer
 -------------------------------------------
 
-Override a geometry hook rather than a strategy method: the hooks on the
-classes below are the only points at which strategies vary per
-layer. `TernaryDense` is the in-tree example: its geometry supplies its
-own straight-through ternarization values, and the ternary strategy needs no
-knowledge of the layer.
+Override a geometry hook rather than a strategy method. A strategy varies
+per layer through the hooks on the classes below and through the
+attributes of step 7 above; AWQ also matches the layer's `name` against
+`AWQConfig.clip_skip_patterns`. `TernaryDense` is the in-tree example of a
+hook: its geometry supplies its own straight-through ternarization values,
+and the ternary strategy needs no knowledge of the layer.
 
 Two things this protocol deliberately does not offer. A layer cannot
 override one strategy's math for itself alone, because that surface lives
