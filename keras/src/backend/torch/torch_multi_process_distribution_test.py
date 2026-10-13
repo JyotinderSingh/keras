@@ -399,6 +399,47 @@ class TorchMultiProcessDistributeTest(
                 value = value.full_tensor()
             self.assertAllClose(value, expected, msg=weight.path)
 
+    def test_sharded_group_index_refuses_other_groups(self):
+        # The `g_idx` of int4 in groups of 64 is sharded over the
+        # processes, so each process holds half of it. The write check of
+        # its fixed groups reads the whole `DTensor`, not the local shard.
+        num_devices = torch_distribution_lib.get_device_count()
+        device_mesh = distribution_lib.DeviceMesh(
+            shape=(num_devices,),
+            axis_names=["model"],
+            devices=distribution_lib.list_devices(),
+        )
+        layout_map = distribution_lib.LayoutMap(device_mesh)
+        layout_map["target/g_idx"] = distribution_lib.TensorLayout(["model"])
+        distribution = distribution_lib.ModelParallel(
+            layout_map=layout_map, batch_dim_name=None
+        )
+        k = 256
+        fixed = (np.arange(k) // 64).astype("float32")
+        other = np.random.default_rng(3).permutation(fixed)
+        layout = distribution_lib.TensorLayout(["model"], device_mesh)
+
+        def sharded(value):
+            value = torch_distribution_lib.distribute_tensor(value, layout)
+            self.assertEqual(tuple(value.to_local().shape), (k // num_devices,))
+            return value
+
+        def state_tree(value):
+            return {"non_trainable_variables": {"target": {"g_idx": value}}}
+
+        with distribution.scope():
+            inputs = layers.Input((k,))
+            layer = layers.Dense(
+                16, name="target", dtype="int4/64_from_float32"
+            )
+            model = models.Model(inputs, layer(inputs))
+            self.assertIsInstance(layer.g_idx.value, DTensor)
+            with self.assertRaisesRegex(ValueError, "k // 64"):
+                model.set_state_tree(state_tree(sharded(other)))
+            self.assertAllEqual(layer.g_idx.value.full_tensor(), fixed)
+            model.set_state_tree(state_tree(sharded(fixed)))
+            self.assertAllEqual(layer.g_idx.value.full_tensor(), fixed)
+
 
 if __name__ == "__main__":
     pytest.main([__file__])
