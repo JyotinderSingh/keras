@@ -484,7 +484,9 @@ class ReverseLookupRouteTest(testing.TestCase):
                 call, x, upstream
             )
         rows = {_row_key(layer.compute_dtype, "1-16"): (("matrix", None),)}
-        with _lookup_routes(rows, matrix=kernels.RouteSource(_matrix_logits)):
+        matrix = kernels.RouteSource(_matrix_logits)
+        # The allow-list applies under `"auto"` only.
+        with kernels.policy("auto"), _lookup_routes(rows, matrix=matrix):
             self.assertEqual(_counts(layer, x), {"matrix": 1})
             self.assertEqual(
                 _counts(layer, np.ones((17, DIM))), {"reference": 1}
@@ -537,7 +539,8 @@ class ReverseLookupRouteTest(testing.TestCase):
                 available=lambda m, k, n, view: (m, k, n) == (2, DIM, VOCAB),
             ),
         ):
-            counts = _counts(layer, _random((2, DIM), 1))
+            with kernels.policy("auto"):
+                counts = _counts(layer, _random((2, DIM), 1))
         self.assertEqual(counts, {"matrix": 1})
 
     @pytest.mark.skipif(
