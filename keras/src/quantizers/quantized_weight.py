@@ -13,6 +13,8 @@ import math
 
 from keras.src import backend
 from keras.src import ops
+from keras.src.quantizers.packing import pack_int2
+from keras.src.quantizers.packing import pack_int4
 from keras.src.quantizers.packing import unpack_int2
 from keras.src.quantizers.packing import unpack_int4
 from keras.src.quantizers.packing import unpack_ternary
@@ -68,13 +70,18 @@ class PackLayout:
 
     One subclass per storage format: `values_per_byte` codes share a
     stored element along the layout's axis, `packed_length` gives the
-    stored length of that axis, and `unpack` restores one code per element.
+    stored length of that axis, `unpack` restores one code per element
+    and `pack` stores them.
     """
 
     values_per_byte = 1
 
     def unpack(self, codes):
         """Returns the unpacked codes, one per element."""
+        raise NotImplementedError
+
+    def pack(self, codes):
+        """Returns `codes`, one per element, in their stored form."""
         raise NotImplementedError
 
     @classmethod
@@ -90,6 +97,9 @@ class NoPack(PackLayout):
     """One code per stored element."""
 
     def unpack(self, codes):
+        return codes
+
+    def pack(self, codes):
         return codes
 
 
@@ -123,6 +133,11 @@ class Int4Pairs(_AxisPack):
         dtype = backend.standardize_dtype(codes.dtype)
         return unpack_int4(codes, self.orig_len, axis=self.axis, dtype=dtype)
 
+    def pack(self, codes):
+        dtype = backend.standardize_dtype(codes.dtype)
+        packed, _, _ = pack_int4(codes, axis=self.axis, dtype=dtype)
+        return packed
+
 
 class Int2Quads(_AxisPack):
     """Four 2-bit codes per byte along `axis`, as `pack_int2` writes them."""
@@ -132,6 +147,11 @@ class Int2Quads(_AxisPack):
     def unpack(self, codes):
         dtype = backend.standardize_dtype(codes.dtype)
         return unpack_int2(codes, self.orig_len, axis=self.axis, dtype=dtype)
+
+    def pack(self, codes):
+        dtype = backend.standardize_dtype(codes.dtype)
+        packed, _, _ = pack_int2(codes, axis=self.axis, dtype=dtype)
+        return packed
 
 
 class TernaryTrits(_AxisPack):
