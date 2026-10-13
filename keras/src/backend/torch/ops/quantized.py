@@ -976,8 +976,9 @@ def _triton_logits_available(device_class, m, d, v, group_size, dtype):
 
 
 # The kernels of this backend. Triton ships with torch on Linux. Where it
-# does not import, the backend has none. The GPU job of CI runs the kernel
-# under `"require"` on the torch release that it installs.
+# does not import, the backend has none. The measured rows of
+# `keras.src.quantizers.kernels` name its cells, and the GPU job of CI
+# runs the kernel under `"require"` on the torch release that it installs.
 KERNELS = ()
 if triton is not None:
     KERNELS = (
