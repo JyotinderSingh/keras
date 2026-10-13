@@ -6,6 +6,7 @@ from keras.src import backend
 from keras.src import layers
 from keras.src import tree
 from keras.src.export.export_utils import make_tf_tensor_spec
+from keras.src.quantizers import kernels
 from keras.src.utils.module_utils import tensorflow as tf
 
 
@@ -241,6 +242,9 @@ class BaseSavedModelExportArchive:
         )
         setattr(self._tf_trackable, name, list(variables))
 
+    # A hand-built `ExportArchive` traces here; `Model.export` scopes the
+    # formats.
+    @kernels.policy("off")
     def write_out(self, filepath, options=None, verbose=True):
         """Write the corresponding SavedModel to disk.
 

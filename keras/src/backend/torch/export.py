@@ -10,6 +10,7 @@ from keras.src.export.export_utils import make_tf_tensor_spec
 from keras.src.export.saved_model_export_archive import (
     BaseSavedModelExportArchive,
 )
+from keras.src.quantizers import kernels
 from keras.src.utils.module_utils import tensorflow as tf
 from keras.src.utils.module_utils import torch_xla
 
@@ -29,6 +30,9 @@ class SavedModelExportArchive(BaseSavedModelExportArchive):
             "torch backend. Use `track_and_add_endpoint` instead."
         )
 
+    # A hand-built `ExportArchive` traces here; `Model.export` scopes the
+    # formats.
+    @kernels.policy("off")
     def track_and_add_endpoint(self, name, resource, input_signature, **kwargs):
         if name in self._endpoint_names:
             raise ValueError(f"Endpoint name '{name}' is already taken.")

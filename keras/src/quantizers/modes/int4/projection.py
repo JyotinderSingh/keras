@@ -5,6 +5,7 @@ import math
 from keras.src import ops
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import contract_quantized
 from keras.src.quantizers.modes.common import (
     contract_with_float_kernel_gradient,
 )
@@ -29,7 +30,10 @@ class Int4ProjectionHandlers:
     the columns. The codes are packed two per byte along the columns, and
     the scale runs per column (per-channel) or per group of rows (grouped,
     with a zero point and a group index). The forward pass dequantizes
-    through the `QuantizedWeight` view and contracts in float.
+    through the `QuantizedWeight` view and contracts in float. Without an
+    activation quantizer it calls `contract_quantized`, which runs a route
+    of `kernels.py` in place of that reference path when the checks select
+    one.
     """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
@@ -109,9 +113,15 @@ class Int4ProjectionHandlers:
                 x = geometry.contract(inputs, float_kernel)
             return x
 
-        x = contract_with_float_kernel_gradient(
-            layer, geometry, view, inputs, contract_dequantized
-        )
+        def reference(inputs, quantized_weight):
+            return contract_with_float_kernel_gradient(
+                layer, geometry, quantized_weight, inputs, contract_dequantized
+            )
+
+        if layer.inputs_quantizer:
+            x = reference(inputs, view)
+        else:
+            x = contract_quantized(layer, geometry, view, inputs, reference)
         x = geometry.add_lora_delta(inputs, x)
         return apply_bias_activation(layer, x)
 

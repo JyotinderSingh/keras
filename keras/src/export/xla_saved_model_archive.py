@@ -16,6 +16,7 @@ from keras.src.backend import config
 from keras.src.backend.common import StatelessScope
 from keras.src.export.export_utils import make_input_spec
 from keras.src.export.export_utils import to_polymorphic_shape
+from keras.src.quantizers import kernels
 from keras.src.utils import file_utils
 from keras.src.utils import io_utils
 from keras.src.utils.module_utils import xla_saved_model
@@ -365,6 +366,8 @@ class XLASavedModelArchive:
             raise ValueError(f"Variable collection '{name}' is already taken.")
         self._variable_collections[name] = list(variables)
 
+    # The endpoints are traced here; `Model.export` scopes the formats.
+    @kernels.policy("off")
     def write_out(self, filepath, options=None, verbose=True):
         """Write the XLA SavedModel to disk.
 
