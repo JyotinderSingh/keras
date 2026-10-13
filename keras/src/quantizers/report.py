@@ -35,6 +35,12 @@ class QuantizationReport:
             `SKIP_ALREADY_QUANTIZED` (the layer was already quantized), or
             `SKIP_OUTSIDE_STRUCTURE` (a GPTQ/AWQ call whose quantization
             layer structure does not cover the layer).
+        details: A dict that maps the path of a skipped layer to the text of
+            its refusal. `Model.quantize` records the message of the
+            `NotImplementedError` of a layer that it skips with
+            `SKIP_NO_SUPPORT` although the layer defines
+            `_quantization_geometry()`, such as a subclass or a layer with
+            a `float16` compute dtype.
     """
 
     # Reasons a leaf layer can be skipped during quantization.
@@ -47,12 +53,15 @@ class QuantizationReport:
         self.mode = mode
         self.quantized = []
         self.skipped = []
+        self.details = {}
 
     def add_quantized(self, path, mode, scheme):
         self.quantized.append((path, mode, scheme))
 
-    def add_skipped(self, path, reason):
+    def add_skipped(self, path, reason, detail=None):
         self.skipped.append((path, reason))
+        if detail:
+            self.details[path] = detail
 
     @property
     def num_quantized(self):
@@ -71,7 +80,8 @@ class QuantizationReport:
 
         This replaces the previous behavior of emitting one `UserWarning` per
         non-quantizable leaf layer with a single message that reports counts
-        and up to `max_examples` example layer names.
+        and up to `max_examples` example layer names, followed by the detail
+        of the first of them that has one.
         """
         unsupported = self.skipped_by_reason(self.SKIP_NO_SUPPORT)
         if not unsupported:
@@ -80,13 +90,17 @@ class QuantizationReport:
         examples = ", ".join(repr(p) for p in unsupported[:max_examples])
         if len(unsupported) > max_examples:
             examples += ", ..."
-        return (
+        message = (
             f"`model.quantize()`: {len(unsupported)} layer(s) were skipped "
             f"because they do not support quantization (e.g. {examples}). "
             f"Quantized {self.num_quantized} layer(s) in mode "
             f"'{self.mode}'. Call `model.quantization_summary()` or inspect "
             "the returned `QuantizationReport` for details."
         )
+        detailed = [p for p in unsupported if p in self.details]
+        if detailed:
+            message += f" {detailed[0]!r}: {self.details[detailed[0]]}"
+        return message
 
     def render(self):
         """Return the full report as a multi-line string."""
@@ -102,7 +116,10 @@ class QuantizationReport:
         lines.append(f"Skipped {self.num_skipped} layer(s):")
         if self.skipped:
             for path, reason in self.skipped:
-                lines.append(f"  - {path}: {reason}")
+                line = f"  - {path}: {reason}"
+                if path in self.details:
+                    line += f" ({self.details[path]})"
+                lines.append(line)
         else:
             lines.append("  (none)")
         return "\n".join(lines)

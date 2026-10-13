@@ -1546,10 +1546,19 @@ class Layer(BackendLayer, Operation):
         mode = config.mode
         self._check_quantize_args(mode, self.compute_dtype)
         geometry = self._quantization_geometry()
-        if geometry is None or (
-            type_check and type(self) is not self._quantization_type_owner()
-        ):
+        if geometry is None:
             raise self._not_implemented_error(self.quantize)
+        owner = self._quantization_type_owner()
+        if type_check and type(self) is not owner:
+            raise NotImplementedError(
+                f"Layer '{self.name}' (of type '{type(self).__name__}') is "
+                f"a subclass of `{owner.__name__}`, the class that declares "
+                "its quantization support. A subclass can change what that "
+                "support relies on, so `quantize()` refuses it. Pass "
+                f"`type_check=False` to quantize it as a `{owner.__name__}`, "
+                f"or define `_quantization_geometry()` on "
+                f"`{type(self).__name__}` to declare its own support."
+            )
         strategy = strategy_registry.get_strategy(mode)
         if strategy is None or not self._supports_quantization_mode(strategy):
             raise self._quantization_mode_error(mode)
@@ -1635,37 +1644,53 @@ class Layer(BackendLayer, Operation):
     def _quantized_weight(self):
         """Returns the `QuantizedWeight` view of the layer's weight.
 
-        `None` when the layer is not quantized, or when its mode holds no
-        integer codes for it (see `QuantizationStrategy.quantized_weight`).
+        `None` when the layer is not quantized, has no quantization
+        geometry, or when its mode holds no integer codes for it (see
+        `QuantizationStrategy.quantized_weight`).
         """
         if not self.built:
             return None
         strategy = strategy_registry.get_strategy(self.quantization_mode)
-        if strategy is None:
+        if strategy is None or self._quantization_geometry() is None:
             return None
         return strategy.quantized_weight(self)
 
     def _get_weight_with_merged_lora(self, name):
         """Returns `(value, scale, zero_point)` to save for weight `name`.
 
-        Without a `QuantizedWeight` view this is the float property `name`
-        (which merges any LoRA update itself) with no scale or zero point.
-        Otherwise it is the stored codes, scale and zero point, or, with
-        LoRA enabled, the mode's `merge_lora_delta` of the LoRA update
-        `lora_{name}_a @ lora_{name}_b`.
+        Without a `QuantizedWeight` view this is the float weight `_{name}`
+        with no scale or zero point. Otherwise it is the stored codes, scale
+        and zero point. With LoRA enabled and a nonzero `lora_{name}_b`,
+        the update `lora_{name}_a @ lora_{name}_b` is merged: a float
+        weight adds it and rounds once to the weight's own dtype, and a
+        quantized weight goes through the mode's `merge_lora_delta`. A zero
+        `lora_{name}_b` (as `enable_lora` and a load leave it) gives the
+        stored values, so a save of an unchanged layer writes the same
+        store again.
         """
         quantized_weight = self._quantized_weight()
         if quantized_weight is None:
-            return getattr(self, name), None, None
-        if not self.lora_enabled:
-            return (
+            weight = getattr(self, f"_{name}")
+            stored = (weight, None, None)
+        else:
+            stored = (
                 quantized_weight.codes,
                 quantized_weight.scale,
                 quantized_weight.zero_point,
             )
+        if not self.lora_enabled:
+            return stored
+        lora_b = getattr(self, f"lora_{name}_b")
+        if not ops.convert_to_numpy(ops.any(ops.not_equal(lora_b, 0))):
+            return stored
         lora_delta = (self.lora_alpha / self.lora_rank) * ops.matmul(
-            getattr(self, f"lora_{name}_a"), getattr(self, f"lora_{name}_b")
+            getattr(self, f"lora_{name}_a"), lora_b
         )
+        if quantized_weight is None:
+            # The weight property rounds to the compute dtype for the
+            # forward pass; the save keeps the variable dtype.
+            merged = ops.cast(ops.add(weight, lora_delta), weight.dtype)
+            return merged, None, None
         strategy = strategy_registry.get_strategy(self.quantization_mode)
         return strategy.merge_lora_delta(self, lora_delta)
 
@@ -1778,13 +1803,11 @@ class Layer(BackendLayer, Operation):
                 f"dtype_policy='{self._own_dtype_policy.name}'. "
                 f"Received: mode={mode}"
             )
-        if mode == "int8" and compute_dtype == "float16":
-            raise ValueError(
-                f"Quantization mode='{mode}' doesn't work well with "
-                "compute_dtype='float16'. Consider loading model/layer with "
-                "another dtype policy such as 'mixed_bfloat16' or "
-                "'mixed_float16' before calling `quantize()`."
-            )
+        strategy = strategy_registry.get_strategy(mode)
+        if strategy is not None:
+            # A refusal for this layer only: `Model.quantize` skips the
+            # layer and reports it.
+            strategy.check_compute_dtype(compute_dtype)
 
     def quantized_call(self, *args, **kwargs):
         current_remat_mode = get_current_remat_mode()
@@ -1825,9 +1848,20 @@ class Layer(BackendLayer, Operation):
         )
 
     def _quantization_mode_error(self, mode):
+        spec = self.variable_serialization_spec
+        if spec is None:
+            return NotImplementedError(
+                f"Layer '{self.name}' (of type '{type(self).__name__}') "
+                "defines `_quantization_geometry()` but no "
+                "`variable_serialization_spec`, which lists the modes it "
+                "supports."
+            )
+        # The registered modes the layer's spec lists, in registry order.
+        modes = tuple(
+            m for m in strategy_registry.registered_modes() if m in spec
+        )
         return NotImplementedError(
-            "Invalid quantization mode. Expected one of "
-            f"{strategy_registry.registered_modes()}. "
+            f"Invalid quantization mode. Expected one of {modes}. "
             f"Received: quantization_mode={mode}"
         )
 
