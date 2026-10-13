@@ -234,6 +234,12 @@ class CalibrationRun:
     batches the blocks run on. `quantized` lists the layers swapped so
     far, also when `run()` raises.
 
+    Each block is calibrated on the quantized outputs of the block
+    before it, for both modes: the statistics describe the activations
+    the block sees at inference. This is the GPTQ references' rule; the
+    AWQ references calibrate every block on the float model's
+    activations.
+
     Args:
         strategy: The `CalibrationStrategy` of the mode. It supplies the
             calibrator class.
