@@ -77,6 +77,18 @@ else:
             pass
 
 
+# The attributes of a quantized dtype policy that fix the layer's stored
+# variables: the mode and its parameters. A quantized layer's policy may
+# change its source dtype, never these.
+_QUANTIZATION_POLICY_ATTRIBUTES = (
+    "quantization_mode",
+    "block_size",
+    "weight_bits",
+    "group_size",
+    "amax_history_length",
+)
+
+
 @keras_export(["keras.Layer", "keras.layers.Layer"])
 class Layer(BackendLayer, Operation):
     """This is the class from which all layers inherit.
@@ -798,31 +810,66 @@ class Layer(BackendLayer, Operation):
     @dtype_policy.setter
     def dtype_policy(self, value):
         policy = dtype_policies.get(value)
-        if isinstance(self._dtype_policy, DTypePolicyMap) and self.path:
-            if self.path in self._dtype_policy:
-                del self._dtype_policy[self.path]
-            self._dtype_policy[self.path] = policy
+        previous = self._dtype_policy
+        # Only the check of a quantized layer reads its previous policy. A
+        # `DTypePolicyMap` whose keys match the path ambiguously raises on
+        # that read, and the exact key stored below resolves it.
+        previous_own = self._own_dtype_policy if self._is_quantized else None
+        in_map = isinstance(previous, DTypePolicyMap) and self.path
+        if in_map:
+            previous_entry = None
+            if self.path in previous:
+                previous_entry = previous[self.path]
+                del previous[self.path]
+            previous[self.path] = policy
         else:
             self._dtype_policy = policy
         policy = self._own_dtype_policy
-        if policy.quantization_mode is not None:
-            if self.built and not self._is_quantized:
-                # Forward the policy's full parameters into `quantize` so the
-                # built variables agree with the policy name: assigning
-                # "int4/32_from_float32" quantizes with block_size=32 instead
-                # of silently falling back to the default block size while
-                # keeping a name that says 32. A mode may refuse
-                # policy-triggered quantization by raising here (GPTQ needs
-                # a calibration dataset that a bare policy cannot carry).
+        try:
+            if (
+                self._is_quantized
+                and previous_own.quantization_mode is not None
+            ):
+                # The variables of the current mode exist, so only the
+                # source dtype of the policy may change.
+                if any(
+                    getattr(policy, name, None)
+                    != getattr(previous_own, name, None)
+                    for name in _QUANTIZATION_POLICY_ATTRIBUTES
+                ):
+                    raise ValueError(
+                        f"Layer '{self.name}' is quantized with "
+                        f"dtype_policy='{previous_own.name}'. Its dtype "
+                        "policy can change only its source dtype, not its "
+                        "quantization mode or parameters. Received: "
+                        f"dtype_policy='{policy.name}'"
+                    )
+            elif (
+                policy.quantization_mode is not None
+                and self.built
+                and not self._is_quantized
+            ):
+                # Forward the policy's full parameters into `quantize` so
+                # the built variables agree with the policy name
+                # ("int4/32_from_float32" builds block size 32). A mode may
+                # refuse policy-triggered quantization (GPTQ needs a
+                # calibration dataset that a bare policy cannot carry).
                 strategy = strategy_registry.get_strategy(
                     policy.quantization_mode
                 )
-                config = (
-                    strategy.config_from_policy(policy)
-                    if strategy is not None
-                    else None
+                self.quantize(
+                    policy.quantization_mode,
+                    config=strategy.config_from_policy(policy),
                 )
-                self.quantize(policy.quantization_mode, config=config)
+        except BaseException:
+            # A refused policy is not stored.
+            if in_map:
+                del previous[self.path]
+                if previous_entry is not None:
+                    previous[self.path] = previous_entry
+            else:
+                self._dtype_policy = previous
+            raise
 
     @property
     def _own_dtype_policy(self):
@@ -1466,7 +1513,9 @@ class Layer(BackendLayer, Operation):
         Resolves `mode`/`config` into a `QuantizationConfig`, validates that
         the layer supports the mode *before* mutating any state, then lets
         the mode's strategy compute and swap the variables and updates the
-        dtype policy.
+        dtype policy. A refused or failed quantization leaves the layer as
+        it was: the same variables in the same order, the same attributes
+        and config.
 
         A layer supports quantization by defining
         `_quantization_geometry()`; only instances of the exact class that
@@ -1515,23 +1564,56 @@ class Layer(BackendLayer, Operation):
 
         `swap` replaces the float weight with the mode's variables:
         `strategy.quantize`, or the write-back of a calibration. A swap
-        that raises before the layer is quantized leaves its config as it
-        was.
+        that raises, or is interrupted, leaves the layer as it was.
         """
-        previous_config = self.quantization_config
+        attributes = dict(vars(self))
+        tracked = {
+            "trainable_variables": list(self._trainable_variables),
+            "non_trainable_variables": list(self._non_trainable_variables),
+        }
+        # On TensorFlow, the names of the attributes that hold a tracked
+        # collection, which a SavedModel export reads.
+        tracked_names = (
+            list(self._tracked) if hasattr(self, "_tracked") else None
+        )
         self._tracker.unlock()
         try:
-            # Record the config only after the mode is validated, so a
-            # rejected mode leaves the layer untouched.
             self.quantization_config = config
             swap(self, config)
             self._finalize_quantization_policy(strategy, config)
-        except Exception:
-            if not self._is_quantized:
-                self.quantization_config = previous_config
+        except BaseException:
+            self._restore_quantization_state(attributes, tracked, tracked_names)
             raise
         finally:
             self._tracker.lock()
+
+    def _restore_quantization_state(self, attributes, tracked, tracked_names):
+        """Puts the layer back in the state `quantize` recorded.
+
+        A failed quantization can delete the float weight, create the
+        mode's variables and attributes, and record a config. This deletes
+        every attribute that `attributes` (a copy of `vars(self)`) does not
+        hold, tracks the variables of `tracked` again in their stores and
+        order, and sets every other attribute back to its recorded value.
+        On TensorFlow it also sets `_tracked` back to `tracked_names`. A
+        TensorFlow checkpoint of the layer then holds only its float
+        variables, and a SavedModel export reads no deleted attribute.
+        """
+        for name in set(vars(self)) - set(attributes):
+            delattr(self, name)
+        for variable in (
+            self._trainable_variables + self._non_trainable_variables
+        ):
+            self._untrack_variable(variable)
+        for store, variables in tracked.items():
+            for variable in variables:
+                self._tracker.add_to_store(store, variable)
+                self._post_track_variable(variable)
+        for name, value in attributes.items():
+            if name not in vars(self) or vars(self)[name] is not value:
+                setattr(self, name, value)
+        if tracked_names is not None:
+            self._tracked[:] = tracked_names
 
     def _quantization_geometry(self):
         """Returns this layer's quantization geometry, or `None`.
@@ -1637,8 +1719,14 @@ class Layer(BackendLayer, Operation):
 
     def _load_serialized_variables(self, store, name):
         """Loads the variables `_save_serialized_variables` saved."""
-        if not self.lora_enabled:
-            self._check_load_own_variables(store)
+        # The store holds no LoRA factors: a save merges the update into
+        # the weight.
+        factors = (
+            [getattr(self, f"lora_{name}_{f}") for f in ("a", "b")]
+            if self.lora_enabled
+            else []
+        )
+        self._check_load_own_variables(store, skip=factors)
         if not self.built:
             return
         mode = self.quantization_mode
@@ -1659,10 +1747,8 @@ class Layer(BackendLayer, Operation):
                 value = ops.cast(value, target.dtype)
             target.assign(value)
             idx += 1
-        if self.lora_enabled:
-            for factor in ("a", "b"):
-                lora = getattr(self, f"lora_{name}_{factor}")
-                lora.assign(ops.zeros(lora.shape))
+        for lora in factors:
+            lora.assign(ops.zeros(lora.shape))
 
     def _quantization_type_owner(self):
         """The class whose `_quantization_geometry` definition applies."""
@@ -1715,6 +1801,11 @@ class Layer(BackendLayer, Operation):
                 f"{self._remat_mode} for this layer."
             )
         mode = self.quantization_mode
+        if self.lora_enabled:
+            # A layer whose own `enable_lora` skips this check fails here:
+            # the forward pass of a mode without LoRA support has no term
+            # for the update.
+            self._check_lora_supported(mode)
         strategy = strategy_registry.get_strategy(mode)
         if strategy is None:
             raise self._quantization_mode_error(mode)
@@ -1753,8 +1844,13 @@ class Layer(BackendLayer, Operation):
         for i, v in enumerate(all_vars):
             store[f"{i}"] = v
 
-    def _check_load_own_variables(self, store):
-        all_vars = self._trainable_variables + self._non_trainable_variables
+    def _check_load_own_variables(self, store, skip=()):
+        skip = {id(v) for v in skip}
+        all_vars = [
+            v
+            for v in self._trainable_variables + self._non_trainable_variables
+            if id(v) not in skip
+        ]
         if len(store.keys()) != len(all_vars):
             if len(all_vars) == 0 and not self.built:
                 raise ValueError(

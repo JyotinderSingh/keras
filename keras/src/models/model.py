@@ -479,10 +479,10 @@ class Model(Trainer, Layer):
         call `model.quantization_summary()`.
 
         An error other than `NotImplementedError` from `layer.quantize`,
-        `run.add` or the calibration stops the call. The layers quantized
-        before it stay quantized, `model._quantization_report` lists them,
-        and the compiled functions are reset when at least one layer
-        changed.
+        `run.add` or the calibration stops the call: the layer that raised
+        stays as it was, the layers quantized before it stay quantized,
+        `model._quantization_report` lists them, and the compiled functions
+        are reset when at least one layer changed.
 
         Args:
             mode: The mode of the quantization. Supported modes are:
