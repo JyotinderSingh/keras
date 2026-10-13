@@ -17,6 +17,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from absl.testing import parameterized
+from packaging.version import Version
 
 import keras
 from keras.src import backend
@@ -44,6 +45,7 @@ from keras.src.testing.test_utils import named_product
 
 if backend.backend() == "jax":
     import jax
+    import jaxlib
 elif backend.backend() == "tensorflow":
     import tensorflow as tf
 elif backend.backend() == "torch":
@@ -610,6 +612,58 @@ class N5Test(testing.TestCase):
         self.assertEqual(dict(kernels.route_counts), {"n5": 2})
         self.assertEqual(compiles, [])
         self.assertAllEqual(second, first)
+
+    @parameterized.named_parameters(("per_channel", None, -1))
+    @pytest.mark.skipif(
+        backend.backend() != "jax"
+        or Version(jaxlib.__version__) < Version("0.11.2"),
+        reason=(
+            "Reads the XLA memory analysis of JAX. The XLA CPU compiler of "
+            "jaxlib 0.10.2 does not keep the order of the barrier: the "
+            "chain keeps 32 MiB. jaxlib 0.11.2 and 0.12.0 keep it."
+        ),
+    )
+    def test_chain_memory_stays_per_layer(self, mode, block_size):
+        """A `jax.jit` chain of 8 distinct 1024 x 1024 layers with N5, the
+        variables passed as arguments as `predict` passes them, reserves
+        less temp memory than two layers of float32 weights. Without the
+        barrier of `_wait_for_inputs`, XLA unpacks the codes of every
+        layer at the start of the program and keeps them live: 32 MiB."""
+        k = n = 1024
+        chain, state = [], []
+        for seed in range(8):
+            layer = _float_layer((None, n, (1, k)))
+            layer._kernel.assign(_random((k, n), seed=seed))
+            if mode is None:
+                config = Int4QuantizationConfig(block_size=block_size)
+                layer.quantize("int4", config=config)
+            else:
+                config = calibration_config(mode, group_size=block_size)
+                calibrate_layer(layer, config, _random((16, k), seed=seed))
+            chain.append(layer)
+            state.append(
+                [
+                    [v.value for v in variables]
+                    for variables in (
+                        layer.trainable_variables,
+                        layer.non_trainable_variables,
+                    )
+                ]
+            )
+
+        def call(state, x):
+            for layer, (trainable, non_trainable) in zip(chain, state):
+                x, _ = layer.stateless_call(trainable, non_trainable, x)
+            return x
+
+        kernels.route_counts.clear()
+        with kernels.force_route("n5"):
+            compiled = jax.jit(call).lower(state, _random((1, k))).compile()
+        self.assertEqual(dict(kernels.route_counts), {"n5": 8})
+        memory = compiled.memory_analysis()
+        if memory is None:
+            self.skipTest("XLA gives no memory analysis on this device.")
+        self.assertLess(memory.temp_size_in_bytes, 2 * k * n * 4)
 
     @pytest.mark.skipif(
         backend.backend() != "tensorflow", reason="Traces a `tf.function`."
