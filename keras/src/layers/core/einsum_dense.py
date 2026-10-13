@@ -302,10 +302,6 @@ class EinsumDense(Layer):
             raise ValueError(
                 "lora is already enabled. This can only be done once per layer."
             )
-        if self.quantization_mode == "gptq":
-            raise NotImplementedError(
-                "lora is not currently supported with GPTQ quantization."
-            )
         self._check_lora_supported(self.quantization_mode)
         self._tracker.unlock()
 
@@ -327,7 +323,11 @@ class EinsumDense(Layer):
             dtype="float32",
             regularizer=self.kernel_regularizer,
         )
-        self._kernel.trainable = False
+        if self._quantized_weight() is None:
+            # The float kernel is the weight of an unquantized layer (float8,
+            # which keeps it, refuses LoRA above); a quantized weight's codes
+            # were built non-trainable.
+            self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
         self.lora_rank = rank

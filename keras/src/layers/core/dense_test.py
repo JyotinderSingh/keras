@@ -1082,6 +1082,33 @@ class DenseTest(testing.TestCase):
         self.assertIsNone(layer.quantization_mode)
         self.assertEqual(report.skipped, [(layer.path, report.SKIP_NO_SUPPORT)])
 
+    @parameterized.named_parameters(
+        test_utils.named_product(mode=["gptq", "awq"], lora_first=[False, True])
+    )
+    def test_calibration_modes_enable_lora(self, mode, lora_first):
+        # LoRA trains against the dequantized codes, whether it is enabled
+        # on the float layer before the calibration or after it.
+        if mode == "gptq":
+            config = GPTQConfig(dataset=None, tokenizer=None, group_size=4)
+        else:
+            config = AWQConfig(
+                dataset=None, tokenizer=None, group_size=4, num_grid_points=5
+            )
+        layer = layers.Dense(4)
+        layer.build((None, 8))
+        if lora_first:
+            layer.enable_lora(2)
+        _calibrate(layer, config)
+        if not lora_first:
+            layer.enable_lora(2)
+        self.assertTrue(layer.lora_enabled)
+        # bias + the two LoRA factors.
+        self.assertLen(layer.trainable_weights, 3)
+        num_stored = 4 if mode == "gptq" else 5
+        self.assertFalse(hasattr(layer, "_kernel"))
+        self.assertLen(layer.non_trainable_weights, num_stored)
+        self.assertEqual(tuple(layer.kernel.shape), (8, 4))
+
     def test_legacy_load_own_variables(self):
         # In previous versions, `load_own_variables` accepted a store with
         # numeric keys.

@@ -219,15 +219,9 @@ class Dense(Layer):
             raise ValueError(
                 "lora is already enabled. This can only be done once per layer."
             )
-        if self.quantization_mode == "gptq":
-            raise NotImplementedError(
-                "lora is not currently supported with GPTQ quantization."
-            )
         self._check_lora_supported(self.quantization_mode)
         self._tracker.unlock()
-        # `kernel` is the unpacked kernel in its own shape whatever the
-        # quantization mode, so its first dimension is the input dimension.
-        input_dim_for_lora = self.kernel.shape[0]
+        input_dim_for_lora = self.kernel_shape[0]
 
         # LoRA weights should be float32 to avoid the risk of underflow or
         # overflow during fine-tuning.
@@ -242,12 +236,16 @@ class Dense(Layer):
         )
         self.lora_kernel_b = self.add_weight(
             name="lora_kernel_b",
-            shape=(rank, self.kernel.shape[1]),
+            shape=(rank, self.kernel_shape[1]),
             initializer=initializers.get(b_initializer),
             dtype="float32",
             regularizer=self.kernel_regularizer,
         )
-        self._kernel.trainable = False
+        if self._quantized_weight() is None:
+            # The float kernel is the weight of an unquantized layer (float8,
+            # which keeps it, refuses LoRA above); a quantized weight's codes
+            # were built non-trainable.
+            self._kernel.trainable = False
         self._tracker.lock()
         self.lora_enabled = True
         self.lora_rank = rank
