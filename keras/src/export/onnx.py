@@ -8,9 +8,11 @@ from keras.src.export.export_utils import make_tf_tensor_spec
 from keras.src.export.saved_model import DEFAULT_ENDPOINT_NAME
 from keras.src.export.saved_model import ExportArchive
 from keras.src.export.tf2onnx_lib import patch_tf2onnx
+from keras.src.quantizers import kernels
 from keras.src.utils import io_utils
 
 
+@kernels.policy("off")
 def export_onnx(
     model,
     filepath,
