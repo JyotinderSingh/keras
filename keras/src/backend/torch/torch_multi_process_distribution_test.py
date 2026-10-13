@@ -437,6 +437,10 @@ class TorchMultiProcessDistributeTest(
             with self.assertRaisesRegex(ValueError, "k // 64"):
                 model.set_state_tree(state_tree(sharded(other)))
             self.assertAllEqual(layer.g_idx.value.full_tensor(), fixed)
+            # `assign` runs the check too.
+            with self.assertRaisesRegex(ValueError, "k // 64"):
+                layer.g_idx.assign(sharded(other))
+            self.assertAllEqual(layer.g_idx.value.full_tensor(), fixed)
             model.set_state_tree(state_tree(sharded(fixed)))
             self.assertAllEqual(layer.g_idx.value.full_tensor(), fixed)
 

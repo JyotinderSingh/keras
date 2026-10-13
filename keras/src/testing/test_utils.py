@@ -209,7 +209,7 @@ def randomize_serialized_variables(layer, seed=1234):
     rng = np.random.RandomState(seed)
     for name in serialized_variable_names(layer):
         variable = serialized_variable(layer, name)
-        if getattr(variable, "_assign_check", None) is not None:
+        if variable._assign_check is not None:
             # A value that the mode fixes, such as contiguous groups.
             continue
         dtype = str(variable.dtype)

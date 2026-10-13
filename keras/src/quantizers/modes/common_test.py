@@ -15,6 +15,7 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.legacy.saving import legacy_h5_format
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.modes.common import ContiguousGroups
@@ -25,6 +26,13 @@ from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.testing import test_utils
 from keras.src.testing.test_utils import named_product
+from keras.src.utils.module_utils import tensorflow as tf
+
+if backend.backend() == "jax":
+    import jax
+
+    if is_nnx_enabled():
+        from flax import nnx
 
 K, N = 256, 64
 
@@ -133,6 +141,14 @@ def _legacy_file(test, model, layer, g_idx):
     return path
 
 
+def _assign(test, model, layer, g_idx):
+    layer.g_idx.assign(g_idx)
+
+
+def _assign_add(test, model, layer, g_idx):
+    layer.g_idx.assign_add(g_idx - _numpy(layer.g_idx))
+
+
 def _layer_set_weights(test, model, layer, g_idx):
     weights = layer.get_weights()
     weights[[v.name for v in layer.weights].index("g_idx")] = g_idx
@@ -191,6 +207,8 @@ LOADERS = {
 
 # The writes of a value into a variable that check it first.
 WRITERS = {
+    "assign": _assign,
+    "assign_add": _assign_add,
     "layer_set_weights": _layer_set_weights,
     "model_set_weights": _model_set_weights,
     "set_state_tree": _set_state_tree,
@@ -413,8 +431,63 @@ class ContiguousGroupsTest(testing.TestCase):
                     self.assertAllClose(
                         _numpy(loaded(x)), expected, atol=1e-4, rtol=1e-4
                     )
-                    with self.assertRaisesRegex(ValueError, _message(layer)):
-                        _layer_set_weights(
-                            self, loaded, layer, _other_groups(layer)
-                        )
+                    for writer in (_layer_set_weights, _assign):
+                        with self.assertRaisesRegex(
+                            ValueError, _message(layer)
+                        ):
+                            writer(self, loaded, layer, _other_groups(layer))
                     self.assertAllEqual(layer.g_idx, _groups(layer))
+
+    @pytest.mark.skipif(
+        backend.backend() not in ("jax", "tensorflow"),
+        reason="Traces a write under `jax.jit` or `tf.function`.",
+    )
+    def test_traced_write_does_not_crash(self):
+        """The host cannot read a traced value, so the check passes it."""
+        _, layer = _model("int4")
+        groups = _groups(layer)
+        if backend.backend() == "jax":
+
+            def write(value):
+                layer.g_idx.assign(value)
+                return value
+
+            jax.jit(write)(groups)
+            # The variable holds the tracer of the write: put the value
+            # back.
+            layer.g_idx._direct_assign(ops.convert_to_tensor(groups))
+        else:
+            tf.function(layer.g_idx.assign)(ops.convert_to_tensor(groups))
+        self.assertAllEqual(layer.g_idx, groups)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax" or not is_nnx_enabled(),
+        reason="Runs under NNX.",
+    )
+    def test_nnx_keeps_the_check(self):
+        """Under NNX, the check is in the metadata of the variable, and
+        `nnx.split` and `nnx.merge` keep it. The check compares by value,
+        so after its first calls `nnx.jit` traces no more. Writes of other
+        groups raise."""
+        model, layer = _model("int4")
+        self.assertIn("_assign_check", layer.g_idx._var_metadata)
+        graphdef, state = nnx.split(model)
+        merged = nnx.merge(graphdef, state).get_layer("target")
+        self.assertEqual(merged.g_idx._assign_check, layer.g_idx._assign_check)
+        traces = []
+
+        @nnx.jit
+        def call(model, x):
+            traces.append(1)
+            return model(x)
+
+        x = _random((4, K), 7)
+        call(model, x)
+        call(model, x)
+        traced = len(traces)
+        call(model, x)
+        call(model, x)
+        self.assertLen(traces, traced)
+        for writer in (_layer_set_weights, _assign):
+            with self.assertRaisesRegex(ValueError, _message(layer)):
+                writer(self, model, layer, _other_groups(layer))

@@ -173,16 +173,16 @@ class ContiguousGroups:
     """Refuses a group index other than `arange(length) // group_size`.
 
     The write check of a `g_idx` whose groups the mode fixes, stored on the
-    variable as `_assign_check`. `Layer.set_weights` and
-    `Model.set_state_tree` call it with the value of each write, before the
-    write. The Keras-format and the legacy h5 loads call the check of each
-    variable of a layer before its first write. It raises `ValueError` to
-    refuse the value. A value that the host cannot read now (a tracer, a
-    symbolic tensor, a JAX array on other processes) passes unchecked. The
-    check reads a torch `DTensor` whole (`_host_value`). A value of another
-    shape passes too, and the write raises its shape error. The check is a
-    frozen dataclass, so it compares and hashes by value and copies with
-    its variable.
+    variable as `_assign_check`. `Variable.assign` calls it with the
+    converted value of each write, before the write, and so do
+    `assign_add` and `assign_sub`. The Keras-format and the legacy h5 loads
+    call the check of each variable of a layer before its first write. It
+    raises `ValueError` to refuse the value. A value that the host cannot
+    read now (a tracer, a symbolic tensor, a JAX array on other processes)
+    passes unchecked. The check reads a torch `DTensor` whole
+    (`_host_value`). A value of another shape passes too, and the write
+    raises its shape error. The check is a frozen dataclass, so it compares
+    and hashes by value and copies with its variable.
     """
 
     length: int
