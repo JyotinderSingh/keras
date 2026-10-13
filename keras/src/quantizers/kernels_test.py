@@ -934,9 +934,10 @@ class PolicyTest(testing.TestCase):
         self.assertEqual(self.state(), self.initial)
 
     def test_require_raises_without_a_kernel(self):
-        """The test clears this backend's `"require"` kernels, because the
-        static entries of `_REQUIRED` give a GPU one: Triton K1 on a CUDA
-        host with Triton (torch), and Mosaic GPU K1 on JAX."""
+        """The test clears this backend's `"require"` kernels, because on
+        some hosts the static entries of `_REQUIRED` give one: Triton K1
+        on a CUDA host with Triton (torch), and on JAX, Mosaic GPU K1 on
+        a GPU and Pallas TPU K1 on a TPU."""
         with _routes(required={}):
             with self.assertRaisesRegex(ValueError, "needs a platform with"):
                 kernels.set_policy("require")

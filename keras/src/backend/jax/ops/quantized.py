@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import jaxlib
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from keras.src.utils.module_utils import LazyModule
 
@@ -532,3 +533,215 @@ def _logits_kernel(
         )(x_g, codes_g, *rows_g)
 
     return kernel(x, codes, *rows)
+
+
+# Pallas TPU K1: the sizes of a block of `BK` rows or `BNH` code columns,
+# largest first. The JAX backend imports Pallas TPU in `nn.py` already, so
+# the import of `pltpu` adds no cost to `import keras`.
+_PALLAS_TPU_BLOCKS = (512, 256, 128)
+
+
+def pallas_tpu_blocks(m, k, n, group_size):
+    """The blocks `(BM, BK, BNH)` of Pallas TPU K1, or `None`.
+
+    `BNH` is the largest of 512, 256 and 128 that divides `N / 2`, else all
+    `N / 2` code columns. `BK` is the largest of them that divides `K` and
+    that `group_size` divides. One group of `K` rows, and a per-channel
+    weight (`group_size=None`), take any of them. `BM` is 16 at decode
+    (`M <= 16`) and 128 otherwise. The alignment gate refuses an odd `N`
+    and a shape with no `BK`, and the result is then `None`.
+    """
+    group = k if group_size is None else group_size
+    block_k = next(
+        (
+            b
+            for b in _PALLAS_TPU_BLOCKS
+            if k % b == 0 and (group == k or b % group == 0)
+        ),
+        None,
+    )
+    if n % 2 or block_k is None:
+        return None
+    half = n // 2
+    block_n = next((b for b in _PALLAS_TPU_BLOCKS if half % b == 0), half)
+    return (16 if m <= 16 else 128, block_k, block_n)
+
+
+def pallas_tpu_precision(dtype):
+    """The precision of each in-kernel dot of Pallas TPU K1.
+
+    The Pallas TPU lowering accepts only `DEFAULT` and `HIGHEST`, and a dot
+    with no precision takes the global `jax_default_matmul_precision`. So
+    each dot passes one. bfloat16 compute takes `DEFAULT`. For float32
+    compute, the global value at trace time maps through `lax.Precision`:
+    `DEFAULT` (`None`, `"default"` and `"bfloat16"`) gives `DEFAULT` with
+    bfloat16 activations, the one bfloat16 pass of XLA on a TPU. Each other
+    value, a `DotAlgorithmPreset` name included, gives `HIGHEST`.
+    """
+    if jnp.dtype(dtype) == jnp.bfloat16:
+        return lax.Precision.DEFAULT
+    value = jax.config.jax_default_matmul_precision or "default"
+    try:
+        value = lax.Precision(value)
+    except ValueError:  # A `DotAlgorithmPreset` name.
+        return lax.Precision.HIGHEST
+    if value == lax.Precision.DEFAULT:
+        return value
+    return lax.Precision.HIGHEST
+
+
+# The kernel compiles once per signature, and inlines under a trace, as
+# `mosaic_gpu_w4a16_matmul` does.
+@functools.partial(
+    jax.jit,
+    static_argnames=(
+        "group_size",
+        "signed",
+        "per_channel",
+        "config",
+        "interpret",
+    ),
+    inline=True,
+)
+def pallas_tpu_w4a16_matmul(
+    x,
+    codes,
+    scale,
+    zero,
+    *,
+    group_size,
+    signed,
+    per_channel,
+    config,
+    input_scales=None,
+    interpret=None,
+):
+    """Returns the `(M, N)` contraction of `x` against the 4-bit weight, in
+    `x.dtype`.
+
+    Pallas TPU K1, with sum-then-scale. `x` is `(M, K)` in bfloat16 or
+    float32. `codes`, `scale`, `zero`, `group_size`, `signed`,
+    `per_channel` and `input_scales` are as for `mosaic_gpu_w4a16_matmul`.
+    `config` is the `(BM, BK, BNH)` of `pallas_tpu_blocks`, so the caller
+    checks the alignment with it. The dots take the precision of
+    `pallas_tpu_precision`.
+
+    `interpret` (tests only) takes a `pltpu.InterpretParams`, which runs
+    the kernel in TPU interpret mode.
+    """
+    block_m = config[0]
+    dtype = x.dtype
+    if input_scales is not None:
+        x = x / input_scales.astype(dtype)
+    precision = pallas_tpu_precision(dtype)
+    if precision == lax.Precision.DEFAULT:
+        x = x.astype(jnp.bfloat16)
+    m, half = x.shape[0], codes.shape[1]
+    padded = -(-m // block_m) * block_m
+    inputs = [jnp.pad(x, ((0, padded - m), (0, 0))), codes]
+    if not per_channel:
+        # `(2, n_groups, 1, N / 2)`: the rows of the even and the odd
+        # columns, for blocks of `BNH` columns.
+        inputs += [
+            jnp.stack([rows[:, 0::2], rows[:, 1::2]]).reshape(2, -1, 1, half)
+            for rows in (scale.astype("float32"), zero.astype("int32"))
+        ]
+    planes = _pallas_tpu_kernel(
+        *inputs,
+        signed=signed,
+        group_size=group_size,
+        blocks=config,
+        precision=precision,
+        dtype="float32" if per_channel else dtype,
+        interpret=interpret,
+    )
+    # One transpose and one reshape interleave the two planes.
+    y = planes.transpose(1, 2, 0).reshape(padded, 2 * half)[:m]
+    if per_channel:
+        y = y / scale.astype("float32")
+    return y.astype(dtype)
+
+
+def _pallas_tpu_kernel(
+    x, codes, *rows, signed, group_size, blocks, precision, dtype, interpret
+):
+    """The outputs `(2, Mp, N / 2)` of the even and the odd columns.
+
+    Each program holds one block of `BM` rows and `BNH` code columns, with
+    every operand in HBM. One pipeline over the K steps double-buffers the
+    activation block, the code block and the scale and zero rows of its
+    groups. A step widens the codes to int32 and splits the two planes:
+    shifts sign-extend the nibbles of int8 storage, and masks take those
+    of uint8 storage. For each plane and group, it subtracts the zero row
+    in int32, which gives integers in [-15, 15], exact in the dot dtype.
+    One dot gives a float32 result, its scale row multiplies it, and the
+    float32 accumulator of the plane adds it.
+    """
+    block_m, block_k, block_n = blocks
+    half = codes.shape[1]
+    grouped = bool(rows) and rows[0].shape[1] > 1
+    # The groups of one K step: `BK / G`, or one for one group of K rows.
+    per_step = block_k // group_size if grouped else 1
+    size = block_k // per_step
+
+    # A pipeline inside the kernel over operands in HBM (`pl.ANY`) follows
+    # the `pltpu.emit_pipeline` section of the JAX Pallas TPU pipelining
+    # guide (`docs/pallas/tpu/pipelining.md`). As in `_w4a16_kernel`, the
+    # pipeline has inputs only and the output block is written once after
+    # it, an idea of the sm80 `ragged_dot` kernel of Tokamax
+    # (`tokamax/_src/ops/ragged_dot/pallas_mosaic_gpu_kernel_sm80.py`).
+    def kernel(x_hbm, codes_hbm, *refs):
+        *rows_hbm, out_ref, acc_ref = refs
+        i, j = pl.program_id(0), pl.program_id(1)
+        acc_ref[...] = jnp.zeros_like(acc_ref)
+
+        def body(x_t, codes_t, *rows_t):
+            b = codes_t[...].astype(jnp.int32)
+            if signed:
+                planes = ((b << 28) >> 28, (b << 24) >> 28)
+            else:
+                planes = (b & 15, (b >> 4) & 15)
+            a = x_t[...]
+            for p, w in enumerate(planes):
+                for g in range(per_step):
+                    span = slice(g * size, (g + 1) * size)
+                    w_g = w[span]
+                    if rows_t:
+                        w_g = w_g - rows_t[1][p, g]
+                    part = jnp.dot(
+                        a[:, span],
+                        w_g.astype(a.dtype),
+                        precision=precision,
+                        preferred_element_type=jnp.float32,
+                    )
+                    if rows_t:
+                        part = part * rows_t[0][p, g]
+                    acc_ref[p] += part
+
+        specs = [
+            pl.BlockSpec((block_m, block_k), lambda s: (i, s)),
+            pl.BlockSpec((block_k, block_n), lambda s: (s, j)),
+        ]
+        group = (lambda s: s) if grouped else (lambda s: 0)
+        specs += [
+            pl.BlockSpec(
+                (2, per_step, 1, block_n), lambda s: (0, group(s), 0, j)
+            )
+        ] * len(rows_hbm)
+        pltpu.emit_pipeline(
+            body, grid=(x.shape[1] // block_k,), in_specs=specs
+        )(x_hbm, codes_hbm, *rows_hbm)
+        out_ref[...] = acc_ref[...].astype(out_ref.dtype)
+
+    return pl.pallas_call(
+        kernel,
+        grid=(x.shape[0] // block_m, half // block_n),
+        in_specs=[pl.BlockSpec(memory_space=pl.ANY)] * (2 + len(rows)),
+        out_specs=pl.BlockSpec((2, block_m, block_n), lambda i, j: (0, i, j)),
+        out_shape=jax.ShapeDtypeStruct((2, x.shape[0], half), dtype),
+        scratch_shapes=[pltpu.VMEM((2, block_m, block_n), jnp.float32)],
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel")
+        ),
+        interpret=interpret,
+    )(x, codes, *rows)
