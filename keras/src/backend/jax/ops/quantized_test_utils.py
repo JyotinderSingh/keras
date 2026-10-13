@@ -1,9 +1,9 @@
-"""Test helpers of the Mosaic GPU kernel of the JAX backend.
+"""Test helpers of the Mosaic GPU kernels of the JAX backend.
 
-`mosaic_gpu_lowering` lowers the kernel for a GPU on a CPU host.
-`mosaic_gpu_routes` gives a matmul route of the kernel that runs on a CPU
-host, in GPU interpret mode, and `register_interpret_routes` adds the
-interpret route `"mosaic_gpu_interpret"` to the matmul route table of
+`mosaic_gpu_lowering` lowers the kernels for a GPU on a CPU host.
+`mosaic_gpu_routes` gives routes of the kernels that run on a CPU host,
+in GPU interpret mode, and `register_interpret_routes` adds the interpret
+routes `"mosaic_gpu_interpret"` to the route tables of
 `keras.src.quantizers.kernels`. `kernels_test_utils` calls it at import.
 """
 
@@ -19,7 +19,7 @@ from keras.src.quantizers import kernels
 
 @contextlib.contextmanager
 def mosaic_gpu_lowering(compute_capability):
-    """Lowers the Mosaic GPU kernel for a GPU on a CPU host.
+    """Lowers the Mosaic GPU kernels for a GPU on a CPU host.
 
     Inside the block, `jax.export.export(..., platforms=["cuda"])` lowers
     a Mosaic GPU kernel for `compute_capability`, for example `"8.9"`. It
@@ -35,10 +35,11 @@ def mosaic_gpu_lowering(compute_capability):
     The wrap raises `ValueError` for such a block. It changes nothing
     else.
 
-    The pipeline reads the capability when `mosaic_gpu_w4a16_matmul`
-    traces, and the function keeps its traces. So the helper clears them
-    on entry and on exit: a trace for another capability does not serve
-    the block, and a trace of the block does not serve a later call.
+    The pipeline reads the capability when `mosaic_gpu_w4a16_matmul` or
+    `mosaic_gpu_w4a16_logits` traces, and the functions keep their
+    traces. So the helper clears them on entry and on exit: a trace for
+    another capability does not serve the block, and a trace of the block
+    does not serve a later call.
 
     Raises `NotImplementedError` when JAX has no `plgpu.mma`, or when a
     private name moved.
@@ -70,7 +71,10 @@ def mosaic_gpu_lowering(compute_capability):
             self, src_ref=src_ref, gmem_slice=gmem_slice, **kwargs
         )
 
-    traced = (quantized._mosaic_gpu_w4a16_matmul,)
+    traced = (
+        quantized._mosaic_gpu_w4a16_matmul,
+        quantized._mosaic_gpu_w4a16_logits,
+    )
     for function in traced:
         function.clear_cache()
     utils._infer_arch = lambda: arch
@@ -107,17 +111,16 @@ def _contiguous_block(shape, gmem_slice):
 
 
 def mosaic_gpu_routes(interpret=True, config=None, **changes):
-    """The matmul route of the Mosaic GPU kernel for a CPU host, and
-    `None` in place of a logits route, as `kernels._kernel_routes` gives
-    them.
+    """The matmul and the logits route of the Mosaic GPU kernels, for a
+    CPU host.
 
-    The route is that of `kernels._kernel_routes`, with the device check
-    `plgpu.available` in place of the GPU check and no `kernel`, so
-    `"require"` does not run it. With `interpret`, it runs the kernel in
-    GPU interpret mode. With `config`, the kernel takes that launch
-    configuration, else the row of its table: on a CPU host, the rows of
-    compute capability 8.9 in interpret mode. `changes` replace fields of
-    the route, for example `tested=None`.
+    The routes are those of `kernels._kernel_routes`, with the device
+    check `plgpu.available` in place of the GPU check and no `kernel`, so
+    `"require"` does not run them. With `interpret`, they run the kernels
+    in GPU interpret mode. With `config`, the kernels take that launch
+    configuration, else the row of their table: on a CPU host, the rows
+    of compute capability 8.9 in interpret mode. `changes` replace fields
+    of both routes, for example `tested=None`.
     """
     (kernel,) = [k for k in quantized.KERNELS if k.name == "mosaic_gpu"]
     options = {"interpret": interpret}
@@ -126,23 +129,29 @@ def mosaic_gpu_routes(interpret=True, config=None, **changes):
     kernel = dataclasses.replace(
         kernel,
         matmul=functools.partial(kernel.matmul, **options),
+        logits=functools.partial(kernel.logits, **options),
         supports_device=lambda device_class: quantized.plgpu.available,
     )
-    matmul, _ = kernels._kernel_routes(kernel)
+    matmul, logits = kernels._kernel_routes(kernel)
     changes.setdefault("kernel", None)
-    return dataclasses.replace(matmul, **changes), None
+    return (
+        dataclasses.replace(matmul, **changes),
+        dataclasses.replace(logits, **changes),
+    )
 
 
 def register_interpret_routes():
-    """Adds `"mosaic_gpu_interpret"` to the matmul routes, and returns
-    `{"mosaic_gpu_interpret": "mosaic_gpu"}`.
+    """Adds `"mosaic_gpu_interpret"` to the matmul and the logits routes,
+    and returns `{"mosaic_gpu_interpret": "mosaic_gpu"}`.
 
-    The matmul route runs the kernel in GPU interpret mode on CPU, with
+    The routes run the kernels in GPU interpret mode on CPU, with
     `jnp.dot` in place of `plgpu.mma`, through `force_route` or a
-    measured row. It has no version range. It does not support `jax.vmap`
-    of a guarded call (a view with a `g_idx`): interpret mode has an IO
-    effect, which JAX does not support in a vmap-of-cond.
+    measured row. They have no version range. The matmul route does not
+    support `jax.vmap` of a guarded call (a view with a `g_idx`):
+    interpret mode has an IO effect, which JAX does not support in a
+    vmap-of-cond.
     """
-    matmul, _ = mosaic_gpu_routes(tested=None)
+    matmul, logits = mosaic_gpu_routes(tested=None)
     kernels._ROUTES["mosaic_gpu_interpret"] = matmul
+    kernels._LOGITS_ROUTES["mosaic_gpu_interpret"] = logits
     return {"mosaic_gpu_interpret": "mosaic_gpu"}
