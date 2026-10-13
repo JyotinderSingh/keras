@@ -659,8 +659,17 @@ class Model(Trainer, Layer):
                         quantized.append(layer)
                     else:
                         run.add(layer, type_check)
-                except NotImplementedError:
-                    report.add_skipped(path, QuantizationReport.SKIP_NO_SUPPORT)
+                except NotImplementedError as error:
+                    # Keep the refusal of a layer that declares quantization
+                    # support: it says more than "no quantize support".
+                    detail = (
+                        str(error)
+                        if layer._quantization_geometry() is not None
+                        else None
+                    )
+                    report.add_skipped(
+                        path, QuantizationReport.SKIP_NO_SUPPORT, detail
+                    )
             if run is not None:
                 run.run()
         finally:
