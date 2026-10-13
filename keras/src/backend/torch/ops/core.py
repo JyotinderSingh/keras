@@ -6,6 +6,7 @@ import os
 import ml_dtypes
 import numpy as np
 import torch
+import torch._dynamo as dynamo
 from torch.distributed.tensor import DTensor
 from torch.distributed.tensor import Replicate
 
@@ -175,6 +176,53 @@ class KerasDTensorPromotionMode(torch.utils._python_dispatch.TorchDispatchMode):
         return func(*args, **kwargs)
 
 
+def _on_active_device(value):
+    """Returns the value of a variable on the active device.
+
+    A variable keeps its value on the device it was created on, while the
+    results of `keras.ops` land on the active device. Torch raises when an
+    operation mixes the two. `Tensor.to` returns the tensor itself when it is
+    already on the device, so in-place updates and autograd through the
+    parameter are unchanged on a single device. A value on the meta device is
+    left alone, because `convert_to_tensor` would replace it with
+    uninitialized data.
+    """
+    if isinstance(value, torch.Tensor) and not value.is_meta:
+        return value.to(get_device())
+    return value
+
+
+@dynamo.assume_constant_result
+def _has_in_place_name(func):
+    # Torch names in-place functions and methods `relu_`, `add_`, ... A name
+    # like `__rsub__` is an operator, not an in-place function. Dynamo cannot
+    # read the name of a torch function, so it calls this while tracing and
+    # keeps the result.
+    name = getattr(func, "__name__", "")
+    return name.endswith("_") and not name.endswith("__")
+
+
+def _updates_first_argument(func, kwargs):
+    """Returns whether a torch call writes into its first argument."""
+    return bool(kwargs.get("inplace")) or _has_in_place_name(func)
+
+
+def _is_destination_keyword(key, in_place):
+    """Returns whether a keyword argument of a torch call is written into."""
+    # An in-place call receives its target as `input` (`torch.relu_`) or, for
+    # the `torch.nn.init` functions, as `tensor`.
+    return key == "out" or (in_place and key in ("input", "tensor"))
+
+
+def _read_variable(variable, is_destination):
+    """Returns the value that a torch call receives for a variable."""
+    if is_destination:
+        # A copy on the active device would take the update and the variable
+        # would stay unchanged.
+        return variable.value
+    return _on_active_device(variable.value)
+
+
 class Variable(KerasVariable):
     def _initialize_distributed(self, initializer):
         from keras.src.distribution.distribution_lib import distribution
@@ -262,14 +310,45 @@ class Variable(KerasVariable):
     # Overload native accessor.
     @classmethod
     def __torch_function__(cls, func, types, args=(), kwargs=None):
-        args = [arg.value if isinstance(arg, Variable) else arg for arg in args]
         if kwargs is None:
             kwargs = {}
+        # A variable that the call writes into stays on its own device, so an
+        # in-place call updates the variable, as it does on a single device,
+        # and raises when the other operands are elsewhere.
+        in_place = _updates_first_argument(func, kwargs)
+        args = [
+            _read_variable(arg, in_place and index == 0)
+            if isinstance(arg, Variable)
+            else arg
+            for index, arg in enumerate(args)
+        ]
         kwargs = {
-            key: value.value if isinstance(value, Variable) else value
+            key: (
+                _read_variable(value, _is_destination_keyword(key, in_place))
+                if isinstance(value, Variable)
+                else value
+            )
             for key, value in kwargs.items()
         }
         return func(*args, **kwargs)
+
+    # The operators below return a tensor, not a variable, so the tensor must
+    # already be on the active device for the next operation.
+    def __getitem__(self, idx):
+        # Index first so that only the slice is moved, not the whole value.
+        return _on_active_device(self.value.__getitem__(idx))
+
+    def __neg__(self):
+        return _on_active_device(self.value).__neg__()
+
+    def __pos__(self):
+        return _on_active_device(self.value)
+
+    def __abs__(self):
+        return _on_active_device(self.value).__abs__()
+
+    def __invert__(self):
+        return _on_active_device(self.value).__invert__()
 
     def __array__(self, dtype=None):
         value = convert_to_numpy(self.value)
