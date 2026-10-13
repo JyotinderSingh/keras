@@ -85,10 +85,6 @@ class Float8Strategy(QuantizationStrategy):
 
     def call(self, layer, inputs, training=None):
         geometry = self.require_geometry(layer)
-        if layer.lora_enabled:
-            raise NotImplementedError(
-                "Currently, float8 quantization doesn't support LoRA"
-            )
 
         @ops.custom_gradient
         def quantized_dequantize_inputs(inputs, scale, amax_history):

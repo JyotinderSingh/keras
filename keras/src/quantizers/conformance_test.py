@@ -510,6 +510,8 @@ class QuantizationConformanceTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "Implicitly enabling"):
             layer.dtype_policy = name
         self._assert_unchanged(layer, before)
+        self.assertEqual(layer.dtype_policy.name, "float32")
+        self.assertIsNone(layer.quantization_mode)
 
     @parameterized.named_parameters(CALIBRATED_PAIRS)
     def test_layer_quantize_refuses_calibration_modes(self, mode_name, kind):
