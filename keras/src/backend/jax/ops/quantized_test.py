@@ -32,6 +32,7 @@ from keras.src import ops
 from keras.src import testing
 from keras.src.backend.common import AutocastScope
 from keras.src.backend.jax.ops import quantized
+from keras.src.backend.jax.ops.quantized_test_utils import kernel_record
 from keras.src.backend.jax.ops.quantized_test_utils import mosaic_gpu_lowering
 from keras.src.backend.jax.ops.quantized_test_utils import mosaic_gpu_routes
 from keras.src.quantizers import kernels
@@ -842,7 +843,7 @@ class GateTest(testing.TestCase):
         code columns and groups of whole K steps, so `G` 32 and 64, `N` 96
         and 127, and per channel `K = 192` fail. The kernel takes bfloat16
         and float16 compute only."""
-        (kernel,) = quantized.KERNELS
+        kernel = kernel_record("mosaic_gpu")
         self.assertEqual(kernel.dtypes, ("bfloat16", "float16"))
         for k, n, group, expected in (
             (256, 128, 128, True),
@@ -862,7 +863,7 @@ class GateTest(testing.TestCase):
         """Each Mosaic GPU measured row names a device class and a compute
         dtype that the kernel supports, and `MOSAIC_GPU_CONFIGS` has a row
         for its compute capability, compute dtype and M bucket."""
-        (kernel,) = quantized.KERNELS
+        kernel = kernel_record("mosaic_gpu")
         rows = [
             key
             for key, routes in kernels._MEASURED_ROWS.items()
@@ -895,7 +896,7 @@ class GateTest(testing.TestCase):
         capabilities = {key[0] for key in quantized.MOSAIC_GPU_CONFIGS}
         self.assertEqual(quantized._MOSAIC_GPU_CAPABILITIES, CAPABILITIES)
         self.assertEqual(capabilities, set(CAPABILITIES))
-        (kernel,) = quantized.KERNELS
+        kernel = kernel_record("mosaic_gpu")
         self.assertIs(kernels._ROUTES["mosaic_gpu"].kernel, kernel)
         for device_class, expected in (
             ("cuda-sm80", True),
