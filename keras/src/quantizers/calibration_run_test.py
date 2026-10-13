@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from absl.testing import parameterized
 
+from keras.src import activations
 from keras.src import backend
 from keras.src import layers
 from keras.src import models
@@ -17,6 +18,7 @@ from keras.src.quantizers.calibration_run import CalibrationRun
 from keras.src.quantizers.calibration_run import _execution_stages
 from keras.src.quantizers.calibration_run import get_dataloader
 from keras.src.quantizers.capture import calibration_scope
+from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
@@ -219,6 +221,71 @@ class TrainingOnlyBlock(layers.Layer):
         if training:
             hidden = self.training_only(hidden)
         return hidden
+
+
+class RecipeOnlyProjection(layers.Layer):
+    """A projection layer written to the documented recipe only.
+
+    It is not a `Dense`: it defines a geometry, lists the modes in its
+    `variable_serialization_spec`, and runs the quantized build sequence.
+    It has none of the extras of `quantization_test_utils`'s third-party
+    layers (LoRA, a `kernel` property, a config).
+    """
+
+    def __init__(self, units, activation=None, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+        self.activation = activations.get(activation)
+
+    def build(self, input_shape):
+        self.kernel_shape = (input_shape[-1], self.units)
+        if self.quantization_mode:
+            self.quantized_build(
+                self.kernel_shape,
+                mode=self.quantization_mode,
+                config=self.quantization_config,
+            )
+        if not self._strategy_owns_weight_storage():
+            self._kernel = self.add_weight(
+                name="kernel", shape=self.kernel_shape
+            )
+        self.bias = self.add_weight(
+            name="bias", shape=(self.units,), initializer="zeros"
+        )
+
+    def call(self, inputs):
+        outputs = ops.add(ops.matmul(inputs, self._kernel), self.bias)
+        return self.activation(outputs)
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+    @property
+    def variable_serialization_spec(self):
+        return {
+            None: ["kernel", "bias"],
+            "gptq": [
+                "bias",
+                "quantized_kernel",
+                "kernel_scale",
+                "kernel_zero",
+                "g_idx",
+            ],
+            "awq": [
+                "bias",
+                "quantized_kernel",
+                "kernel_scale",
+                "kernel_zero",
+                "awq_scales",
+                "g_idx",
+            ],
+        }
+
+    def save_own_variables(self, store):
+        self._save_serialized_variables(store, "kernel")
+
+    def load_own_variables(self, store):
+        self._load_serialized_variables(store, "kernel")
 
 
 class AttentionLikeBlock(layers.Layer):
@@ -606,6 +673,35 @@ class CalibrationRunModelTest(testing.TestCase):
         self.assertFalse([m for m in messages if "undersampled" in m])
         for layer in (block.observed, block.training_only):
             _assert_calibrated(self, layer, mode)
+
+    @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
+    def test_third_party_projection_in_a_block_is_calibrated(self, mode):
+        """A layer that lists the mode is calibrated, not only `Dense`.
+
+        The third-party layer computes what the `Dense` it replaces
+        computes, so the run must store the same values for both.
+        """
+        reference, reference_config = _tiny_model(mode)
+        custom = RecipeOnlyProjection(16, activation="relu")
+        model, config = _tiny_model(
+            mode, block_layers=[custom, layers.Dense(8)]
+        )
+        block = config.quantization_layer_structure["sequential_blocks"][0]
+        model.set_weights(reference.get_weights())
+        report = model.quantize(mode, config=config)
+        reference.quantize(mode, config=reference_config)
+
+        self.assertIn(custom.path, [path for path, *_ in report.quantized])
+        _assert_calibrated(self, custom, mode)
+        reference_block = reference_config.quantization_layer_structure[
+            "sequential_blocks"
+        ][0]
+        for layer, reference_layer in zip(block.layers, reference_block.layers):
+            self.assertEqual(len(layer.weights), len(reference_layer.weights))
+            for variable, expected in zip(
+                layer.weights, reference_layer.weights
+            ):
+                self.assertAllEqual(variable, expected)
 
     @parameterized.named_parameters(("gptq", "gptq"), ("awq", "awq"))
     def test_equation_without_a_view_is_skipped_and_reported(self, mode):

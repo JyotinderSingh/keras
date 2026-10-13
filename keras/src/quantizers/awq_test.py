@@ -22,6 +22,9 @@ from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
+from keras.src.quantizers.quantization_test_utils import (
+    tiny_transformer_classifier,
+)
 from keras.src.quantizers.quantization_test_utils import token_dataset
 
 # Shared RNG instance for reproducible tests
@@ -297,38 +300,6 @@ class AWQLayerTest(testing.TestCase):
 class AWQIntegrationTest(testing.TestCase):
     """Integration tests for AWQ quantization."""
 
-    def test_dense_layer_quantize_awq(self):
-        """Test Dense layer can be calibrated with AWQ."""
-        layer = layers.Dense(64)
-        layer.build(input_shape=(None, 32))
-
-        config = AWQConfig(
-            dataset=None, tokenizer=None, group_size=16, num_grid_points=5
-        )
-        calibrate_layer(
-            layer, config, RNG.standard_normal((16, 32)).astype("float32")
-        )
-
-        # Check layer is properly configured
-        self.assertEqual(layer.quantization_mode, "awq")
-        self.assertTrue(hasattr(layer, "awq_scales"))
-
-    def test_einsum_dense_layer_quantize_awq(self):
-        """Test EinsumDense layer can be calibrated with AWQ."""
-        layer = layers.EinsumDense("ab,bc->ac", output_shape=(64,))
-        layer.build(input_shape=(None, 32))
-
-        config = AWQConfig(
-            dataset=None, tokenizer=None, group_size=-1, num_grid_points=5
-        )
-        calibrate_layer(
-            layer, config, RNG.standard_normal((16, 32)).astype("float32")
-        )
-
-        # Check layer is properly configured
-        self.assertEqual(layer.quantization_mode, "awq")
-        self.assertTrue(hasattr(layer, "awq_scales"))
-
     def test_model_quantize_requires_structure(self):
         """Test model.quantize requires structure for AWQ."""
         model = models.Sequential([layers.Dense(10, input_shape=(5,))])
@@ -463,41 +434,6 @@ def _top1_match_rate(a_logits, b_logits):
     )
 
 
-def _get_sequence_classifier():
-    """Create a transformer-based sequence classifier for testing."""
-    embed_dim = 32
-    num_heads = 4
-    ff_dim = 32
-
-    class SimpleTransformerBlock(layers.Layer):
-        def __init__(self, embed_dim, num_heads, ff_dim, **kwargs):
-            super().__init__(**kwargs)
-            self.att = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=embed_dim // num_heads
-            )
-            self.ffn = models.Sequential(
-                [
-                    layers.Dense(ff_dim, activation="relu"),
-                    layers.Dense(embed_dim),
-                ]
-            )
-            self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-            self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-
-        def call(self, inputs):
-            attention_output = self.att(inputs, inputs)
-            out1 = self.layernorm1(inputs + attention_output)
-            ffn_output = self.ffn(out1)
-            return self.layernorm2(out1 + ffn_output)
-
-    inputs = layers.Input(shape=(SEQ_LEN,), dtype="int32")
-    x = layers.Embedding(VOCAB_SIZE, embed_dim)(inputs)
-    x = SimpleTransformerBlock(embed_dim, num_heads, ff_dim)(x)
-    x = layers.GlobalAveragePooling1D(data_format="channels_last")(x)
-    outputs = layers.Dense(NUM_CLASSES)(x)
-    return models.Model(inputs, outputs)
-
-
 def _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN):
     """Character-based tokenizer for testing."""
 
@@ -562,7 +498,7 @@ class AWQAccuracyTest(testing.TestCase):
         self.assertNotEmpty(calibration_set)
 
         # Build model and tokenizer
-        model = _get_sequence_classifier()
+        model = tiny_transformer_classifier(VOCAB_SIZE, SEQ_LEN, NUM_CLASSES)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Build eval batch from same distribution as calibration

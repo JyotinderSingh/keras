@@ -23,6 +23,9 @@ from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
+from keras.src.quantizers.quantization_test_utils import (
+    tiny_transformer_classifier,
+)
 from keras.src.quantizers.quantization_test_utils import token_dataset
 from keras.src.testing.test_utils import named_product
 
@@ -570,45 +573,6 @@ class GPTQTest(testing.TestCase):
             model.quantize("gptq", config=config)
 
 
-def _get_sequence_classifier():
-    """Transformer-based sequence classifier
-
-    tokens -> Embedding -> Transformer -> GAP -> Dense(num_classes).
-    """
-    embed_dim = 32
-    num_heads = 4
-    ff_dim = 32
-
-    class SimpleTransformerBlock(layers.Layer):
-        def __init__(self, embed_dim, num_heads, ff_dim, **kwargs):
-            super().__init__(**kwargs)
-
-            self.att = layers.MultiHeadAttention(
-                num_heads=num_heads, key_dim=embed_dim // num_heads
-            )
-            self.ffn = models.Sequential(
-                [
-                    layers.Dense(ff_dim, activation="relu"),
-                    layers.Dense(embed_dim),
-                ]
-            )
-            self.layernorm1 = layers.LayerNormalization(epsilon=1e-6)
-            self.layernorm2 = layers.LayerNormalization(epsilon=1e-6)
-
-        def call(self, inputs):
-            attention_output = self.att(inputs, inputs)
-            out1 = self.layernorm1(inputs + attention_output)
-            ffn_output = self.ffn(out1)
-            return self.layernorm2(out1 + ffn_output)
-
-    inputs = layers.Input(shape=(SEQ_LEN,), dtype="int32")
-    x = layers.Embedding(VOCAB_SIZE, embed_dim)(inputs)
-    x = SimpleTransformerBlock(embed_dim, num_heads, ff_dim)(x)
-    x = layers.GlobalAveragePooling1D()(x)
-    outputs = layers.Dense(NUM_CLASSES)(x)
-    return models.Model(inputs, outputs)
-
-
 def _get_simple_model():
     return models.Sequential([layers.Dense(10, input_shape=(5,))])
 
@@ -712,10 +676,6 @@ def _token_dataset(
 
 
 @pytest.mark.requires_trainable_backend
-@pytest.mark.skipif(
-    backend.backend() == "torch",
-    reason="torch gives low accuracy on CI, but works well locally",
-)
 class TestModelQuantization(testing.TestCase):
     @parameterized.named_parameters(
         named_product(
@@ -728,6 +688,10 @@ class TestModelQuantization(testing.TestCase):
                 for config_id, config in CONFIGS.items()
             ],
         )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "torch",
+        reason="torch gives low accuracy on CI, but works well locally",
     )
     def test_quantize_gptq_combinations(self, dataset, config):
         """Tests GPTQ quantization on a tiny transformer classifier.
@@ -745,7 +709,7 @@ class TestModelQuantization(testing.TestCase):
         self.assertNotEmpty(calibration_set)
 
         # Build classifier and tokenizer
-        model = _get_sequence_classifier()
+        model = tiny_transformer_classifier(VOCAB_SIZE, SEQ_LEN, NUM_CLASSES)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Build an eval batch drawn from the SAME distribution as calibration
@@ -837,7 +801,7 @@ class TestModelQuantization(testing.TestCase):
 
     def test_gptq_filtering(self):
         """Tests that filters argument works for GPTQ."""
-        model = _get_sequence_classifier()
+        model = tiny_transformer_classifier(VOCAB_SIZE, SEQ_LEN, NUM_CLASSES)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         # Structure
@@ -876,7 +840,7 @@ class TestModelQuantization(testing.TestCase):
 
     def test_gptq_multi_filtering(self):
         """Tests that list of regex filters works for GPTQ."""
-        model = _get_sequence_classifier()
+        model = tiny_transformer_classifier(VOCAB_SIZE, SEQ_LEN, NUM_CLASSES)
         tokenizer = _char_tokenizer(vocab_size=VOCAB_SIZE, seq_len=SEQ_LEN)
 
         embedding_layer = model.layers[1]
