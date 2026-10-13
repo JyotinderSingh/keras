@@ -8,6 +8,7 @@ the logits kernels as ops.
 """
 
 import functools
+import itertools
 import warnings
 
 import ml_dtypes
@@ -26,9 +27,11 @@ from keras.src.backend.common import AutocastScope
 from keras.src.backend.common import standardize_dtype
 from keras.src.quantizers import kernels
 from keras.src.quantizers import strategy_registry
+from keras.src.quantizers.kernels_test_utils import BUCKET_ROWS
 from keras.src.quantizers.kernels_test_utils import admitted
 from keras.src.quantizers.kernels_test_utils import counts
 from keras.src.quantizers.kernels_test_utils import direct_logits
+from keras.src.quantizers.kernels_test_utils import first_tested_route
 from keras.src.quantizers.kernels_test_utils import floor_and_bound
 from keras.src.quantizers.kernels_test_utils import lookup_table
 from keras.src.quantizers.kernels_test_utils import matrix_logits_route
@@ -762,6 +765,54 @@ class ReverseLookupRouteTest(testing.TestCase):
         with kernels.policy("auto"):
             self.assertEqual(counts(layer, x, reverse=True), {"reference": 1})
             self.assertAllEqual(layer(x, reverse=True), expected)
+
+    def test_rows_of_this_platform(self):
+        """Under `"auto"`, each reverse lookup row of this backend and
+        device runs its first route that this process has in its tested
+        version range, for a tied and an untied table, and the logits
+        equal a direct call of the route (G8). With no such route, the
+        reference path runs. The table passes the shape gates of every
+        route: `D = V = 256` and groups of 128."""
+        platform_key = row_key("float32", "1-16")[:2]
+        rows = {
+            key: routes
+            for key, routes in kernels._MEASURED_LOGITS_ROWS.items()
+            if key[:2] == platform_key
+        }
+        if not rows:
+            self.skipTest("No measured row has this platform.")
+        policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
+        rng = np.random.default_rng(0)
+        for ((_, _, dtype, bucket), routes), tie_weights in itertools.product(
+            rows.items(), (True, False)
+        ):
+            with self.subTest(dtype=dtype, bucket=bucket, tied=tie_weights):
+                layer = layers.ReversibleEmbedding(
+                    256,
+                    256,
+                    tie_weights=tie_weights,
+                    dtype=policy.get(dtype, dtype),
+                )
+                layer.build()
+                layer._embeddings.assign(rng.normal(size=(256, 256)))
+                if not tie_weights:
+                    layer.reverse_embeddings.assign(rng.normal(size=(256, 256)))
+                config = Int4QuantizationConfig(block_size=128)
+                layer.quantize("int4", config=config)
+                x = _random((BUCKET_ROWS[bucket], 256), 1)
+                expected = first_tested_route(routes, kernels._LOGITS_ROUTES)
+                # Only `"auto"` reads the measured rows.
+                with kernels.policy("auto"):
+                    selected = counts(layer, x, reverse=True)
+                    self.assertEqual(selected, {expected: 1})
+                    logits = layer(x, reverse=True)
+                    if expected != "reference":
+                        called = direct_logits(layer, x)
+                        self.assertAllEqual(_bits(logits), _bits(called))
+                if expected == "reference":
+                    with kernels.policy("off"):
+                        expected_logits = layer(x, reverse=True)
+                    self.assertAllEqual(_bits(logits), _bits(expected_logits))
 
     @pytest.mark.skipif(
         backend.backend() != "numpy",

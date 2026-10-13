@@ -69,6 +69,8 @@ from keras.src.utils.module_utils import torch_xla
 if backend.backend() == "jax":
     import jax
 
+    from keras.src.backend.jax.ops import quantized as jax_quantized
+
     if is_nnx_enabled():
         from flax import nnx
 elif backend.backend() == "tensorflow":
@@ -1297,13 +1299,33 @@ class MeasuredRowsTest(testing.TestCase):
         """Each row of both measured tables has a backend, a device class of
         `_device_class`, a compute dtype and an M bucket. Its routes serve
         that backend, device class and compute dtype, so
-        a row cannot name a cell that its routes refuse."""
+        a row cannot name a cell that its routes refuse. The device classes
+        of each kernel are written out here: a backend registers only its
+        own kernels, and a kernel's device check also reads its library."""
         buckets = M_BUCKET_NAMES
+        mosaic_gpu = {"cuda-sm80", "cuda-sm86", "cuda-sm89", "cuda-sm90"}
+        # Kernel -> (its backend, whether it serves a device class).
+        kernel_classes = {
+            "triton": (
+                "torch",
+                lambda c: c.startswith("cuda-sm") and int(c[7:]) >= 80,
+            ),
+            "mosaic_gpu": ("jax", lambda c: c in mosaic_gpu),
+        }
         backends = ("jax", "numpy", "tensorflow", "torch")
         device_classes = r"^(cuda-sm\d+|tpu-.+|mps|cpu-.+|gpu)$"
+        # The reverse lookup has kernel routes only.
         tables = (
-            (kernels._MEASURED_ROWS, kernels._ROUTES, ("sum_then_scale",)),
-            (kernels._MEASURED_LOGITS_ROWS, kernels._LOGITS_ROUTES, ()),
+            (
+                kernels._MEASURED_ROWS,
+                kernels._ROUTES,
+                ("sum_then_scale", *kernel_classes),
+            ),
+            (
+                kernels._MEASURED_LOGITS_ROWS,
+                kernels._LOGITS_ROUTES,
+                kernel_classes,
+            ),
         )
         for measured_rows, sources, names in tables:
             for key, routes in measured_rows.items():
@@ -1315,8 +1337,14 @@ class MeasuredRowsTest(testing.TestCase):
                 self.assertNotEqual(len(routes), 0, key)
                 for name in routes:
                     self.assertIn(name, names, key)
-                    source = sources[name]
-                    if source.dtypes:
+                    if name in kernel_classes:
+                        owner, serves = kernel_classes[name]
+                        self.assertEqual(backend_name, owner, key)
+                        self.assertTrue(serves(device_class), key)
+                    # A source that this process does not register (Triton
+                    # off torch) has no dtypes to read.
+                    source = sources.get(name)
+                    if source is not None and source.dtypes:
                         self.assertIn(dtype, source.dtypes, key)
 
     def test_rows_of_this_platform(self):
@@ -1350,6 +1378,34 @@ class MeasuredRowsTest(testing.TestCase):
                 if expected == "reference":
                     with kernels.policy("off"):
                         self.assertAllEqual(y, _numpy(layer(x)))
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="The Mosaic GPU kernels need JAX."
+    )
+    def test_kernel_tests_run_where_rows_are_measured(self):
+        """On a JAX host with measured rows, the Mosaic GPU kernel tests run.
+        `quantized_test.py` and `quantized_logits_test.py` skip without
+        `plgpu.mma`, which needs JAX 0.11.2 or newer, so Python 3.12 or
+        newer. On an older Python, this test skips and names it."""
+        platform_key = row_key("float32", "1-16")[:2]
+        tables = (kernels._MEASURED_ROWS, kernels._MEASURED_LOGITS_ROWS)
+        if not any(
+            key[:2] == platform_key for table in tables for key in table
+        ):
+            self.skipTest("No measured row has this platform.")
+        if jax_quantized.plgpu.available:
+            return
+        python = platform.python_version()
+        if sys.version_info < (3, 12):
+            self.skipTest(
+                f"JAX 0.11.2 and newer, which have `plgpu.mma`, need Python "
+                f"3.12 or newer. Installed: Python {python}."
+            )
+        self.fail(
+            f"The measured rows name {platform_key[1]!r}, but JAX "
+            f"{jax.__version__} has no `plgpu.mma`, so the Mosaic GPU kernel "
+            "tests skip. Install JAX 0.11.2 or newer."
+        )
 
 
 class PolicyTest(testing.TestCase):

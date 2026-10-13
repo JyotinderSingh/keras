@@ -694,7 +694,9 @@ def _mosaic_gpu_logits_available(device_class, m, d, v, group_size, dtype):
     return v % 128 == 0 and _mosaic_gpu_aligned(d, v, group_size)
 
 
-# The kernels of this backend.
+# The kernels of this backend. The measured rows of
+# `keras.src.quantizers.kernels` name their cells: compute capability 8.9
+# for the matmul, and 8.9 and 9.0 for the logits.
 KERNELS = (
     Kernel(
         name="mosaic_gpu",

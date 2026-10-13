@@ -80,10 +80,47 @@ _MEASURED_ROWS = {
     ("torch", "cpu-arm64", "bfloat16", "257+"): ("sum_then_scale",),
     # 8 vCPU x86_64, torch 2.14.1 eager, 2026-10-23.
     ("torch", "cpu-x86_64", "float32", "17-64"): ("sum_then_scale",),
+    # NVIDIA GeForce RTX 4090, torch 2.14.1 eager (Triton 3.8.0),
+    # 2026-10-23.
+    ("torch", "cuda-sm89", "bfloat16", "1-16"): ("triton",),
+    ("torch", "cuda-sm89", "bfloat16", "17-64"): ("triton",),
+    ("torch", "cuda-sm89", "bfloat16", "65-256"): ("triton",),
+    ("torch", "cuda-sm89", "bfloat16", "257+"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "1-16"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "17-64"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "65-256"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "257+"): ("triton",),
+    # NVIDIA H100 SXM, torch 2.14.1 eager (Triton 3.8.0), 2026-10-23.
+    ("torch", "cuda-sm90", "bfloat16", "1-16"): ("triton",),
+    ("torch", "cuda-sm90", "bfloat16", "17-64"): ("triton",),
+    ("torch", "cuda-sm90", "bfloat16", "65-256"): ("triton",),
+    ("torch", "cuda-sm90", "float16", "1-16"): ("triton",),
+    # NVIDIA GeForce RTX 4090, JAX 0.12.0 under `jit`, 2026-10-23.
+    ("jax", "cuda-sm89", "bfloat16", "17-64"): ("mosaic_gpu",),
+    ("jax", "cuda-sm89", "float16", "17-64"): ("mosaic_gpu",),
 }
 # The rows of the reverse lookup, as `_MEASURED_ROWS`. The compute dtype is
 # the reverse dtype of the layer, when it has one.
-_MEASURED_LOGITS_ROWS = {}
+_MEASURED_LOGITS_ROWS = {
+    # NVIDIA GeForce RTX 4090, torch 2.14.1 eager (Triton 3.8.0),
+    # 2026-10-23.
+    ("torch", "cuda-sm89", "bfloat16", "1-16"): ("triton",),
+    ("torch", "cuda-sm89", "bfloat16", "17-64"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "1-16"): ("triton",),
+    ("torch", "cuda-sm89", "float16", "17-64"): ("triton",),
+    # NVIDIA H100 SXM, torch 2.14.1 eager (Triton 3.8.0), 2026-10-23.
+    ("torch", "cuda-sm90", "bfloat16", "1-16"): ("triton",),
+    ("torch", "cuda-sm90", "bfloat16", "17-64"): ("triton",),
+    ("torch", "cuda-sm90", "float16", "1-16"): ("triton",),
+    ("torch", "cuda-sm90", "float16", "17-64"): ("triton",),
+    # NVIDIA GeForce RTX 4090, JAX 0.12.0 under `jit`, 2026-10-23.
+    ("jax", "cuda-sm89", "bfloat16", "1-16"): ("mosaic_gpu",),
+    ("jax", "cuda-sm89", "bfloat16", "17-64"): ("mosaic_gpu",),
+    ("jax", "cuda-sm89", "float16", "1-16"): ("mosaic_gpu",),
+    ("jax", "cuda-sm89", "float16", "17-64"): ("mosaic_gpu",),
+    # NVIDIA H100 SXM, JAX 0.12.0 under `jit`, 2026-10-23.
+    ("jax", "cuda-sm90", "bfloat16", "1-16"): ("mosaic_gpu",),
+}
 route_counts = collections.Counter()
 
 
