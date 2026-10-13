@@ -462,6 +462,17 @@ class Pointwise1D(ThirdPartyProjection):
         return PointwiseGeometry(self)
 
 
+class StandardProjection(ThirdPartyProjection):
+    """A third-party projection with the standard contraction. It declares
+    its geometry and its serialization spec, and nothing about groups."""
+
+    def float_kernel_shape(self, input_shape):
+        return (input_shape[-1], self.units)
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+
 class TokenTable(Layer):
     """A lookup layer written against the quantization protocol only.
 

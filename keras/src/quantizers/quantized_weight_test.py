@@ -21,6 +21,11 @@ from keras.src.quantizers.quantized_weight import TernaryTrits
 from keras.src.quantizers.quantized_weight import WeightScheme
 from keras.src.quantizers.quantized_weight import lay_out_scale
 
+if backend.backend() == "torch":
+    import torch
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_flatten
+
 DIVISOR = WeightScheme(code_range=(-127, 127), scale_form="divisor")
 MULTIPLIER = WeightScheme(code_range=(-127, 127), scale_form="multiplier")
 GROUPED = WeightScheme(
@@ -33,6 +38,7 @@ GROUPED = WeightScheme(
 
 def _grouped_view(**kwargs):
     # Two groups of two rows; group 1 has a non-zero zero point.
+    kwargs.setdefault("g_idx", np.array([0, 0, 1, 1], "float32"))
     return QuantizedWeight(
         codes=np.array([[1, 2], [3, 4], [5, 6], [7, 8]], "uint8"),
         scale=np.array([[1.0, 0.5], [2.0, 0.25]], "float32"),
@@ -41,7 +47,6 @@ def _grouped_view(**kwargs):
         shape=(4, 2),
         axis=0,
         zero_point=np.array([[0, 0], [1, 2]], "uint8"),
-        g_idx=np.array([0, 0, 1, 1], "float32"),
         **kwargs,
     )
 
@@ -130,11 +135,82 @@ class QuantizedWeightTest(testing.TestCase):
                 codes=codes,
                 scale=scale,
                 layout=NoPack(),
-                scheme=GROUPED,
+                scheme=DIVISOR,
                 shape=(4, 2),
-                axis=0,
-                zero_point=np.zeros((2,), "int8"),
+                scale_axes=(1,),
+                g_idx=np.zeros((4,), "float32"),
             )
+
+    def test_view_without_g_idx_reads_contiguous_groups(self):
+        """A grouped view with no `g_idx` puts position `i` in group
+        `i // group_size`: it equals the view whose `g_idx` holds these
+        groups, and it reads one tensor fewer."""
+        view = _grouped_view()
+        contiguous = _grouped_view(g_idx=None)
+        self.assertAllEqual(contiguous.group_index(), [0, 0, 1, 1])
+        self.assertDType(contiguous.group_index(), "int32")
+        self.assertAllEqual(view.group_index(), [0, 0, 1, 1])
+        self.assertEqual(len(contiguous.read_tensors()), 3)
+        self.assertAllEqual(
+            contiguous.dequantize("float32"), view.dequantize("float32")
+        )
+        weight = view.dequantize("float32")
+        self.assertAllEqual(
+            contiguous.code_image(weight), view.code_image(weight)
+        )
+        # A last group that is shorter: three rows in groups of two.
+        short = QuantizedWeight(
+            codes=np.array([[1, 2], [3, 4], [5, 6]], "uint8"),
+            scale=np.array([[1.0, 0.5], [2.0, 0.25]], "float32"),
+            layout=NoPack(),
+            scheme=GROUPED,
+            shape=(3, 2),
+            axis=0,
+            zero_point=np.array([[0, 0], [1, 2]], "uint8"),
+        )
+        self.assertAllEqual(short.group_index(), [0, 0, 1])
+        self.assertAllEqual(
+            short.dequantize("float32"), [[1.0, 1.0], [3.0, 2.0], [8.0, 1.0]]
+        )
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Records the torch dispatch."
+    )
+    def test_view_without_g_idx_copies_nothing_from_the_host(self):
+        """On a GPU or MPS device, `group_index()` and `dequantize` of a
+        grouped view with no `g_idx` make no tensor from host data and
+        no CPU tensor. On torch, a Python number that becomes a tensor is
+        a copy from the host on each call, and a CUDA graph capture
+        refuses it."""
+        if ops.convert_to_tensor(0).device.type == "cpu":
+            self.skipTest("The torch device is the CPU.")
+        view = _grouped_view(g_idx=None)
+        view = view.with_tensors(
+            [ops.convert_to_tensor(t) for t in view.read_tensors()]
+        )
+        found = []
+
+        class HostData(TorchDispatchMode):
+            def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+                outputs = func(*args, **(kwargs or {}))
+                tensors = tree_flatten((args, kwargs, outputs))[0]
+                on_cpu = any(
+                    isinstance(t, torch.Tensor) and t.device.type == "cpu"
+                    for t in tensors
+                )
+                # `lift_fresh` returns a tensor made from host data.
+                if on_cpu or func is torch.ops.aten.lift_fresh.default:
+                    found.append(str(func))
+                return outputs
+
+        with HostData():
+            index = view.group_index()
+            weight = view.dequantize("float32")
+        self.assertEqual(found, [])
+        self.assertAllEqual(index, [0, 0, 1, 1])
+        self.assertAllEqual(
+            weight, _grouped_view().dequantize("float32"), msg="dequantize"
+        )
 
     def test_ungrouped_view_lays_out_its_scale_by_scale_axes(self):
         # One encoding per scheme kind: `axis` belongs to grouped weights.

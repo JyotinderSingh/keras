@@ -185,10 +185,8 @@ class CalibrationStrategy(QuantizationStrategy):
         kernel_columns = self._get_pack_layout(bits, columns).packed_length(
             columns
         )
-        group_size = self.resolve_group_size(layer, config)
-        n_groups = view.batch * (
-            1 if group_size == -1 else math.ceil(view.rows / group_size)
-        )
+        group = self._group_rows(layer, config, view)
+        n_groups = view.batch * math.ceil(view.rows / group)
 
         # Stored as the view's `(batch * rows, columns)` matrix in `[in,
         # out]` orientation (the view's axis order, which may permute the
@@ -227,7 +225,35 @@ class CalibrationStrategy(QuantizationStrategy):
                     trainable=False,
                 ),
             )
-        layer.g_idx = add_group_index(layer, rows)
+        # Where the mode fixes the groups, the index starts as those groups,
+        # so a layer that no calibration has written saves and loads back.
+        contiguous = self._contiguous_groups(view, group)
+        layer.g_idx = add_group_index(
+            layer, rows, group if contiguous else None
+        )
+
+    # Whether a calibration can put the rows of a group out of order (GPTQ's
+    # activation order).
+    permutes_groups = False
+
+    def _group_rows(self, layer, config, view):
+        """The rows of one group of a problem: the group size, or every
+        row of the problem for a group size of `-1`."""
+        group_size = self.resolve_group_size(layer, config)
+        return view.rows if group_size == -1 else group_size
+
+    def _contiguous_groups(self, view, group):
+        """Whether stored row `k` is in group `k // group` by construction.
+
+        The stored rows stack `view.batch` problems, and the groups of each
+        problem are numbered after those of the problem before. So the
+        stack has these groups when there is one problem or when each
+        problem holds whole groups. A mode that permutes the groups has
+        them only when each problem is one group.
+        """
+        if view.batch > 1 and view.rows % group:
+            return False
+        return not self.permutes_groups or group >= view.rows
 
     # --- Calibration state ------------------------------------------------
 
@@ -357,21 +383,22 @@ class CalibrationStrategy(QuantizationStrategy):
     def quantized_weight(self, layer):
         geometry = self.require_geometry(layer)
         bits = self.resolve_weight_bits(layer, None)
-        group_size = self.resolve_group_size(layer, None)
         view = geometry.contraction_view()
+        group = self._group_rows(layer, None, view)
+        # Where the mode fixes the groups, row `k` is in group `k // group`,
+        # and the view does not read the stored `g_idx`.
+        contiguous = self._contiguous_groups(view, group)
         return QuantizedWeight(
             codes=layer.quantized_kernel,
             scale=layer.kernel_scale,
             zero_point=layer.kernel_zero,
-            g_idx=layer.g_idx,
+            g_idx=None if contiguous else layer.g_idx,
             layout=self._get_pack_layout(bits, view.columns),
             scheme=WeightScheme(
                 code_range=(0, 2**bits - 1),
                 scale_form="multiplier",
                 has_zero_point=True,
-                # `-1` means one group spanning every input row of a
-                # problem.
-                group_size=view.rows if group_size == -1 else group_size,
+                group_size=group,
             ),
             shape=geometry.weight_shape,
             axis=0,
@@ -404,6 +431,8 @@ class GPTQStrategy(CalibrationStrategy):
     config_cls = GPTQConfig
     policy_cls = GPTQDTypePolicy
     calibrator_cls = GPTQCalibrator
+    # The activation order permutes the rows of the groups.
+    permutes_groups = True
 
 
 class AWQStrategy(CalibrationStrategy):

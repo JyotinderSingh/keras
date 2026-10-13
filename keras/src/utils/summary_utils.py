@@ -515,6 +515,11 @@ def print_quantization_summary(model, verbose=True):
                 ):
                     if tensor is not None:
                         stored[id(tensor)] = tensor
+            # A view whose mode fixes its groups reads no `g_idx`, but the
+            # layer stores one.
+            g_idx = getattr(layer, "g_idx", None)
+            if g_idx is not None:
+                stored[id(g_idx)] = g_idx
             storage_bytes = sum(_weight_bytes(t) for t in stored.values())
             storage_dtype = standardize_dtype(quantized_weights[0].codes.dtype)
         elif keeps_float_weight:

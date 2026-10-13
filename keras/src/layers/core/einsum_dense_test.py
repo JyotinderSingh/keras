@@ -1045,13 +1045,18 @@ class EinsumDenseTest(testing.TestCase):
             self.assertAllClose(
                 reloaded_layer(ref_input), ref_output, atol=1e-7
             )
-            self.assertLen(reloaded_layer.weights, len(model.weights))
+            # The forward pass of a grouped int4 layer does not read its
+            # `g_idx`, so the serving function of the export does not
+            # capture it. The SavedModel still holds the variable, but the
+            # reloaded layer lists one weight fewer.
+            unread = int(getattr(model.layers[0], "g_idx", None) is not None)
+            self.assertLen(reloaded_layer.weights, len(model.weights) - unread)
             self.assertLen(
                 reloaded_layer.trainable_weights, len(model.trainable_weights)
             )
             self.assertLen(
                 reloaded_layer.non_trainable_weights,
-                len(model.non_trainable_weights),
+                len(model.non_trainable_weights) - unread,
             )
 
     @pytest.mark.requires_trainable_backend
