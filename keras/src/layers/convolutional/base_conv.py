@@ -328,7 +328,19 @@ class BaseConv(Layer):
         # Do nothing if the layer isn't yet built
         if not self.built:
             return
-        target_variables = [self.kernel]
+        kernel = self._kernel
+        if self.lora_enabled:
+            # The `kernel` property rounds to the compute dtype for the
+            # forward pass; the save keeps the variable dtype.
+            kernel = ops.cast(
+                ops.add(
+                    kernel,
+                    (self.lora_alpha / self.lora_rank)
+                    * ops.matmul(self.lora_kernel_a, self.lora_kernel_b),
+                ),
+                kernel.dtype,
+            )
+        target_variables = [kernel]
         if self.use_bias:
             target_variables.append(self.bias)
         for i, variable in enumerate(target_variables):
