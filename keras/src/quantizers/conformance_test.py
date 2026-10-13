@@ -2,8 +2,9 @@
 
 `SUPPORTED` is the written (mode, layer) table: a change to the support
 matrix is a change to this table. Every supported pair runs the same
-stages: the life cycle, LoRA, the dtype policy setter, the input
-gradient, the TF SavedModel export and `from_config` with `set_weights`.
+stages: the life cycle, the scale convention of the stored variables,
+LoRA, the dtype policy setter, the input gradient, the TF SavedModel
+export and `from_config` with `set_weights`.
 The reversible lookups also run the reverse call with a soft cap. The
 calibration modes refuse `quantize` on one layer, which stays float, and
 also run through `Model.quantize`. Every other pair is refused before
@@ -277,6 +278,84 @@ def _assert_round_trips(test, layer, x, y, name):
     test.assertAllClose(fresh(x), y)
 
 
+# The scale convention of each row: how the stored codes, scale and zero
+# point give the weight. float8 stores no codes.
+CONVENTIONS = {
+    "int8": "divisor",
+    "int8_weight_only": "divisor",
+    "int4_per_channel": "divisor",
+    "int4_grouped": "grouped",
+    "float8": None,
+    "ternary": "scalar",
+    "gptq": "grouped",
+    "awq": "grouped",
+}
+
+# `(scale_form, has_zero_point, grouped)` of the scheme of each convention.
+DECLARED_SCHEMES = {
+    "divisor": ("divisor", False, False),
+    "grouped": ("multiplier", True, True),
+    "scalar": ("multiplier", False, False),
+}
+
+# The range of the unpacked codes of each row that stores codes.
+CODE_RANGES = {
+    "int8": (-127, 127),
+    "int8_weight_only": (-127, 127),
+    "int4_per_channel": (-8, 7),
+    "int4_grouped": (-8, 7),
+    "ternary": (-1, 1),
+    "gptq": (0, 15),
+    "awq": (0, 15),
+}
+
+
+def _broadcast_scale(scale, scale_axes, shape):
+    """Reshapes a stored scale to broadcast against codes of `shape`."""
+    kept = [axis for axis in scale_axes if axis is not None]
+    # An axis of size one that runs along no axis of the codes goes.
+    sizes = [n for n, axis in zip(scale.shape, scale_axes) if axis is not None]
+    scale = np.transpose(scale.reshape(sizes), np.argsort(kept))
+    target = [1] * len(shape)
+    for axis in kept:
+        target[axis] = shape[axis]
+    return scale.reshape(target)
+
+
+def _documented_weight(view, convention):
+    """The weight that a view's stored tensors give under `convention`.
+
+    Computed in NumPy from the stored codes, scale, zero point, group
+    index and input scales, without the view's `dequantize`:
+
+    - `"divisor"`: `codes / scale`, the scale laid out by `scale_axes`.
+    - `"grouped"`: `(codes - zero_point) * scale`, the zero point and the
+      scale of each position's group (`g_idx`) along `axis`, divided by
+      `input_scales` when the view has them.
+    - `"scalar"`: `codes * scale`, one scalar scale.
+    """
+    codes = _numpy(view.layout.unpack(view.codes)).astype("float32")
+    scale = _numpy(view.scale).astype("float32")
+    if convention == "divisor":
+        weight = codes / _broadcast_scale(scale, view.scale_axes, codes.shape)
+    elif convention == "scalar":
+        weight = codes * scale
+    else:
+        groups = _numpy(view.g_idx).astype("int64")
+        zero_point = _numpy(view.zero_point).astype("float32")
+        weight = np.take(scale, groups, axis=view.axis) * (
+            codes - np.take(zero_point, groups, axis=view.axis)
+        )
+        if view.input_scales is not None:
+            shape = [1] * codes.ndim
+            shape[view.axis] = -1
+            weight = weight / _numpy(view.input_scales).reshape(shape)
+    if view.permutation is None:
+        return weight.reshape(view.shape)
+    permuted = [view.shape[axis] for axis in view.permutation]
+    return np.transpose(weight.reshape(permuted), np.argsort(view.permutation))
+
+
 @pytest.mark.skipif(
     testing.tensorflow_uses_gpu(), reason="Segfault on Tensorflow GPU"
 )
@@ -370,6 +449,74 @@ class QuantizationConformanceTest(testing.TestCase):
         self.assertAllClose(restored(x), y)
 
         _assert_round_trips(self, layer, x, y, name)
+
+    @parameterized.named_parameters(PAIRS)
+    def test_stored_variables_follow_the_scale_convention(
+        self, mode_name, kind
+    ):
+        case = MODES[mode_name]
+        convention = CONVENTIONS[mode_name]
+        weight_name = LAYERS[kind].weight_name
+        strategy = strategy_registry.get_strategy(case.mode)
+        layer = build_layer(kind)
+        float_weights = [_numpy(getattr(layer, f"_{weight_name}")).copy()]
+        if kind == "reversible_untied":
+            float_weights.append(_numpy(layer.reverse_embeddings).copy())
+        _quantize(layer, case, layer_inputs(kind, np.random.default_rng(0)))
+
+        views = strategy.quantized_weights(layer)
+        if convention is None:
+            # float8 keeps the float kernel and stores no codes.
+            self.assertEqual(views, ())
+            self.assertAllEqual(
+                getattr(layer, f"_{weight_name}"), float_weights[0]
+            )
+            return
+        for view, float_weight in zip(views, float_weights, strict=True):
+            # The view reads the layer's stored variables themselves.
+            for name in (
+                "codes",
+                "scale",
+                "zero_point",
+                "g_idx",
+                "input_scales",
+            ):
+                variable = getattr(view, name)
+                if variable is not None:
+                    self.assertTrue(
+                        any(variable is v for v in layer.weights), msg=name
+                    )
+            scheme = view.scheme
+            self.assertEqual(
+                (
+                    scheme.scale_form,
+                    scheme.has_zero_point,
+                    scheme.group_size is not None,
+                ),
+                DECLARED_SCHEMES[convention],
+            )
+            self.assertEqual(scheme.code_range, CODE_RANGES[mode_name])
+            codes = _numpy(view.layout.unpack(view.codes))
+            low, high = CODE_RANGES[mode_name]
+            self.assertGreaterEqual(codes.min(), low)
+            self.assertLessEqual(codes.max(), high)
+            if convention == "scalar":
+                self.assertEqual(tuple(view.scale.shape), ())
+            weight = _documented_weight(view, convention)
+            self.assertAllClose(
+                weight,
+                view.dequantize("float32"),
+                atol=1e-6,
+                rtol=1e-6,
+                tpu_atol=1e-3,
+                tpu_rtol=1e-3,
+            )
+            if case.max_error is not None:
+                # `max_error` bounds the output error; on these rows it
+                # also bounds the weight error (at most 0.12, for gptq).
+                self.assertLess(
+                    _relative_error(weight, float_weight), case.max_error
+                )
 
     @parameterized.named_parameters(PAIRS)
     def test_lora(self, mode_name, kind):
