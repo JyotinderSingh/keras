@@ -328,7 +328,8 @@ class BaseConv(Layer):
         # Do nothing if the layer isn't yet built
         if not self.built:
             return
-        target_variables = [self.kernel]
+        kernel, _, _ = self._get_weight_with_merged_lora("kernel")
+        target_variables = [kernel]
         if self.use_bias:
             target_variables.append(self.bias)
         for i, variable in enumerate(target_variables):

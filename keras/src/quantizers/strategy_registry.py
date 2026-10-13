@@ -179,6 +179,22 @@ class QuantizationStrategy:
         """
         self.require_geometry(layer)
 
+    def check_compute_dtype(self, compute_dtype):
+        """Raises `NotImplementedError` if this mode cannot use `compute_dtype`.
+
+        `Layer._check_quantize_args` calls it, so `Layer.quantize`,
+        `Model.quantize` and a layer on the released per-layer protocol
+        refuse before any layer changes, and `Model.quantize` skips a
+        refused layer and reports it. A quantized dtype policy calls it
+        too and raises the error as a `ValueError`. The default accepts
+        every compute dtype.
+
+        Args:
+            compute_dtype: The compute dtype of the layer or policy, such
+                as `"float16"`.
+        """
+        del compute_dtype
+
     # --- Mode math --------------------------------------------------------
 
     def build(self, layer, input_shape, config):
