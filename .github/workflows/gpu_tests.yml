@@ -99,6 +99,16 @@ jobs:
             --cov-config=pyproject.toml --splits 4 \
             --group ${{ matrix.shard }}
 
+      - name: Run the Triton and quantization tests under the "require" kernel policy
+        # One shard runs it: the step selects its own files.
+        if: ${{ matrix.backend == 'torch' && matrix.shard == 1 }}
+        run: |
+          pytest --kernel-policy=require \
+            keras/src/backend/torch/ops/quantized_matmul_test.py \
+            keras/src/quantizers \
+            keras/src/layers/core/dense_test.py \
+            keras/src/layers/core/einsum_dense_test.py
+
       - name: Convert Coverage
         run: coverage xml --omit='keras/src/applications/*,keras/api' -o core-coverage.xml
 
