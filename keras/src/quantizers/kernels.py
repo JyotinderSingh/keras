@@ -19,7 +19,8 @@ the policy and the library versions, and never a tensor value:
 4. The codes are 2-D and pack two 4-bit codes per byte along the
    columns. The scheme is grouped (a multiplier and a zero point), or
    per-channel (a divisor, no zero point and no activation quantizer).
-5. The route is available: its device and shape checks pass, and under
+5. The route is available: its device and shape checks pass, it accepts
+   the configuration of the allow-list row for the call, and under
    `"auto"` its library version is in its tested range (`tested`).
 6. No Keras distribution is active, and no operand is a DTensor.
 7. The route supports the compute dtype. The inputs of a `matrix` route
@@ -120,7 +121,10 @@ class RouteSource:
     and returns the shapes of the layer. `dtypes` holds the compute dtypes
     that the source supports (gate 7, empty for every dtype), and
     `available(m, k, n, quantized_weight)` its device and shape checks
-    (gate 5). `version()` returns the installed library version, or the
+    (gate 5). `accepts(m, quantized_weight, config)` refuses the
+    configuration of an allow-list row for a call that the kernel cannot
+    run with it (gate 5): one row serves every shape of its M bucket.
+    `version()` returns the installed library version, or the
     `(jax, jaxlib)` pair, and `tested_versions` holds the release
     prefixes of the tested range. A source with `contiguous_groups`
     reads the group of row `k` as `k // G`, so `run_route` guards it.
@@ -130,6 +134,7 @@ class RouteSource:
     matrix: bool = True
     dtypes: tuple = ()
     available: object = None
+    accepts: object = None
     version: object = None
     tested_versions: tuple = ()
     contiguous_groups: bool = False
@@ -337,15 +342,19 @@ def _select(layer, geometry, view, inputs):
             source.matrix and standardize_dtype(inputs.dtype) != dtype
         ):
             continue
-        if _available(source, m, rows, math.prod(columns), view):
+        if _available(source, m, rows, math.prod(columns), view, config):
             return Route(name, source, config, rows, contracted, columns)
     return None
 
 
-def _available(source, m, k, n, view):
-    """Gate 5: the device and shape checks, and the tested version range."""
+def _available(source, m, k, n, view, config):
+    """Gate 5: the device and shape checks, the configuration of the
+    allow-list row (`None` without one), and the tested version range."""
     if source.available is not None and not source.available(m, k, n, view):
         return False
+    if config is not None and source.accepts is not None:
+        if not source.accepts(m, view, config):
+            return False
     if _state.route or _state.policy == "require" or source.version is None:
         return True
     return tested(source.version(), source.tested_versions)
@@ -651,7 +660,7 @@ def _select_lookup(layer, table, orientation, inputs):
         source = _LOOKUP_ROUTES.get(name)
         if source is None or (source.dtypes and dtype not in source.dtypes):
             continue  # No reverse lookup in the route, or gate 7.
-        if _available(source, m, d, v, table):
+        if _available(source, m, d, v, table, config):
             return Route(name, source, config, d, 1, (v,))
     return None
 
@@ -906,10 +915,11 @@ def mosaic_gpu_lowering(compute_capability):
     The wrap raises `ValueError` for such a block. It changes nothing
     else.
 
-    The pipeline reads the capability when `mosaic_gpu_w4a16_matmul`
-    traces, and the function keeps its traces. So the helper clears them
-    on entry and on exit: a trace for another capability does not serve
-    the block, and a trace of the block does not serve a later call.
+    The pipeline reads the capability when `mosaic_gpu_w4a16_matmul` or
+    `mosaic_gpu_w4a16_logits` traces, and the functions keep their
+    traces. So the helper clears them on entry and on exit: a trace for
+    another capability does not serve the block, and a trace of the block
+    does not serve a later call.
 
     Raises `NotImplementedError` when JAX has no `plgpu.mma`, or when a
     private name moved.
@@ -941,15 +951,21 @@ def mosaic_gpu_lowering(compute_capability):
             self, src_ref=src_ref, gmem_slice=gmem_slice, **kwargs
         )
 
-    kernel = backend.ops.quantized.mosaic_gpu_w4a16_matmul
-    kernel.clear_cache()
+    quantized = backend.ops.quantized
+    traced = (
+        quantized.mosaic_gpu_w4a16_matmul,
+        quantized.mosaic_gpu_w4a16_logits,
+    )
+    for function in traced:
+        function.clear_cache()
     utils._infer_arch = lambda: arch
     context.async_copy = checked_copy
     try:
         yield
     finally:
         utils._infer_arch, context.async_copy = infer_arch, async_copy
-        kernel.clear_cache()
+        for function in traced:
+            function.clear_cache()
 
 
 def _block_shape(shape, gmem_slice):
@@ -973,3 +989,88 @@ def _contiguous_block(shape, gmem_slice):
             return False
         longer = longer or length != 1
     return True
+
+
+# Mosaic GPU K-packed (JAX, NVIDIA): `mosaic_gpu_w4a16_logits` of the JAX
+# backend's `ops.quantized`, the reverse lookup routes `"mosaic_gpu"` and
+# `"mosaic_gpu_interpret"`. They have the device gate, the version range
+# and the dtypes of Mosaic GPU K1. The groups of a table are `d // G` by
+# construction, so they need no guard.
+def _mosaic_gpu_logits(
+    layer, table, orientation, inputs, config, interpret=False
+):
+    """Mosaic GPU K-packed: the `(M, D)` inputs against the stored table.
+
+    With no configuration in the allow-list row, the row of
+    `MOSAIC_GPU_LOGITS_CONFIGS` for the device gives it. Interpret mode
+    runs on CPU and takes the rows of compute capability 8.9.
+    """
+    quantized = backend.ops.quantized
+    m, d = inputs.shape
+    if config is None:
+        if interpret:
+            capability = "8.9"
+        else:
+            capability = jax.devices()[0].compute_capability
+        dtype = layer.reverse_dtype or layer.compute_dtype
+        key = (capability, dtype, _m_bucket(m))
+        config = quantized.MOSAIC_GPU_LOGITS_CONFIGS[key]
+    grouped = table.zero_point is not None
+    return quantized.mosaic_gpu_w4a16_logits(
+        inputs,
+        table.codes,
+        table.scale,
+        table.zero_point,
+        group_size=min(table.scheme.group_size, d) if grouped else None,
+        per_channel=not grouped,
+        orientation=orientation,
+        config=config,
+        interpret=interpret,
+    )
+
+
+def _mosaic_gpu_logits_available(m, d, v, table, interpret=False):
+    """Gate 5 of Mosaic GPU K-packed: blocks of 128 columns of `V`, then
+    gate 5 of K1 for `K = D` and `N = V`.
+
+    The shape check comes before the device gate, as for the Triton
+    logits. So under `"require"`, a `V` that 128 does not divide takes the
+    reference path on each device.
+    """
+    if v % 128:
+        return False
+    if interpret:
+        return _mosaic_gpu_interpret_available(m, d, v, table)
+    return _mosaic_gpu_available(m, d, v, table)
+
+
+def _mosaic_gpu_logits_accepts(m, table, config):
+    """The configuration check of Mosaic GPU K-packed: a tied table with
+    more than 16 rows needs `BM` 32 or 64.
+
+    On JAX 0.12.0, a block of 16 columns of the transposed activations
+    `(D, Mp)` fails the GMEM transfer plan of Mosaic GPU when `Mp > 16`.
+    One allow-list row serves both orientations. So the check refuses the
+    tied call, which takes the reference path, and keeps the untied one.
+    A tied table packs its codes along axis 1.
+    """
+    tied = table.layout.axis % 2 == 1
+    return not (tied and config[0] == 16 and m > 16)
+
+
+_LOOKUP_ROUTES["mosaic_gpu"] = RouteSource(
+    _mosaic_gpu_logits,
+    dtypes=("bfloat16", "float16"),
+    accepts=_mosaic_gpu_logits_accepts,
+    available=_mosaic_gpu_logits_available,
+    version=lambda: backend.ops.quantized.mosaic_gpu_versions(),
+    tested_versions=MOSAIC_GPU_TESTED_JAX,
+)
+# Test helper, through `force_route` only: Mosaic GPU K-packed in GPU
+# interpret mode on CPU.
+_LOOKUP_ROUTES["mosaic_gpu_interpret"] = RouteSource(
+    functools.partial(_mosaic_gpu_logits, interpret=True),
+    dtypes=("bfloat16", "float16"),
+    accepts=_mosaic_gpu_logits_accepts,
+    available=functools.partial(_mosaic_gpu_logits_available, interpret=True),
+)
