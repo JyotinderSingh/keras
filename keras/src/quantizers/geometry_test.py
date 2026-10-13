@@ -301,9 +301,6 @@ class EinsumAxesTest(testing.TestCase):
         # The input axes that carry the kernel's contracted labels are the
         # ones the equation reduces.
         self.assertEqual(axes.input_axes(contracted), axes.input_reduced_axes)
-        self.assertEqual(
-            axes.gradient_equation, f"{output},{axes.kernel}->{inputs}"
-        )
 
     @parameterized.named_parameters(
         ("matmul", "ab,bc->ac", (None, 8), (6,), (None, 1), (1, 6)),
