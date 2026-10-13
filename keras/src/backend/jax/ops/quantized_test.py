@@ -164,6 +164,7 @@ def _oracle(layer, x):
         permutation=view.permutation,
         zero_point=read(view.zero_point),
         g_idx=read(view.g_idx),
+        group_size=view.scheme.group_size,
         input_scales=read(view.input_scales, scale=True),
         equation=getattr(layer, "equation", None),
         dtype=layer.compute_dtype,
@@ -548,6 +549,38 @@ class LoweringTest(testing.TestCase):
             text = exported.mlir_module()
             self.assertEqual("mosaic_gpu_v2" in text, lowered)
 
+    @parameterized.named_parameters(named_product(capability=CAPABILITIES))
+    def test_guard_only_where_g_idx_is_read(self, capability):
+        """Through a layer and the real route: int4 and AWQ in groups of
+        128 and GPTQ with one group fix their groups, so the module holds
+        the Mosaic GPU call and no guard (`stablehlo.case`) or reference
+        contraction. GPTQ in groups of 128 holds the guard, whose
+        reference branch contracts the dequantized weight."""
+        real = dataclasses.replace(
+            kernels._ROUTES["mosaic_gpu"],
+            available=kernels._ROUTES["mosaic_gpu_interpret"].available,
+            version=None,
+        )
+        key = (capability, "bfloat16", "1-16")
+        row = _row("bfloat16", 3, "real", quantized.MOSAIC_GPU_CONFIGS[key])
+        args = jax.ShapeDtypeStruct(CASES["dense"][2], "float32")
+        for mode, group, guarded in (
+            ("int4", 128, False),
+            ("awq", 128, False),
+            ("gptq", -1, False),
+            ("gptq", 128, True),
+        ):
+            layer = _layer(CASES["dense"], mode, group)
+            with _routes(row, real=real):
+                # A new function each time: a traced one keeps its route.
+                call = jax.jit(lambda v: layer(v))
+                with kernels.mosaic_gpu_lowering(capability):
+                    exported = jax.export.export(call, platforms=["cuda"])(args)
+            text = exported.mlir_module()
+            self.assertIn("mosaic_gpu_v2", text, mode)
+            self.assertEqual(text.count("stablehlo.case"), guarded, mode)
+            self.assertEqual("stablehlo.dot_general" in text, guarded, mode)
+
     @parameterized.named_parameters(named_product(capability=["8.9", "9.0"]))
     def test_copy_check_refuses_a_block_that_is_not_contiguous(
         self, capability
@@ -653,13 +686,15 @@ class InterpretTest(testing.TestCase):
     )
     def test_group_shapes(self, mode, group, k):
         """One group of `K` rows (`group_size=-1`), and `G = 256` with
-        `K = 1152`, whose last group has 128 rows. The groups are
-        contiguous, so the guard runs the kernel. The layer output equals
-        a direct call of the route (G8), and G1, G2 and G4 pass."""
+        `K = 1152`, whose last group has 128 rows. The mode fixes the
+        groups, so the view reads no `g_idx` and the route runs with no
+        guard. The layer output equals a direct call of the route (G8),
+        and G1, G2 and G4 pass."""
         layer = _layer((None, 512, (1, k)), mode, group)
         view = layer._quantized_weight()
+        self.assertIsNone(view.g_idx)
         group = min(view.scheme.group_size, k)
-        g_idx = ops.convert_to_numpy(view.g_idx)
+        g_idx = ops.convert_to_numpy(layer.g_idx)
         self.assertAllEqual(g_idx, np.arange(k) // group)
         for m in (3, 17):
             x = _random((m, k), seed=m)
@@ -727,7 +762,7 @@ class InterpretTest(testing.TestCase):
         view = layer._quantized_weight()
         with AutocastScope(layer.compute_dtype):
             view = view.with_tensors(view.read_tensors())
-        grouped = view.g_idx is not None
+        grouped = view.scheme.group_size is not None
         args = (
             ops.cast(_random((3, 1024)), layer.compute_dtype),
             view.codes,
