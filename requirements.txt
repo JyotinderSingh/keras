@@ -8,6 +8,9 @@ ai-edge-litert
 # Torch.
 --extra-index-url https://download.pytorch.org/whl/cpu
 torch
+# The Triton that torch 2.14 declares on PyPI, for the Triton interpreter
+# tests (the CPU wheel declares none). Bump with torch.
+triton~=3.8.0; platform_system == "Linux" and python_version < "3.15"
 torch-xla;sys_platform != 'darwin'
 
 # Jax.

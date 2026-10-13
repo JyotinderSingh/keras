@@ -1,18 +1,20 @@
 """Route selection for a 4-bit weight-only contraction (`kernels.py`).
 
-The library has one route in `keras.ops`, `"sum_then_scale"`. The tests
-also run the reference path as a route
-(`force_route("reference_wrapped")`) and the `"matrix"` route, which
-contracts the `(M, K)` inputs with the stored matrix, both from
-`kernels_test_utils`. The route suites run each kernel route of the
-process through real layers. The labels G1 to G8 are those of
-`kernels_test_utils`.
+The library has one route in `keras.ops`, `"sum_then_scale"`, and the
+kernel routes of the backend. The tests also run the reference path as a
+route (`force_route("reference_wrapped")`), the `"matrix"` route, which
+contracts the `(M, K)` inputs with the stored matrix, and the interpret
+routes of the kernels on a CPU host, all from `kernels_test_utils`. The
+route suites run each kernel route of the process through real layers.
+The backend test files test the kernels as ops. The labels G1 to G8 are
+those of `kernels_test_utils`.
 """
 
 import dataclasses
 import math
 import os
 import platform
+import re
 import subprocess
 import sys
 import threading
@@ -46,6 +48,7 @@ from keras.src.quantizers.kernels_test_utils import device_type
 from keras.src.quantizers.kernels_test_utils import direct
 from keras.src.quantizers.kernels_test_utils import first_tested_route
 from keras.src.quantizers.kernels_test_utils import floor_and_bound
+from keras.src.quantizers.kernels_test_utils import kernel_routes
 from keras.src.quantizers.kernels_test_utils import matrix_route
 from keras.src.quantizers.kernels_test_utils import route_tables
 from keras.src.quantizers.kernels_test_utils import row_key
@@ -72,6 +75,7 @@ elif backend.backend() == "tensorflow":
     import tensorflow as tf
 elif backend.backend() == "torch":
     import torch
+    from torch._dynamo.testing import CompileCounter
     from torch.utils._python_dispatch import TorchDispatchMode
 
 # name -> (equation, or `None` for `Dense`; output shape or units; inputs).
@@ -452,6 +456,31 @@ class RouteSuiteTest(testing.TestCase):
                     # `ops.cond` traces both branches.
                     y = jax.jit(lambda v: layer(v))(x)
                     self.assertAllEqual(_numpy(y), expected)
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Compiles with `torch.compile`."
+    )
+    def test_torch_compiled_kernel_is_one_graph(self):
+        """Under `torch.compile`, a float32 layer through each kernel route
+        is one graph: the frontend reads the float32 precision as a
+        constant and adds no graph break."""
+        layer = _layer(ROUTABLE["dense_ragged"], 32, bias=True)
+        x = ops.convert_to_tensor(_random(ROUTABLE["dense_ragged"][2]))
+        calls = [
+            (name, lambda v: layer(v), x)
+            for name in kernel_routes(kernels._ROUTES)
+            if name in admitted(layer, x)
+        ]
+        if not calls:
+            self.skipTest("No kernel route of this process runs here.")
+        for name, call, inputs in calls:
+            counter = CompileCounter()
+            torch._dynamo.reset()
+            with kernels.force_route(name):
+                y = torch.compile(call, backend=counter)(inputs)
+                expected = call(inputs)
+            self.assertEqual(counter.frame_count, 1, name)
+            self.assertAllEqual(_numpy(y), _numpy(expected))
 
 
 class SumThenScaleTest(testing.TestCase):
@@ -1207,6 +1236,48 @@ class MeasuredRowsTest(testing.TestCase):
         cpu = f"cpu-{platform.machine()}"
         self.assertEqual(kernels._device_class(), cpu)
 
+    @parameterized.named_parameters(("matmul", False), ("logits", True))
+    def test_device_check(self, reverse):
+        """On a device that a kernel does not support, a measured row of
+        its route runs the reference path. On a device that no kernel
+        supports, `"require"` raises and names the requirements of each
+        kernel."""
+        routes = kernels._LOGITS_ROUTES if reverse else kernels._ROUTES
+        device_class = kernels._device_class()
+        refused = [
+            name
+            for name, route in routes.items()
+            if route.kernel is not None
+            and not route.kernel.supports_device(device_class)
+        ]
+        if not refused:
+            self.skipTest("No kernel of this process refuses the device.")
+        if reverse:
+            layer = layers.ReversibleEmbedding(
+                256, 256, tie_weights=True, dtype="mixed_bfloat16"
+            )
+            layer.build()
+            layer.quantize(
+                "int4", config=Int4QuantizationConfig(block_size=128)
+            )
+        else:
+            layer = _layer(ROUTABLE["dense_aligned"], 128, "mixed_bfloat16")
+        x = _random((3, 256))
+        call_kwargs = {"reverse": True} if reverse else {}
+        for name in refused:
+            key = "logits_rows" if reverse else "rows"
+            rows = {key: {row_key("bfloat16", "1-16"): (name,)}}
+            with route_tables(**rows):
+                selected = counts(layer, x, **call_kwargs)
+            self.assertEqual(selected, {"reference": 1})
+        if kernels._required(kernels._ROUTES, device_class):
+            return
+        for name in refused:
+            requirements = re.escape(routes[name].kernel.requirements)
+            with self.assertRaisesRegex(ValueError, requirements):
+                with kernels.policy("require"):
+                    pass
+
     def test_rows_can_pass_their_gates(self):
         """Each row of both measured tables has a backend, a device class of
         `_device_class`, a compute dtype and an M bucket. Its routes serve
@@ -1368,7 +1439,9 @@ class PolicyTest(testing.TestCase):
         self.assertEqual(self.state(), self.initial)
 
     def test_require_raises_without_a_kernel(self):
-        """The test takes this backend's kernels out of the route table."""
+        """The test takes this backend's kernels out of the route table,
+        because a GPU host can have one: the Triton kernels on a CUDA host
+        with Triton (torch)."""
         with route_tables(required=()):
             with self.assertRaisesRegex(ValueError, "needs a platform with"):
                 with kernels.policy("require"):

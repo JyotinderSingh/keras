@@ -7,6 +7,9 @@ Importing this module registers test routes in both route tables:
   call takes the path of a selected route (the selection, the count and,
   for the reverse lookup, the custom gradient), so its outputs must equal
   those of the reference path bit for bit.
+- The interpret route of the torch backend under the Triton
+  interpreter, `"triton_interpret"`. It runs the kernel of the backend on
+  a CPU host and has no `kernel`, so `"require"` does not run it.
 
 `route_tables` adds the `"matrix"` routes, which contract the `(M, K)`
 inputs with the stored matrix.
@@ -34,6 +37,17 @@ from keras.src import ops
 from keras.src.backend.common import AutocastScope
 from keras.src.quantizers import kernels
 from keras.src.quantizers import strategy_registry
+
+if backend.backend() == "torch":
+    from keras.src.backend.torch.ops import quantized_test_utils
+else:
+    quantized_test_utils = None
+
+# Whether the kernels run under the Triton interpreter, which rounds
+# float32 to bfloat16 toward zero: up to one bfloat16 ulp of the output.
+INTERPRETED = (
+    backend.backend() == "torch" and quantized_test_utils.quantized.INTERPRETED
+)
 
 
 def _reference_logits(layer, geometry, table, inputs):
@@ -86,6 +100,11 @@ kernels._ROUTES["reference_wrapped"] = kernels.Route(
 kernels._LOGITS_ROUTES["reference_wrapped"] = kernels.Route(
     _reference_logits, matrix=False
 )
+# Interpret route name -> the name of the kernel route that it stands in
+# for.
+INTERPRET_ROUTES = {}
+if quantized_test_utils is not None:
+    INTERPRET_ROUTES = quantized_test_utils.register_interpret_routes()
 
 
 @contextlib.contextmanager
@@ -177,7 +196,7 @@ def floor_and_bound(dtype):
         return 1e-6, 1e-5
     if dtype == "float16":
         return 2e-4, 2**-9
-    return 1e-3, 2**-7
+    return 2**-7 if INTERPRETED else 1e-3, 2**-7
 
 
 def lookup_table(layer):
@@ -193,7 +212,8 @@ def admitted(layer, x, reverse=False):
     """The routes that `force_route` runs for a call of `layer` on `x`.
 
     They are the routes of the table whose dtypes, device check and shape
-    check pass.
+    check pass. An interpret route stands in for its kernel only on a
+    device that the kernel does not support.
     """
     if reverse:
         routes, view = kernels._LOGITS_ROUTES, lookup_table(layer)
@@ -208,8 +228,11 @@ def admitted(layer, x, reverse=False):
     shape = tuple(x.shape)
     m = math.prod(shape[: len(shape) - contracted])
     device_class = kernels._device_class()
+    kernels_that_run = kernels._required(routes, device_class)
     names = []
     for name, route in routes.items():
+        if INTERPRET_ROUTES.get(name) in kernels_that_run:
+            continue
         if route.dtypes and dtype not in route.dtypes:
             continue
         if route.available is None or route.available(
@@ -217,6 +240,16 @@ def admitted(layer, x, reverse=False):
         ):
             names.append(name)
     return names
+
+
+def kernel_routes(routes):
+    """The routes of `routes` that run a backend kernel: the routes of the
+    platform's kernels and the interpret routes."""
+    return [
+        name
+        for name, route in routes.items()
+        if route.kernel is not None or name in INTERPRET_ROUTES
+    ]
 
 
 def direct(layer, x):
