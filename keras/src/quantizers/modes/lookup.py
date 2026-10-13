@@ -141,7 +141,8 @@ class LookupHandlers:
             codes=layer._embeddings,
             scale=layer.embeddings_scale,
             zero_point=layer.embeddings_zero,
-            g_idx=layer.g_idx,
+            # The groups run along `output_dim`: column `d` is in group
+            # `d // G`, so the view takes no `g_idx`.
             layout=self._get_lookup_layout(-1, layer.output_dim),
             scheme=self._get_lookup_scheme(layer, layer.quantization_config),
             shape=(layer.input_dim, layer.output_dim),
@@ -171,7 +172,8 @@ class LookupHandlers:
             codes=codes,
             scale=scale,
             zero_point=zero_point,
-            g_idx=layer.g_idx,
+            # The groups run along `output_dim`: row `d` is in group
+            # `d // G`, so the view takes no `g_idx`.
             layout=self._get_lookup_layout(0, layer.output_dim),
             scheme=self._get_lookup_scheme(layer, layer.quantization_config),
             shape=(layer.output_dim, layer.input_dim),
