@@ -136,7 +136,7 @@ class Int8Strategy(GeometryDispatchStrategy):
             layer, geometry, layer._kernel, config
         )
         del layer._kernel
-        layer.quantized_build(kernel_shape, "int8", config)
+        layer.quantized_build(kernel_shape, self.name, config)
         layer._kernel.assign(kernel_value)
         layer.kernel_scale.assign(kernel_scale)
 
@@ -257,7 +257,7 @@ class Int8Strategy(GeometryDispatchStrategy):
                 self, layer, geometry, config
             )
             del layer.reverse_embeddings
-        layer.quantized_build(embeddings_shape, "int8", config)
+        layer.quantized_build(embeddings_shape, self.name, config)
         layer._embeddings.assign(embeddings_value)
         layer.embeddings_scale.assign(embeddings_scale)
         if untied:

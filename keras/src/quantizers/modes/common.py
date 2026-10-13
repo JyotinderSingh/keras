@@ -27,13 +27,12 @@ class GeometryDispatchStrategy(QuantizationStrategy):
     - `_get_reverse_<family>_quantized_weight`, for a reversible family
       whose layer is untied and has a view: the reverse table's view.
 
-    A mode implements every handler of a family it supports.
-    `check_quantizable` resolves the quantize, build, call and view
-    handlers before `Layer.quantize` changes the layer, so a mode missing
-    one of them is refused with `NotImplementedError` and the layer stays
-    as it was. A missing encode or reverse view handler raises only when
-    its verb runs. A subclass that overrides a verb itself needs no
-    handlers for it.
+    A mode implements every handler of each family it lists in
+    `geometry_families`. `register_quantization_strategy` refuses a mode
+    that lacks a build, call, quantize or view handler, the reverse view
+    handler of a reversible family, or, when it supports LoRA and keeps
+    the default `merge_lora_delta`, an encode handler. A subclass that
+    overrides a verb itself needs no handler for it.
     """
 
     # The handler that each verb calls, by geometry family.
@@ -45,6 +44,37 @@ class GeometryDispatchStrategy(QuantizationStrategy):
         "quantized_weight": "_get_{family}_quantized_weight",
         "reverse_quantized_weight": "_get_reverse_{family}_quantized_weight",
     }
+
+    # The families with a reversible geometry (`ReversibleLookupGeometry`),
+    # whose untied layer holds a second table with its own view.
+    _reversible_families = ("lookup",)
+
+    def _get_missing_definitions(self):
+        missing = super()._get_missing_definitions()
+        verbs = ("build", "call", "quantize", "quantized_weight", "encode")
+        for verb in verbs + ("reverse_quantized_weight",):
+            if verb == "encode" and (
+                not self.supports_lora
+                or type(self).merge_lora_delta
+                is not QuantizationStrategy.merge_lora_delta
+            ):
+                continue
+            # A subclass that overrides the verb itself needs no handler.
+            method = "quantized_weights" if verb.startswith("reverse") else verb
+            if getattr(type(self), method) is not getattr(
+                GeometryDispatchStrategy, method
+            ):
+                continue
+            for family in self.geometry_families:
+                if (
+                    verb.startswith("reverse")
+                    and family not in self._reversible_families
+                ):
+                    continue
+                handler = self._handler_names[verb].format(family=family)
+                if getattr(self, handler, None) is None:
+                    missing.append(handler)
+        return missing
 
     def build(self, layer, input_shape, config):
         geometry = self.require_geometry(layer)
@@ -60,15 +90,6 @@ class GeometryDispatchStrategy(QuantizationStrategy):
         geometry = self.require_geometry(layer)
         handler = self._handler("quantize", geometry.family, layer)
         handler(layer, geometry, config)
-
-    def check_quantizable(self, layer):
-        geometry = self.require_geometry(layer)
-        for verb in ("quantize", "build", "call", "quantized_weight"):
-            # A subclass that overrides the verb itself needs no handler.
-            if getattr(type(self), verb) is getattr(
-                GeometryDispatchStrategy, verb
-            ):
-                self._handler(verb, geometry.family, layer)
 
     def encode(self, layer, weight, config=None):
         geometry = self.require_geometry(layer)

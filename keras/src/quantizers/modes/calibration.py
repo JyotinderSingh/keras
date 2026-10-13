@@ -46,7 +46,6 @@ class CalibrationStrategy(QuantizationStrategy):
     """A post-training strategy whose values arrive from a calibration pass."""
 
     geometry_families = ("projection",)
-    requires_config = True
     # The mode's dedicated dtype policy class.
     policy_cls = None
 
@@ -59,6 +58,15 @@ class CalibrationStrategy(QuantizationStrategy):
             f"`model.quantize('{self.name}', config=...)` with a "
             "quantization layer structure that covers the layer."
         )
+
+    def _get_missing_definitions(self):
+        missing = super()._get_missing_definitions()
+        missing += [
+            name
+            for name in ("policy_cls", "calibrator_cls")
+            if getattr(self, name) is None
+        ]
+        return missing
 
     def check_quantizable(self, layer):
         super().check_quantizable(layer)
@@ -82,11 +90,20 @@ class CalibrationStrategy(QuantizationStrategy):
             "instead."
         )
 
-    def _missing_config_error(self):
-        return (
+    def default_config(self):
+        # The calibration dataset comes only from an explicit config.
+        raise ValueError(
             f"For {self.name.upper()}, the `config` argument must be of "
             f"type `{self.config_cls.__name__}`."
         )
+
+    def validate_config(self, config):
+        if not isinstance(config, self.config_cls):
+            raise ValueError(
+                f"Mode '{self.name}' requires a valid `config` argument "
+                f"of type `{self.config_cls.__name__}`. "
+                f"Received: {type(config)}"
+            )
 
     def policy_suffix(self, layer, config):
         del layer
