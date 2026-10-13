@@ -9,7 +9,13 @@ from keras.src.backend.config import (
     disable_flash_attention as disable_flash_attention,
 )
 from keras.src.backend.config import (
+    disable_quantized_kernels as disable_quantized_kernels,
+)
+from keras.src.backend.config import (
     enable_flash_attention as enable_flash_attention,
+)
+from keras.src.backend.config import (
+    enable_quantized_kernels as enable_quantized_kernels,
 )
 from keras.src.backend.config import epsilon as epsilon
 from keras.src.backend.config import floatx as floatx
@@ -18,6 +24,9 @@ from keras.src.backend.config import (
     is_flash_attention_enabled as is_flash_attention_enabled,
 )
 from keras.src.backend.config import is_nnx_enabled as is_nnx_enabled
+from keras.src.backend.config import (
+    is_quantized_kernels_enabled as is_quantized_kernels_enabled,
+)
 from keras.src.backend.config import max_epochs as max_epochs
 from keras.src.backend.config import max_steps_per_epoch as max_steps_per_epoch
 from keras.src.backend.config import set_epsilon as set_epsilon

@@ -44,7 +44,12 @@ and `Pointwise1D`) and `TokenTable` in
      `quantize()` refuses roles that do not name each kernel axis once
      (every mode but ternary, which does not read them).
      `PermutedGeometry` and `PointwiseGeometry` in the fixture module are
-     examples.
+     examples. A 4-bit route (`keras.src.quantizers.kernels`) stands in
+     for `contract` only when the geometry defines `matrix_contraction`,
+     which says how the inputs reshape to `(M, rows)` and contract with
+     the stored matrix. A subclass that overrides `contract` or
+     `kernel_axes` without it keeps the reference path.
+     `PointwiseGeometry` defines the hook; `PermutedGeometry` does not.
    - `LookupGeometry` for an embeddings table, and
      `ReversibleLookupGeometry` for a table that also projects back
      (`call(inputs, reverse=True)`).
@@ -413,11 +418,12 @@ class ProjectionGeometry(QuantizationGeometry):
     """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul.
 
     A kernel of another layout overrides `kernel_axes`, plus `contract`,
-    `contract_grad` and `add_lora_delta` for its own contraction. The
-    defaults of `kernel_scale_axes` and `contraction_view` derive from
-    `kernel_axes`; their docstrings say when a layer overrides them too.
-    int8 and int4 take the input gradient from `contract_grad`, and the
-    other modes differentiate `contract`.
+    `contract_grad` and `add_lora_delta` for its own contraction, and
+    `matrix_contraction` when a 4-bit route may stand in for `contract`.
+    The defaults of `kernel_scale_axes` and `contraction_view` derive
+    from `kernel_axes`; their docstrings say when a layer overrides them
+    too. int8 and int4 take the input gradient from `contract_grad`, and
+    the other modes differentiate `contract`.
     """
 
     family = "projection"
@@ -436,6 +442,12 @@ class ProjectionGeometry(QuantizationGeometry):
                 )
                 + "."
             )
+        if {"contract", "kernel_axes"} & set(vars(cls)) and (
+            "matrix_contraction" not in vars(cls)
+        ):
+            # The contraction changed and the subclass does not say how a
+            # route reproduces it, so the routes stay off.
+            cls.matrix_contraction = _no_matrix_contraction
 
     @property
     def weight_shape(self):
@@ -485,6 +497,24 @@ class ProjectionGeometry(QuantizationGeometry):
         gradient that broadcasts to the shape of the inputs.
         """
         return ops.matmul(upstream, ops.transpose(float_kernel))
+
+    def matrix_contraction(self):
+        """How a route contracts the inputs with the stored matrix.
+
+        Returns `(rows, contracted, columns)`, or `None` for a contraction
+        that no route reproduces. A route reshapes the inputs to
+        `(M, rows)` over their last `contracted` axes, contracts them with
+        the stored `(rows, prod(columns))` matrix and reshapes the result
+        to the free input axes followed by `columns`. That must equal
+        `contract` exactly; the backward still comes from `contract_grad`.
+        The default describes the matmul of a 2-D kernel. A subclass that
+        overrides `contract` or `kernel_axes` without defining this hook
+        gets one that returns `None`.
+        """
+        shape = self.weight_shape
+        if len(shape) != 2:
+            return None
+        return shape[0], 1, (shape[1],)
 
     @property
     def inputs_quantization_axis(self):
@@ -539,6 +569,11 @@ class ProjectionGeometry(QuantizationGeometry):
         in its geometry.
         """
         return ternarize(self.layer._kernel)
+
+
+def _no_matrix_contraction(self):
+    """`matrix_contraction` of a geometry that changed the contraction."""
+    return None
 
 
 def _lora_equations(equation):
@@ -622,6 +657,16 @@ class EinsumProjectionGeometry(ProjectionGeometry):
 
     def contract(self, inputs, kernel):
         return ops.einsum(self.layer.equation, inputs, kernel)
+
+    def matrix_contraction(self):
+        axes = self.layer.einsum_axes
+        contracted = axes.matmul_contracted_axes()
+        if contracted is None:
+            return None
+        sizes = dict(zip(axes.kernel, self.weight_shape))
+        rows = math.prod(sizes[x] for x in axes.kernel if x not in axes.output)
+        columns = tuple(sizes[x] for x in axes.kernel if x in axes.output)
+        return rows, contracted, columns
 
     def contract_grad(self, upstream, float_kernel):
         # From https://stackoverflow.com/a/47609896. The gradient does not

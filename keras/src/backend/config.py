@@ -23,6 +23,11 @@ PLUGGABLE_BACKENDS = frozenset(["mlx", "openvino", "paddle"])
 # Whether NNX is enabled.
 _NNX_ENABLED = False
 
+# The kernel policy of a quantized contraction: `"auto"`, `"off"` or
+# `"require"`. A module global, not an attribute of `global_state`: it
+# survives `clear_session()` and every thread reads it.
+_QUANTIZED_KERNELS = "auto"
+
 # Cap run duration for debugging.
 _MAX_EPOCHS = None
 _MAX_STEPS_PER_EPOCH = None
@@ -358,6 +363,66 @@ def is_flash_attention_enabled():
     return global_state.get_global_attribute("flash_attention", default=None)
 
 
+@keras_export("keras.config.enable_quantized_kernels")
+def enable_quantized_kernels():
+    """Enables the kernels of the quantized layers.
+
+    A layer quantized to 4-bit weights (`"int4"`, `"gptq"`, `"awq"`) runs
+    a kernel in place of its reference path where the backend has a
+    measured one for the device, the compute dtype and the shapes of the
+    call, and the reference path elsewhere. The kernels are enabled by
+    default. A kernel gives the outputs of the reference path, within
+    the rounding of its summation order.
+
+    On JAX and TensorFlow, a change applies to the functions traced
+    after it. The environment variable `KERAS_QUANTIZED_KERNELS` (`auto`
+    or `off`) sets the value at import.
+    """
+    _set_quantized_kernels_policy("auto")
+
+
+@keras_export("keras.config.disable_quantized_kernels")
+def disable_quantized_kernels():
+    """Disables the kernels of the quantized layers.
+
+    Every quantized layer then runs its reference path, which dequantizes
+    the weight and contracts it in the compute dtype. See
+    `enable_quantized_kernels`.
+    """
+    _set_quantized_kernels_policy("off")
+
+
+@keras_export("keras.config.is_quantized_kernels_enabled")
+def is_quantized_kernels_enabled():
+    """Checks whether the kernels of the quantized layers are enabled.
+
+    Returns:
+        `True` unless `disable_quantized_kernels()` ran, or
+        `KERAS_QUANTIZED_KERNELS=off` was set at import.
+    """
+    return _QUANTIZED_KERNELS != "off"
+
+
+def _quantized_kernels_policy():
+    """The kernel policy: `"auto"`, `"off"` or `"require"`."""
+    return _QUANTIZED_KERNELS
+
+
+def _set_quantized_kernels_policy(value):
+    """Sets the kernel policy.
+
+    `"require"` is for CI: `quantizers.kernels` checks that the platform
+    has a kernel before it sets it.
+    """
+    global _QUANTIZED_KERNELS
+    if value not in ("auto", "off", "require"):
+        raise ValueError(
+            "The kernel policy must be one of ('auto', 'off', 'require'). "
+            f"Received: policy={value!r}"
+        )
+    _QUANTIZED_KERNELS = value
+
+
 @keras_export("keras.config.is_nnx_enabled")
 def is_nnx_enabled():
     """Checks whether NNX specific features are enabled for the JAX backend.
@@ -593,6 +658,16 @@ if os.environ.get("KERAS_X64_MODE"):
     _X64_MODE = os.environ["KERAS_X64_MODE"]
 
 set_x64_mode(_X64_MODE)  # Validates the configured mode and syncs JAX.
+
+if "KERAS_QUANTIZED_KERNELS" in os.environ:
+    env_val = os.environ["KERAS_QUANTIZED_KERNELS"].lower()
+    if env_val not in ("auto", "off"):
+        raise ValueError(
+            "The environment variable `KERAS_QUANTIZED_KERNELS` must be "
+            "'auto' or 'off'. Received: "
+            f"{os.environ['KERAS_QUANTIZED_KERNELS']!r}"
+        )
+    _QUANTIZED_KERNELS = env_val
 
 if "KERAS_USE_BACKEND_AGNOSTIC_OPS" in os.environ:
     env_val = os.environ["KERAS_USE_BACKEND_AGNOSTIC_OPS"].lower()

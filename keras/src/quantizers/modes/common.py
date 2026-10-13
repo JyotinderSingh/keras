@@ -3,11 +3,14 @@
 `GeometryDispatchStrategy` is the base class of the modes that write one
 handler per geometry family (int8, int4). The functions below are steps
 that several modes share: the group index variable, the bias and
-activation, and the custom input gradient of a projection, which int8
-and int4 take against the dequantized kernel.
+activation, the custom input gradient of a projection, which int8 and
+int4 take against the dequantized kernel, and `contract_quantized`, the
+one entry point through which a mode lets a route of `kernels.py` run
+its contraction.
 """
 
 from keras.src import ops
+from keras.src.quantizers import kernels
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
 
@@ -191,3 +194,27 @@ def contract_with_float_kernel_gradient(layer, geometry, view, inputs, forward):
     # Read inside the autocast scope: on TensorFlow eager the gradient
     # runs after it, and the scale variable would then read float32.
     return contract(inputs, *view.read_tensors())
+
+
+def contract_quantized(layer, geometry, view, inputs, reference):
+    """Contracts `inputs` against the weight that `view` holds.
+
+    `reference(inputs, quantized_weight)` is the mode's own contraction.
+    When `kernels.select_route` selects a route, the route runs forward
+    only, inside `contract_with_float_kernel_gradient`. Otherwise
+    `reference(inputs, view)` runs as given, with the gradient the mode
+    gives it. A route contracts float inputs: a mode with an activation
+    quantizer runs its own path and does not call this.
+    """
+    selection = kernels.select_route(layer, geometry, view, inputs)
+    if selection is None:
+        return reference(inputs, view)
+    return contract_with_float_kernel_gradient(
+        layer,
+        geometry,
+        view,
+        inputs,
+        lambda inputs, quantized_weight: kernels.run_route(
+            selection, layer, geometry, quantized_weight, inputs
+        ),
+    )
