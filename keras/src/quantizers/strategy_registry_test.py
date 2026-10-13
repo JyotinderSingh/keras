@@ -504,6 +504,32 @@ class ToyModeRegistrationTest(testing.TestCase):
                 layer.quantize("demo_half")
             self.assertIsNone(layer.quantization_mode)
 
+    def test_toy_mode_compute_dtype_rule_reaches_layer_and_policy(self):
+        class NoBFloat16(ToyHalfStrategy):
+            def check_compute_dtype(self, compute_dtype):
+                if compute_dtype == "bfloat16":
+                    raise NotImplementedError("demo_half refuses bfloat16")
+
+        strategy_registry.unregister_quantization_strategy("demo_half")
+        strategy_registry.register_quantization_strategy(NoBFloat16)
+
+        layer = ToyDense(3, dtype="bfloat16")
+        layer.build((None, 4))
+        with self.assertRaisesRegex(
+            NotImplementedError, "^demo_half refuses bfloat16$"
+        ):
+            layer.quantize("demo_half")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertEqual(standardize_dtype(layer._kernel.dtype), "bfloat16")
+        with self.assertRaisesRegex(ValueError, "^demo_half refuses bfloat16$"):
+            dtype_policies.get("demo_half_from_mixed_bfloat16")
+
+        # Another compute dtype still quantizes.
+        layer = ToyDense(3)
+        layer.build((None, 4))
+        layer.quantize("demo_half")
+        self.assertEqual(layer.quantization_mode, "demo_half")
+
 
 class ToyNoneConfig(ToyModeConfig):
     @property
