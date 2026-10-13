@@ -1,4 +1,5 @@
 import pickle
+import re
 from unittest import mock
 
 import numpy as np
@@ -2266,6 +2267,184 @@ class LoraLessQuantizationTest(testing.TestCase):
         layer.build((None, 8))
         layer.quantize("float8")
         layer(np.ones((3, 8), dtype="float32"))
+
+
+# The layers that set up LoRA through `Layer._enable_lora`: (factory, build
+# shape, weight name, float weight shape).
+LORA_LAYERS = {
+    "dense": (lambda **kw: layers.Dense(6, **kw), (None, 5), "kernel", (5, 6)),
+    "einsum_dense": (
+        lambda **kw: layers.EinsumDense("btc,cnh->btnh", (4, 2, 3), **kw),
+        (None, 4, 5),
+        "kernel",
+        (5, 2, 3),
+    ),
+    "embedding": (
+        lambda **kw: layers.Embedding(10, 6, **kw),
+        None,
+        "embeddings",
+        (10, 6),
+    ),
+    "conv2d": (
+        lambda **kw: layers.Conv2D(4, 3, data_format="channels_last", **kw),
+        (None, 6, 6, 2),
+        "kernel",
+        (3, 3, 2, 4),
+    ),
+}
+LORA_KINDS = [(kind, kind) for kind in LORA_LAYERS]
+
+
+def _built_lora_layer(kind, **kwargs):
+    factory, shape, name, weight_shape = LORA_LAYERS[kind]
+    layer = factory(**kwargs)
+    if shape is None:
+        layer.build()
+    else:
+        layer.build(shape)
+    return layer, name, weight_shape
+
+
+class _CustomLoraProjection(layers.Layer):
+    """A custom projection whose `enable_lora` calls `Layer._enable_lora`.
+
+    It defines no `kernel_constraint`, `kernel_regularizer` or
+    `_lora_weight_shape()`.
+    """
+
+    def __init__(self, units, **kwargs):
+        super().__init__(**kwargs)
+        self.units = units
+
+    def build(self, input_shape):
+        self.kernel_shape = (input_shape[-1], self.units)
+        self._kernel = self.add_weight(name="kernel", shape=self.kernel_shape)
+
+    def call(self, inputs):
+        kernel = self._kernel
+        if self.lora_enabled:
+            kernel = kernel + (self.lora_alpha / self.lora_rank) * ops.matmul(
+                self.lora_kernel_a, self.lora_kernel_b
+            )
+        return ops.matmul(inputs, kernel)
+
+    def enable_lora(self, rank, lora_alpha=None):
+        self._enable_lora("kernel", rank, lora_alpha=lora_alpha)
+
+
+class _LoraProjection(_CustomLoraProjection):
+    def _lora_weight_shape(self):
+        return self.kernel_shape
+
+
+class _DenseWithLateState(layers.Dense):
+    """A `Dense` that adds a weight after `super().build()`."""
+
+    def build(self, input_shape):
+        super().build(input_shape)
+        self.extra = self.add_weight(name="extra", shape=(2,))
+
+
+class LoraSetupTest(testing.TestCase):
+    @parameterized.named_parameters(LORA_KINDS)
+    def test_factors_follow_the_weight_shape_and_freeze_it(self, kind):
+        layer, name, weight_shape = _built_lora_layer(
+            kind, dtype="mixed_bfloat16"
+        )
+        layer.enable_lora(3)
+        lora_a = getattr(layer, f"lora_{name}_a")
+        lora_b = getattr(layer, f"lora_{name}_b")
+        self.assertEqual(tuple(lora_a.shape), weight_shape[:-1] + (3,))
+        self.assertEqual(tuple(lora_b.shape), (3, weight_shape[-1]))
+        self.assertEqual(lora_a.dtype, "float32")
+        self.assertEqual(lora_b.dtype, "float32")
+        self.assertAllClose(lora_b, np.zeros(lora_b.shape))
+        self.assertFalse(getattr(layer, f"_{name}").trainable)
+        self.assertEqual(
+            [v.path for v in layer.weights][-2:], [lora_a.path, lora_b.path]
+        )
+        self.assertEqual((layer.lora_rank, layer.lora_alpha), (3, 3))
+        self.assertTrue(layer._tracker.locked)
+
+    @parameterized.named_parameters(LORA_KINDS)
+    def test_refusals_and_lora_alpha(self, kind):
+        factory, _, name, _ = LORA_LAYERS[kind]
+        noun = "embedding" if name == "embeddings" else "kernel"
+        layer = factory(**{f"{name}_constraint": "non_neg"})
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                f"Lora is incompatible with {noun} constraints. In order to "
+                "enable lora on this layer, remove the "
+                f"`{name}_constraint` argument."
+            ),
+        ):
+            layer.enable_lora(2)
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape("Cannot enable lora on a layer that isn't yet built."),
+        ):
+            factory().enable_lora(2)
+        layer, _, _ = _built_lora_layer(kind)
+        layer.enable_lora(2, lora_alpha=5.0)
+        self.assertEqual(layer.lora_alpha, 5.0)
+        with self.assertRaisesRegex(
+            ValueError,
+            re.escape(
+                "lora is already enabled. This can only be done once per layer."
+            ),
+        ):
+            layer.enable_lora(2)
+
+    def test_custom_layer_without_constraint_or_regularizer(self):
+        layer = _LoraProjection(3)
+        layer.build((None, 4))
+        x = np.random.default_rng(0).standard_normal((2, 4)).astype("float32")
+        before = layer(x)
+        layer.enable_lora(2)
+        self.assertEqual(tuple(layer.lora_kernel_a.shape), (4, 2))
+        self.assertEqual(tuple(layer.lora_kernel_b.shape), (2, 3))
+        self.assertFalse(layer._kernel.trainable)
+        self.assertEqual(layer.losses, [])
+        self.assertAllClose(layer(x), before)
+
+    def test_custom_layer_without_weight_shape_is_told_the_hook(self):
+        layer = _CustomLoraProjection(3)
+        layer.build((None, 4))
+        with self.assertRaisesRegex(NotImplementedError, "_lora_weight_shape"):
+            layer.enable_lora(2)
+        # The refusal comes before any factor or tracker change.
+        self.assertTrue(layer._tracker.locked)
+        self.assertFalse(layer.lora_enabled)
+        self.assertEqual([v.name for v in layer.weights], ["kernel"])
+
+    def test_layer_without_lora_has_no_enable_lora(self):
+        # keras-hub's `Backbone.enable_lora` selects the layers that have an
+        # `enable_lora` attribute.
+        self.assertFalse(hasattr(layers.Layer(), "enable_lora"))
+        self.assertFalse(hasattr(layers.LayerNormalization(), "enable_lora"))
+
+    @parameterized.named_parameters(LORA_KINDS)
+    def test_lora_rank_build_locks_with_the_standard_message(self, kind):
+        layer, _, _ = _built_lora_layer(kind, lora_rank=2)
+        self.assertTrue(layer.lora_enabled)
+        self.assertTrue(layer._tracker.locked)
+        with self.assertRaisesRegex(
+            ValueError, "You cannot add new elements of state"
+        ):
+            layer.add_weight(name="late", shape=(1,))
+
+    def test_subclass_adds_state_after_lora_rank_build(self):
+        layer = _DenseWithLateState(3, lora_rank=2)
+        layer.build((None, 4))
+        self.assertEqual(
+            [v.name for v in layer.weights],
+            ["kernel", "bias", "lora_kernel_a", "lora_kernel_b", "extra"],
+        )
+        with self.assertRaisesRegex(
+            ValueError, "You cannot add new elements of state"
+        ):
+            layer.add_weight(name="late", shape=(1,))
 
 
 class _DenseListingExtra(layers.Dense):

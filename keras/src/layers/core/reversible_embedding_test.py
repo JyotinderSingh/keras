@@ -108,6 +108,49 @@ class ReversibleEmbeddingTest(test_case.TestCase):
         restored_output = restored_model(input_data)
         self.assertAllClose(model_output, restored_output)
 
+    def test_untied_layer_with_lora_rank_builds_and_reloads(self):
+        # `Embedding.build` sets up LoRA before the untied layer adds
+        # `reverse_embeddings`.
+        layer = layers.ReversibleEmbedding(
+            10, 6, tie_weights=False, lora_rank=2
+        )
+        layer.build()
+        self.assertEqual(
+            [v.name for v in layer.weights],
+            [
+                "embeddings",
+                "lora_embeddings_a",
+                "lora_embeddings_b",
+                "reverse_embeddings",
+            ],
+        )
+
+        # The saved config holds `lora_rank`, so the load builds the same
+        # way.
+        inputs = layers.Input((3,), dtype="int32")
+        embedding = layers.ReversibleEmbedding(
+            10, 6, tie_weights=False, name="embedding"
+        )
+        model = models.Model(inputs, embedding(inputs))
+        embedding.enable_lora(2)
+        embedding.lora_embeddings_b.assign(
+            np.random.default_rng(0).standard_normal((2, 6)).astype("float32")
+        )
+        path = os.path.join(self.get_temp_dir(), "model.keras")
+        model.save(path)
+        restored = saving.load_model(path).get_layer("embedding")
+        self.assertEqual(restored.lora_rank, 2)
+        x = np.array([[1, 2, 3]], "int32")
+        self.assertAllClose(restored(x), embedding(x))
+        hidden = np.ones((1, 6), "float32")
+        self.assertAllClose(
+            restored(hidden, reverse=True), embedding(hidden, reverse=True)
+        )
+        with self.assertRaisesRegex(
+            ValueError, "You cannot add new elements of state"
+        ):
+            restored.add_weight(name="late", shape=(1,))
+
     def test_correctness(self):
         layer = layers.ReversibleEmbedding(input_dim=3, output_dim=2)
         layer.build()
