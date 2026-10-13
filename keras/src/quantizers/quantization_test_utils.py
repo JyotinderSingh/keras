@@ -336,26 +336,10 @@ class ThirdPartyProjection(Layer):
         return tuple(input_shape[:-1]) + (self.units,)
 
     def enable_lora(self, rank, lora_alpha=None):
-        self._check_lora_supported(self.quantization_mode)
-        self._tracker.unlock()
-        self.lora_kernel_a = self.add_weight(
-            name="lora_kernel_a",
-            shape=self.kernel_shape[:-1] + (rank,),
-            initializer="he_uniform",
-            dtype="float32",
-        )
-        self.lora_kernel_b = self.add_weight(
-            name="lora_kernel_b",
-            shape=(rank, self.kernel_shape[-1]),
-            initializer="zeros",
-            dtype="float32",
-        )
-        if self._quantized_weight() is None:
-            self._kernel.trainable = False
-        self._tracker.lock()
-        self.lora_enabled = True
-        self.lora_rank = rank
-        self.lora_alpha = rank if lora_alpha is None else lora_alpha
+        self._enable_lora("kernel", rank, lora_alpha=lora_alpha)
+
+    def _lora_weight_shape(self):
+        return self.kernel_shape
 
     @property
     def variable_serialization_spec(self):
@@ -536,6 +520,8 @@ class TokenTable(Layer):
         return tuple(input_shape) + (self.output_dim,)
 
     def enable_lora(self, rank, lora_alpha=None):
+        # Written out instead of calling `Layer._enable_lora`, so that the
+        # conformance test also covers a layer that sets up LoRA itself.
         self._check_lora_supported(self.quantization_mode)
         self._tracker.unlock()
         self.lora_embeddings_a = self.add_weight(
