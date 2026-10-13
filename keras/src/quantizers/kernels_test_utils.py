@@ -138,6 +138,24 @@ def row_key(dtype, bucket):
     return (backend.backend(), kernels._device_class(), dtype, bucket)
 
 
+# An `M` in each M bucket.
+BUCKET_ROWS = {"1-16": 4, "17-64": 33, "65-256": 130, "257+": 300}
+
+
+def first_tested_route(routes, table):
+    """The first route of a measured row that `table` holds, with its
+    library version in its tested range, else `"reference"`. On the
+    device class of the row, this is the route that `"auto"` selects for
+    a call that passes the shape gates."""
+    for name in routes:
+        source = table.get(name)
+        if source is None:
+            continue
+        if source.tested is None or source.tested():
+            return name
+    return "reference"
+
+
 def counts(layer, x, **call_kwargs):
     """The routes that one call `layer(x, **call_kwargs)` selects, for
     example with `reverse=True`."""

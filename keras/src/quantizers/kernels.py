@@ -2,7 +2,7 @@
 
 A route runs one int4 contraction in place of the reference path, which
 dequantizes the weight and contracts it. A route is a backend kernel or
-a formulation in `keras.ops`. It runs forward only: its
+the sum-then-scale formulation in `keras.ops`. It runs forward only: its
 caller owns the gradient, and the backward does not call the route. A
 mode's projection reaches it through `contract_quantized` of
 `keras.src.quantizers.modes.common`, and the reverse lookup through
@@ -54,6 +54,14 @@ from keras.src.backend.common import standardize_dtype
 from keras.src.backend.common.backend_utils import m_bucket
 from keras.src.distribution import distribution_lib
 from keras.src.quantizers.quantized_weight import Int4Pairs
+from keras.src.quantizers.quantized_weight import contiguous_group_index
+from keras.src.utils.backend_utils import in_tf_graph
+
+if backend.backend() == "jax":
+    # The one framework read of this module: `run_route` branches in
+    # Python on an eager JAX value, and traces `ops.cond` only for a
+    # `jax.core.Tracer`.
+    import jax
 
 # The kernel module of the backend (`KERNELS`, `device_class`,
 # `is_sharded`, `is_compiling`), or `None` for a backend with no kernels.
@@ -62,7 +70,17 @@ _KERNEL_MODULE = getattr(getattr(backend, "ops", None), "quantized", None)
 # A row names, in order of preference, the routes that ran faster than the
 # reference path at each measured shape of its cell and passed the route
 # tests there. `"auto"` runs a route only where a row names it.
-_MEASURED_ROWS = {}
+_MEASURED_ROWS = {
+    # Apple M1 Pro, torch 2.10.0 eager, 2026-10-22.
+    ("torch", "cpu-arm64", "float32", "1-16"): ("sum_then_scale",),
+    ("torch", "cpu-arm64", "float16", "1-16"): ("sum_then_scale",),
+    ("torch", "cpu-arm64", "bfloat16", "1-16"): ("sum_then_scale",),
+    ("torch", "cpu-arm64", "bfloat16", "17-64"): ("sum_then_scale",),
+    ("torch", "cpu-arm64", "bfloat16", "65-256"): ("sum_then_scale",),
+    ("torch", "cpu-arm64", "bfloat16", "257+"): ("sum_then_scale",),
+    # 8 vCPU x86_64, torch 2.14.1 eager, 2026-10-23.
+    ("torch", "cpu-x86_64", "float32", "17-64"): ("sum_then_scale",),
+}
 # The rows of the reverse lookup, as `_MEASURED_ROWS`. The compute dtype is
 # the reverse dtype of the layer, when it has one.
 _MEASURED_LOGITS_ROWS = {}
@@ -91,9 +109,11 @@ class Route:
     `dtypes` holds the compute dtypes that the route supports (empty for
     every dtype). `available(device_class, m, k, n, quantized_weight,
     dtype)` gives its device and shape checks. `tested()` says whether
-    the installed compiler is in the tested range of the route. `kernel`
-    is the backend `Kernel` of the route, or `None`: the `"require"`
-    policy runs kernels only.
+    the installed compiler is in the tested range of the route. A route
+    with `contiguous_groups` reads the group of row `k` as `k // G`, so
+    `run_route` guards it on a view with a `g_idx`. `kernel` is the
+    backend `Kernel` of the route, or `None`: the `"require"` policy runs
+    kernels only.
     """
 
     fn: object
@@ -101,6 +121,7 @@ class Route:
     dtypes: tuple = ()
     available: object = None
     tested: object = None
+    contiguous_groups: bool = False
     kernel: object = None
 
 
@@ -127,8 +148,78 @@ def _reference(layer, geometry, quantized_weight, inputs):
     return geometry.contract(inputs, float_kernel)
 
 
+def _sum_then_scale(quantized_weight, inputs, dtype):
+    """The `(M, K)` inputs against the 4-bit codes, scaled per group.
+
+    The low and high nibbles of the codes hold the even and the odd
+    columns. For each plane, a batched float32 matmul contracts the
+    inputs of each group, in the values of the compute dtype, with the
+    small integers `q - z`, so each product is exact. The group scale
+    multiplies the partial sum of its group. Per-channel int4 is one group
+    with no zero point, and its scale divides the result. AWQ divides the
+    inputs by its input scales in the compute dtype. The route reads the
+    group of row `k` as `k // G`.
+    """
+    view = quantized_weight
+    rows, columns = view.codes.shape[0], view.layout.orig_len
+    grouped = view.scheme.group_size is not None
+    groups = rows // min(view.scheme.group_size, rows) if grouped else 1
+    if standardize_dtype(view.codes.dtype) == "int8":
+        # The arithmetic shifts sign-extend each nibble.
+        low = ops.right_shift(ops.left_shift(view.codes, 4), 4)
+    else:
+        # A Python number operand of an op becomes a tensor on each call:
+        # on torch, a copy from the host, which a CUDA graph capture
+        # refuses. A tensor operator keeps its Python operand as a scalar.
+        mask = ops.ones((), view.codes.dtype) * 15
+        low = ops.bitwise_and(view.codes, mask)
+    planes = (low, ops.right_shift(view.codes, 4))
+    if view.input_scales is not None:
+        inputs = ops.divide(inputs, view.input_scales)
+    # `(groups, M, G)`: the inputs of each group.
+    x = ops.reshape(inputs, (-1, groups, rows // groups))
+    x = ops.cast(ops.transpose(x, (1, 0, 2)), "float32")
+    scale = ops.cast(view.scale, "float32")
+    if grouped:
+        # `(groups, 1, N / 2, 2)`: the even and odd columns of each group.
+        halves = (groups, 1, columns // 2, 2)
+        zero = ops.cast(ops.reshape(view.zero_point, halves), "float32")
+        group_scale = ops.reshape(scale, halves)
+    outputs = []
+    for i, plane in enumerate(planes):
+        w = ops.reshape(plane, (groups, rows // groups, columns // 2))
+        w = ops.cast(w, "float32")
+        if grouped:
+            # After the cast: a subtraction in uint8 would wrap.
+            w = ops.subtract(w, zero[..., i])
+            partial = ops.multiply(ops.matmul(x, w), group_scale[..., i])
+        else:
+            partial = ops.matmul(x, w)
+        outputs.append(ops.sum(partial, axis=0))
+    y = ops.reshape(ops.stack(outputs, axis=-1), (-1, columns))
+    if not grouped:
+        y = ops.divide(y, scale)
+    return ops.cast(y, dtype)
+
+
+def _sum_then_scale_available(device_class, m, k, n, view, dtype):
+    """Whole groups or one group, an even `N`, and eager execution on
+    torch and TensorFlow (no `torch.compile`, no TensorFlow graph)."""
+    group = view.scheme.group_size
+    if n % 2 or (group is not None and k % group and k > group):
+        return False
+    return not (_is_compiling() or in_tf_graph())
+
+
 # Route name -> `Route` of a projection.
-_ROUTES = {}
+_ROUTES = {
+    "sum_then_scale": Route(
+        _sum_then_scale,
+        dtypes=("bfloat16", "float16", "float32"),
+        available=_sum_then_scale_available,
+        contiguous_groups=True,
+    ),
+}
 # Route name -> `Route` of a reverse lookup.
 _LOGITS_ROUTES = {}
 
@@ -416,14 +507,48 @@ def _tied(table):
 
 
 def run_route(selection, layer, geometry, quantized_weight, inputs):
-    """Runs `selection` forward only."""
+    """Runs `selection` forward only, with the group guard where its route
+    needs one."""
     route = selection.route
     if not route.matrix:
         return route.fn(layer, geometry, quantized_weight, inputs)
-    free = ops.shape(inputs)[: len(inputs.shape) - selection.contracted]
-    x = ops.reshape(inputs, (-1, selection.rows))
-    y = route.fn(quantized_weight, x, selection.dtype)
-    return ops.reshape(y, tuple(free) + selection.columns)
+
+    def routed():
+        free = ops.shape(inputs)[: len(inputs.shape) - selection.contracted]
+        x = ops.reshape(inputs, (-1, selection.rows))
+        y = route.fn(quantized_weight, x, selection.dtype)
+        return ops.reshape(y, tuple(free) + selection.columns)
+
+    def reference():
+        return _reference(layer, geometry, quantized_weight, inputs)
+
+    # A grouped view with no `g_idx` (int4, AWQ, GPTQ with one group, a
+    # lookup table) puts row `k` in group `k // G`, so it needs no guard.
+    # A view with a `g_idx` (GPTQ with several groups) runs the route only
+    # when `g_idx[k] == k // G` for every row, and the reference path
+    # otherwise (GPTQ's activation order). The serialized policy
+    # (`gptq/<bits>/<G>`) does not say whether `g_idx` is permuted, so the
+    # guard reads it on the device on each call: an executable compiled
+    # or exported before a write of other state stays correct after it.
+    # vLLM, SGLang, TGI and TensorRT-LLM read the same fact from the
+    # weight: its `g_idx`, or the absence of one.
+    g_idx = quantized_weight.g_idx
+    if not route.contiguous_groups or g_idx is None:
+        return routed()
+    groups = contiguous_group_index(
+        selection.rows, quantized_weight.scheme.group_size
+    )
+    contiguous = ops.all(ops.equal(ops.cast(g_idx, "int32"), groups))
+    if backend.backend() == "jax" and not isinstance(
+        contiguous, jax.core.Tracer
+    ):
+        # An eager call branches in Python. An eager `lax.cond` would
+        # trace and compile both branches again on each call, because
+        # each call gives it new functions.
+        return routed() if contiguous else reference()
+    # Under a JAX trace this is a `lax.cond`, which traces both branches;
+    # torch and TensorFlow eager branch in Python.
+    return ops.cond(contiguous, routed, reference)
 
 
 def _kernel_routes(kernel):
