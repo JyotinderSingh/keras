@@ -3,7 +3,8 @@
 The int4 reverse lookup selects a route of `kernels.py`. The tests run the
 reference contraction as a route (`force_route("reference_wrapped")`),
 the `"matrix"` route and the kernel routes of the process, from
-`kernels_test_utils`, through real layers.
+`kernels_test_utils`, through real layers. The backend test files test
+the logits kernels as ops.
 """
 
 import functools

@@ -414,6 +414,11 @@ def _compile_for_cuda(capability, jobs):
             "n_groups": "i32",
             "group_size": "i32",
             "NH": "i32",
+            # `w4a16_matmul` passes zeros: it reads no strides.
+            "stride_cb": "i32",
+            "stride_cn": "i32",
+            "stride_sg": "i32",
+            "stride_sn": "i32",
         }
         divisible = {
             (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
@@ -422,6 +427,7 @@ def _compile_for_cuda(capability, jobs):
         constants = {
             "XOR": 8 if job["signed"] else 0,
             "PER_CHANNEL": per_channel,
+            "PACK_K": False,
             "CONTIGUOUS": job["contiguous"],
             "UPCAST_DOT": False,
             "INPUT_PRECISION": job["precision"],
@@ -752,6 +758,12 @@ class W4A16MatmulTest(testing.TestCase):
         ):
             available = kernel.available(device_class, 33, 200, 75, 32, dtype)
             self.assertEqual(available, expected, (device_class, dtype))
+        self.assertTrue(
+            kernel.logits_available("cuda-sm89", 3, 256, 256, 128, "float16")
+        )
+        self.assertFalse(
+            kernel.logits_available("cuda-sm75", 3, 256, 256, 128, "float16")
+        )
 
     def test_float32_precision_follows_torch(self):
         """The precision mapping, in a new process per setter.

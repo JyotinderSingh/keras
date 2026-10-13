@@ -461,18 +461,33 @@ class RouteSuiteTest(testing.TestCase):
         backend.backend() != "torch", reason="Compiles with `torch.compile`."
     )
     def test_torch_compiled_kernel_is_one_graph(self):
-        """Under `torch.compile`, a float32 layer through each kernel route
-        is one graph: the frontend reads the float32 precision as a
-        constant and adds no graph break."""
+        """Under `torch.compile`, a float32 layer and a tied reverse lookup
+        through each kernel route are one graph, as the reverse lookup of
+        the wrapped reference path: the frontends read the float32
+        precision as a constant and add no graph break."""
         layer = _layer(ROUTABLE["dense_ragged"], 32, bias=True)
         x = ops.convert_to_tensor(_random(ROUTABLE["dense_ragged"][2]))
+        embedding = layers.ReversibleEmbedding(384, 256, tie_weights=True)
+        embedding.build()
+        embedding.quantize(
+            "int4", config=Int4QuantizationConfig(block_size=128)
+        )
+        hidden = ops.convert_to_tensor(_random((2, 3, 256)))
         calls = [
             (name, lambda v: layer(v), x)
             for name in kernel_routes(kernels._ROUTES)
             if name in admitted(layer, x)
         ]
+        calls += [
+            (name, lambda v: embedding(v, reverse=True), hidden)
+            for name in kernel_routes(kernels._LOGITS_ROUTES)
+            if name in admitted(embedding, hidden, reverse=True)
+        ]
         if not calls:
             self.skipTest("No kernel route of this process runs here.")
+        calls.append(
+            ("reference_wrapped", lambda v: embedding(v, reverse=True), hidden)
+        )
         for name, call, inputs in calls:
             counter = CompileCounter()
             torch._dynamo.reset()
