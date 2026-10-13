@@ -61,10 +61,14 @@ quantizable layer must define:
   `reverse_embeddings` variables.
 
 LoRA is optional: `Layer` defines `lora_enabled = False`. A layer that
-supports it sets `lora_enabled` in `enable_lora()` and defines
-`lora_kernel_a`, `lora_kernel_b`, `lora_alpha` and `lora_rank` (a lookup
-defines `lora_embeddings_a` and `lora_embeddings_b` in place of the kernel
-factors).
+supports it defines `enable_lora()`, which calls
+`Layer._enable_lora("kernel", rank, ...)` (a lookup passes
+`"embeddings"`), and `_lora_weight_shape()`, which returns the float
+weight's shape. `_enable_lora` creates `lora_kernel_a` and
+`lora_kernel_b` (`lora_embeddings_a` and `lora_embeddings_b` for a
+lookup), freezes the float weight and sets `lora_enabled`, `lora_rank`
+and `lora_alpha`. The `<name>_constraint` and `<name>_regularizer`
+attributes (`kernel_*`, or `embeddings_*` for a lookup) are optional.
 
 The rest comes from `Layer` itself: strategies read `compute_dtype`,
 `dtype_policy` and `path`, create their quantized variables through

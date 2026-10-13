@@ -862,6 +862,27 @@ class ConvBasicTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "expected 1 variables"):
             new_model.load_weights(temp_filepath)
 
+    @parameterized.named_parameters(
+        ("float8", "float8", "FLOAT8"), ("ternary", "ternary", "TERNARY")
+    )
+    def test_lora_rank_under_a_mode_without_lora_refuses_build(
+        self, mode, name
+    ):
+        # The mode does not support LoRA, so `build` refuses the layer
+        # before its first call.
+        layer = layers.Conv2D(
+            4,
+            3,
+            data_format="channels_last",
+            lora_rank=2,
+            dtype=f"{mode}_from_float32",
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError,
+            f"lora is not currently supported with {name} quantization.",
+        ):
+            layer.build((None, 6, 6, 2))
+
     @parameterized.parameters(
         (layers.Conv1D, (10, 3), 2, 10),
         (layers.Conv2D, (10, 10, 3), (2, 2), (10, 10)),

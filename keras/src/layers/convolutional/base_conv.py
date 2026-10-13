@@ -284,45 +284,16 @@ class BaseConv(Layer):
         a_initializer="he_uniform",
         b_initializer="zeros",
     ):
-        if self.kernel_constraint:
-            raise ValueError(
-                "Lora is incompatible with kernel constraints. "
-                "In order to enable lora on this layer, remove the "
-                "`kernel_constraint` argument."
-            )
-        if not self.built:
-            raise ValueError(
-                "Cannot enable lora on a layer that isn't yet built."
-            )
-        if self.lora_enabled:
-            raise ValueError(
-                "lora is already enabled. This can only be done once per layer."
-            )
-        self._tracker.unlock()
+        self._enable_lora(
+            "kernel",
+            rank,
+            lora_alpha=lora_alpha,
+            a_initializer=a_initializer,
+            b_initializer=b_initializer,
+        )
 
-        # LoRA weights should be float32 to avoid the risk of underflow or
-        # overflow during fine-tuning.
-        # When deploying the model, these weights should be merged with the
-        # original kernel while maintaining the original kernel's dtype.
-        self.lora_kernel_a = self.add_weight(
-            name="lora_kernel_a",
-            shape=self._kernel.shape[:-1] + (rank,),
-            initializer=initializers.get(a_initializer),
-            dtype="float32",
-            regularizer=self.kernel_regularizer,
-        )
-        self.lora_kernel_b = self.add_weight(
-            name="lora_kernel_b",
-            shape=(rank, self.filters),
-            initializer=initializers.get(b_initializer),
-            dtype="float32",
-            regularizer=self.kernel_regularizer,
-        )
-        self._kernel.trainable = False
-        self._tracker.lock()
-        self.lora_enabled = True
-        self.lora_rank = rank
-        self.lora_alpha = lora_alpha if lora_alpha is not None else rank
+    def _lora_weight_shape(self):
+        return self._kernel.shape
 
     def save_own_variables(self, store):
         # Do nothing if the layer isn't yet built
