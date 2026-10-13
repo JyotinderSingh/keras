@@ -466,11 +466,10 @@ class Model(Trainer, Layer):
         via `config.quantization_layer_structure` or the model's
         `get_quantization_layer_structure(mode)` hook) that list the mode
         in their `variable_serialization_spec`: `Dense`, `EinsumDense` and
-        custom layers that opt in (a custom layer also needs a `kernel`
-        property, which the calibrator reads the float weight through). All
-        other layers are left in their original precision. These modes are
-        run only here: each layer stays float until the calibration has its
-        statistics, and is then quantized in one step.
+        custom layers that opt in. All other layers are left in their
+        original precision. These modes are run only here: each layer
+        stays float until the calibration has its statistics, and is then
+        quantized in one step.
 
         The call collects a `QuantizationReport` describing which layers were
         quantized and which were skipped (and why). The report is returned and
