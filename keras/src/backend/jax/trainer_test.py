@@ -12,6 +12,34 @@ from keras.src import testing
 from keras.src.backend import distribution_lib as backend_dlib
 from keras.src.backend.jax import trainer as jax_trainer
 from keras.src.distribution import distribution_lib
+from keras.src.quantizers.modes.common import ContiguousGroups
+from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+
+
+@pytest.mark.skipif(backend.backend() != "jax", reason="JAX only")
+class TrainerWriteBackTest(testing.TestCase):
+    def test_trainer_write_back_runs_no_check(self):
+        """The trainer writes back the state of its compiled step inside
+        `skip_assign_checks()`, so no `_assign_check` runs, and no value is
+        read on the host. The check below refuses the stored `g_idx`: a
+        direct `assign` of it raises, and every trainer call passes."""
+        layer = layers.Dense(8)
+        model = models.Sequential([layers.Input((64,)), layer])
+        layer.quantize("int4", config=Int4QuantizationConfig(block_size=32))
+        model.compile(loss="mse", optimizer="sgd")
+        layer.g_idx._assign_check = ContiguousGroups(64, 1)
+        g_idx = layer.g_idx.numpy()
+        with self.assertRaisesRegex(ValueError, "k // 1"):
+            layer.g_idx.assign(g_idx)
+        x = np.random.default_rng(0).standard_normal((16, 64))
+        y = np.zeros((16, 8))
+        model.fit(x, y, batch_size=8, epochs=1, verbose=0)
+        model.evaluate(x, y, batch_size=8, verbose=0)
+        model.predict(x, batch_size=8, verbose=0)
+        model.train_on_batch(x, y)
+        model.test_on_batch(x, y)
+        model.predict_on_batch(x)
+        self.assertAllEqual(layer.g_idx, g_idx)
 
 
 @pytest.mark.skipif(backend.backend() != "jax", reason="JAX only")
