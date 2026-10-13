@@ -371,17 +371,19 @@ class QuantizedDTypePolicy(DTypePolicy):
         }
 
     def _check_quantization_mode(self, mode, compute_dtype):
-        if not _strategy_registry().is_registered(mode):
+        strategy = _strategy_registry().get_strategy(mode)
+        if strategy is None:
             raise ValueError(
                 "Invalid quantization mode. "
                 f"Expected one of {_strategy_registry().registered_modes()}. "
                 f"Received: mode={mode}"
             )
-        if compute_dtype == "float16" and mode == "int8":
-            raise ValueError(
-                f"Quantization mode='{mode}' doesn't work well with "
-                "compute_dtype='float16'."
-            )
+        try:
+            strategy.check_compute_dtype(compute_dtype)
+        except NotImplementedError as error:
+            # A policy whose mode cannot compute in its compute dtype is an
+            # invalid argument.
+            raise ValueError(str(error)) from None
 
 
 @keras_export("keras.dtype_policies.QuantizedFloat8DTypePolicy")

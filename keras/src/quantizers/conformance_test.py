@@ -206,6 +206,15 @@ def _store(layer):
     return {key: _numpy(value) for key, value in store.items()}
 
 
+def _assert_same_store(test, store, expected):
+    """`store` holds the keys, dtypes, shapes and bytes of `expected`."""
+    test.assertEqual(list(store), list(expected))
+    for key, value in expected.items():
+        test.assertEqual(store[key].dtype, value.dtype, key)
+        test.assertEqual(store[key].shape, value.shape, key)
+        test.assertEqual(store[key].tobytes(), value.tobytes(), key)
+
+
 def _spec_variable(layer, entry, weight_name):
     """The variable a spec entry names (`kernel` is held at `_kernel`)."""
     if entry == weight_name:
@@ -432,6 +441,36 @@ class QuantizationConformanceTest(testing.TestCase):
             step = _code_step(strategy.quantized_weights(merged)[0])
             atol = 1e-2 if testing.uses_tpu() else 1e-5
             self.assertLessEqual(np.max(np.abs(error) - 0.5 * step), atol)
+
+    @parameterized.named_parameters(PAIRS)
+    def test_lora_save_is_a_fixed_point(self, mode_name, kind):
+        case = MODES[mode_name]
+        strategy = strategy_registry.get_strategy(case.mode)
+        layer = build_layer(kind)
+        if not hasattr(layer, "enable_lora") or not strategy.supports_lora:
+            self.skipTest("The pair has no LoRA.")
+        _quantize(layer, case, layer_inputs(kind, np.random.default_rng(0)))
+
+        def assert_fixed_point(expected):
+            # A load leaves a zero update, so a save, a load into a layer
+            # with LoRA and a save again give the same store.
+            store = expected
+            for _ in range(3):
+                reloaded = policy_built(layer)
+                reloaded.enable_lora(2)
+                reloaded.load_own_variables(store)
+                store = _store(reloaded)
+                _assert_same_store(self, store, expected)
+
+        # A zero update saves the stored values.
+        expected = _store(layer)
+        layer.enable_lora(2)
+        _assert_same_store(self, _store(layer), expected)
+        assert_fixed_point(expected)
+
+        # The first save of a nonzero update merges it.
+        _set_lora_factors(layer, LAYERS[kind].weight_name, scale=0.3)
+        assert_fixed_point(_store(layer))
 
     @parameterized.named_parameters(REFUSED)
     def test_unsupported_pair_is_refused_before_any_change(
