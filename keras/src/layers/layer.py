@@ -807,11 +807,6 @@ class Layer(BackendLayer, Operation):
                     "is not compatible with provided weight "
                     f"shape {value.shape}."
                 )
-            # A quantization mode can fix the value of a variable. Its check
-            # (`_assign_check`) refuses another value.
-            check = getattr(variable, "_assign_check", None)
-            if check is not None:
-                check(value)
             variable.assign(value)
 
     @property
@@ -2631,13 +2626,14 @@ def _check_writes(writes):
     """Checks the `(variable, value)` writes of a load before the first.
 
     A quantization mode can fix the value of a variable. Its check
-    (`_assign_check`) refuses another value. When a variable of the writes
-    holds a check, a value of another shape raises first, with the shape
-    error of `assign`. So a file of another group size reports the shape
-    that differs. Then every check runs. A refused load (a warning under
-    `skip_mismatch`) leaves the layer as it was.
+    (`_assign_check`) refuses another value, and `assign` runs it. When a
+    variable of the writes holds a check, a value of another shape raises
+    first, with the shape error of `assign`. So a file of another group
+    size reports the shape that differs. Then every check runs before the
+    first write. A refused load (a warning under `skip_mismatch`) leaves
+    the layer as it was.
     """
-    if all(getattr(v, "_assign_check", None) is None for v, _ in writes):
+    if all(v._assign_check is None for v, _ in writes):
         return
     for variable, value in writes:
         shape = getattr(value, "shape", None)
@@ -2651,9 +2647,8 @@ def _check_writes(writes):
                 f"Target variable: {variable}"
             )
     for variable, value in writes:
-        check = getattr(variable, "_assign_check", None)
-        if check is not None:
-            check(value)
+        if variable._assign_check is not None:
+            variable._assign_check(value)
 
 
 def might_have_unbuilt_state(layer):

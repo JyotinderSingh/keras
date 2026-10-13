@@ -1230,11 +1230,6 @@ class Model(Trainer, Layer):
         for path, value in path_value_dict.items():
             for variable in variables:
                 if variable.path == path:
-                    # A quantization mode can fix the value of a variable.
-                    # Its check (`_assign_check`) refuses another value.
-                    check = getattr(variable, "_assign_check", None)
-                    if check is not None:
-                        check(value)
                     variable.assign(value)
 
     def _flatten_nested_dict(self, nested_dict):
