@@ -9,8 +9,9 @@ the test. `GPUTest` runs the real route on a CUDA GPU that passes the
 device check, and the same cases in interpret mode elsewhere. The route
 suites of `kernels_test.py` run the route through real layers. The module
 needs JAX 0.11.2 or newer, which has `plgpu.mma`. JAX 0.11.2 needs Python
-3.12, so a CI job on Python 3.11 skips it. The labels G1 to G8 are those of
-`kernels_test_utils`.
+3.12, so a CI job on Python 3.11 skips it: `kernels_test.py` names the
+Python version where a measured row has the device. The labels G1 to G8
+are those of `kernels_test_utils`.
 """
 
 import itertools
@@ -856,6 +857,26 @@ class GateTest(testing.TestCase):
         ):
             available = kernel.available("cuda-sm89", 3, k, n, group, "")
             self.assertEqual(available, expected, (k, n, group))
+
+    def test_rows_have_a_configuration(self):
+        """Each Mosaic GPU measured row names a device class and a compute
+        dtype that the kernel supports, and `MOSAIC_GPU_CONFIGS` has a row
+        for its compute capability, compute dtype and M bucket."""
+        (kernel,) = quantized.KERNELS
+        rows = [
+            key
+            for key, routes in kernels._MEASURED_ROWS.items()
+            if "mosaic_gpu" in routes
+        ]
+        self.assertNotEqual(rows, [])
+        for key in rows:
+            _, device_class, dtype, bucket = key
+            self.assertTrue(kernel.supports_device(device_class), key)
+            self.assertIn(dtype, kernel.dtypes, key)
+            number = device_class.removeprefix("cuda-sm")
+            capability = f"{number[:-1]}.{number[-1]}"
+            config_key = (capability, dtype, bucket)
+            self.assertIn(config_key, quantized.MOSAIC_GPU_CONFIGS, key)
 
     def test_versions(self):
         """The route reads the version range of the installed jax and
