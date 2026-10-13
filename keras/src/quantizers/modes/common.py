@@ -22,8 +22,8 @@ class GeometryDispatchStrategy(QuantizationStrategy):
     - `_get_<family>_quantized_weight`: the `QuantizedWeight` view, or
       `None` when the mode holds no integer codes. The weight property,
       saving, `enable_lora` and `Model.quantization_summary` read it.
-    - `_encode_<family>`, when the view is not `None`: the LoRA-merged
-      save re-quantizes the merged weight with it.
+    - `_encode_<family>`, when the view is not `None`: the default
+      `merge_lora_delta` re-quantizes the merged weight with it.
     - `_get_reverse_<family>_quantized_weight`, for a reversible family
       whose layer is untied and has a view: the reverse table's view.
 
