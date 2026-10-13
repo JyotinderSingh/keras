@@ -1189,10 +1189,10 @@ def _vjp(layer, x, upstream, compiled):
 class CalibrationRouteTest(testing.TestCase):
     """GPTQ and AWQ through a route.
 
-    No kernel route exists yet. `force_route("reference_wrapped")` runs the
-    reference path as a route, inside the custom gradient, and `matrix` (a
-    route of `kernels_test.py`) contracts the `(M, K)` inputs with the
-    stored matrix.
+    `force_route("reference_wrapped")` runs the reference path as a route,
+    inside the custom gradient, and `matrix` (a route of `kernels_test.py`)
+    contracts the `(M, K)` inputs with the stored matrix. `kernels_test.py`
+    runs N5 on GPTQ and AWQ.
     """
 
     @parameterized.named_parameters(
@@ -1290,7 +1290,8 @@ class CalibrationRouteTest(testing.TestCase):
     @parameterized.named_parameters(named_product(mode=MODES))
     def test_reference_path_constructs_no_custom_gradient(self, mode):
         """NumPy warns when it constructs a custom gradient. The reference
-        path constructs none, and the wrapped reference does."""
+        path (`"auto"` with no row, and `"off"`) constructs none, and the
+        wrapped reference does."""
         layer, x = _routed_layer("dense", mode)
         with kernels.policy("off"):
             expected = _numpy(layer(x))
@@ -1302,7 +1303,11 @@ class CalibrationRouteTest(testing.TestCase):
                 backend.backend() == "numpy",
             ),
         ):
-            with warnings.catch_warnings(record=True) as caught, scope:
+            with (
+                warnings.catch_warnings(record=True) as caught,
+                _routes(),
+                scope,
+            ):
                 warnings.simplefilter("always")
                 y = layer(x)
             self.assertAllEqual(_numpy(y), expected)
