@@ -3,9 +3,10 @@
 A `CalibrationRun` creates one `Calibrator` per float layer of a block, in
 the layer's stage, passes every input the layer sees during the sweep of
 that stage to `observe`, then calls `quantize`, which solves for the
-layer's codes and swaps them in through the mode's strategy.
-`GPTQCalibrator` (a Hessian) and `AWQCalibrator` (activation magnitudes) are
-the calibrators of the built-in modes.
+layer's codes and swaps them in through the mode's strategy. Every
+calibrator accumulates the Hessian of the layer's inputs. `GPTQCalibrator`
+solves with it; `AWQCalibrator` also accumulates activation magnitudes and
+scores its searches with the Hessian.
 """
 
 import math
@@ -23,9 +24,11 @@ class Calibrator:
     number of independent problems that a kernel axis shared with the
     inputs splits the kernel into. A statistic has a leading problem axis
     only when `batch > 1`. `num_samples` counts the input samples observed
-    so far, per problem. Subclasses implement `observe` and `_solve`, and
-    set `mode`; a subclass that sets `warn_tokens_per_row` also words the
-    warning in its classmethod `undersampling_warning(layers)`.
+    so far, per problem, and `hessian` is their `2 mean(x x^T)`.
+    Subclasses set `mode`, implement `_solve` and can accumulate
+    statistics of their own in `_observe`. A subclass that sets
+    `warn_tokens_per_row` also words the warning in its classmethod
+    `undersampling_warning(layers)`.
 
     Args:
         layer: A float layer with a projection geometry (`Dense`,
@@ -60,10 +63,42 @@ class Calibrator:
         self.view = geometry.contraction_view()
         self.batch = self.view.batch
         self.rows = self.view.rows
+        self.hessian = ops.zeros(
+            self._per_problem((self.rows, self.rows)), dtype="float32"
+        )
 
     def observe(self, inputs):
-        """Accumulates statistics from one batch of the layer's inputs."""
-        raise NotImplementedError
+        """Accumulates statistics from one batch of the layer's inputs.
+
+        The Hessian is the running mean `2 X^T X / N`: GPTQ solves with it
+        and AWQ scores its searches with it.
+        """
+        x = self._inputs_view(inputs)
+        self._observe(x)
+        total_samples = self.num_samples + int(ops.shape(x)[-2])
+        gram_matrix = ops.matmul(ops.swapaxes(x, -1, -2), x)
+        # Ensures numerical stability and symmetry in case of large floating
+        # point activations.
+        gram_matrix = ops.divide(
+            ops.add(gram_matrix, ops.swapaxes(gram_matrix, -1, -2)), 2.0
+        )
+        # Decay the previous mean and add the batch's contribution (2 / N).
+        if self.num_samples > 0:
+            self.hessian = ops.multiply(
+                self.hessian, ops.divide(self.num_samples, total_samples)
+            )
+        self.hessian = ops.add(
+            self.hessian,
+            ops.multiply(ops.divide(2.0, total_samples), gram_matrix),
+        )
+        self.num_samples = total_samples
+
+    def _observe(self, x):
+        """Accumulates the mode's own statistics from a laid-out batch.
+
+        `x` is the batch as `_inputs_view` returns it; `num_samples` does
+        not count it yet.
+        """
 
     def _inputs_view(self, inputs):
         """Validates `inputs` and lays them out through the view.

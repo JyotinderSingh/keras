@@ -12,7 +12,6 @@ from keras.src import models
 from keras.src import ops
 from keras.src import saving
 from keras.src import testing
-from keras.src.quantizers.awq import MAX_CLIP_SAMPLE_ROWS
 from keras.src.quantizers.geometry import ContractionView
 from keras.src.quantizers.geometry import KernelAxes
 from keras.src.quantizers.geometry import ProjectionGeometry
@@ -495,31 +494,34 @@ class CalibrationEinsumLayoutTest(testing.TestCase):
             self.assertAllClose(dequantized[head], _dequantized(dense)[:, 0])
             self.assertAllClose(outputs[:, :, head], dense(x_head)[..., 0])
 
-    def test_awq_clip_sample_is_capped_per_expert(self):
-        # Over two batches of 300 tokens, each expert keeps its own first
-        # `MAX_CLIP_SAMPLE_ROWS` rows for the clipping search, as a `Dense`
-        # of that expert does.
+    def test_awq_clipping_search_is_per_expert(self):
+        # Over two batches of 300 tokens, each expert's clipping search
+        # scores its bounds with that expert's own Hessian, as a `Dense` of
+        # that expert does.
         experts, inner, width = 2, 8, 4
         config = _config("awq", group_size=4, apply_clip=True)
         rng = np.random.default_rng(seed=31)
-        layer = _einsum(
-            "btei,eid->bted",
-            (None, experts, width),
-            (None, 300, experts, inner),
-        )
-        kernel = ops.convert_to_numpy(layer.kernel)
         batches = [
             rng.standard_normal((1, 300, experts, inner)).astype("float32")
             for _ in range(2)
         ]
-        calibrator = calibrate_layer(layer, config, *batches)
-        self.assertEqual(calibrator._clip_sample_rows, MAX_CLIP_SAMPLE_ROWS)
-        self.assertEqual(
-            tuple(ops.concatenate(calibrator._clip_samples, axis=-2).shape),
-            (experts, MAX_CLIP_SAMPLE_ROWS, inner),
-        )
+        # Gaussian weights have tails for the clipping search to cut.
+        kernel = rng.standard_normal((experts, inner, width)).astype("float32")
 
-        dequantized = _dequantized(layer)
+        def calibrated(config):
+            layer = _einsum(
+                "btei,eid->bted",
+                (None, experts, width),
+                (None, 300, experts, inner),
+                kernel,
+            )
+            calibrate_layer(layer, config, *batches)
+            return _dequantized(layer)
+
+        dequantized = calibrated(config)
+        self.assertNotAllClose(
+            dequantized, calibrated(_config("awq", group_size=4))
+        )
         for expert in range(experts):
             dense = _dense(kernel[expert])
             calibrate_layer(
