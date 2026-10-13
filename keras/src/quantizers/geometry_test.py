@@ -1,3 +1,5 @@
+import math
+
 import numpy as np
 from absl.testing import parameterized
 
@@ -529,6 +531,42 @@ class CustomProjectionTest(testing.TestCase):
 
         self.assertEqual(Geometry(None).kernel_scale_axes, (0, 2))
         self.assertEqual(ProjectionGeometry(None).kernel_scale_axes, (1,))
+
+    def test_contraction_override_turns_the_routes_off(self):
+        # A subclass that overrides `contract` or `kernel_axes` without
+        # `matrix_contraction` gets a hook that returns `None` when the
+        # class is created; one that defines the hook keeps it, and one
+        # that overrides only `contract_grad` keeps the default.
+        class Permuted(ProjectionGeometry):
+            def contract(self, inputs, kernel):
+                return ops.matmul(ops.flip(inputs, axis=-1), kernel)
+
+        class Axes(ProjectionGeometry):
+            kernel_axes = KernelAxes(contracted=(0, 1), free=(2,))
+
+        class Described(Axes):
+            def matrix_contraction(self):
+                shape = self.weight_shape
+                return math.prod(shape[:2]), 1, (shape[2],)
+
+        class GradOnly(ProjectionGeometry):
+            def contract_grad(self, upstream, float_kernel):
+                return ops.matmul(upstream, ops.transpose(float_kernel))
+
+        dense = layers.Dense(6)
+        dense.build((None, 8))
+        pointwise = Pointwise1D(6)
+        pointwise.build((None, 5, 8))
+        self.assertEqual(
+            ProjectionGeometry(dense).matrix_contraction(), (8, 1, (6,))
+        )
+        self.assertEqual(GradOnly(dense).matrix_contraction(), (8, 1, (6,)))
+        self.assertIsNone(Permuted(dense).matrix_contraction())
+        self.assertIsNone(Axes(pointwise).matrix_contraction())
+        self.assertEqual(
+            Described(pointwise).matrix_contraction(), (8, 1, (6,))
+        )
+        self.assertIsNone(MinimalGeometry(pointwise).matrix_contraction())
 
     def test_replaced_hook_is_refused(self):
         with self.assertRaisesRegex(

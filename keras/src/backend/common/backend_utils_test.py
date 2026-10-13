@@ -1,5 +1,6 @@
 import numpy as np
 
+from keras.src.backend.common.backend_utils import M_BUCKET_NAMES
 from keras.src.backend.common.backend_utils import (
     _convert_conv_transpose_padding_args_from_keras_to_jax,
 )
@@ -16,6 +17,7 @@ from keras.src.backend.common.backend_utils import (
 from keras.src.backend.common.backend_utils import (
     compute_conv_transpose_padding_args_for_torch,
 )
+from keras.src.backend.common.backend_utils import m_bucket
 from keras.src.testing import test_case
 
 
@@ -210,6 +212,15 @@ class CanonicalizeAxesTest(test_case.TestCase):
     def test_invalid_axis_element_type(self):
         with self.assertRaises(TypeError):
             canonicalize_axes([0, "1"], 4)
+
+
+class MBucketTest(test_case.TestCase):
+    def test_edges(self):
+        edges = {1: "1-16", 16: "1-16", 17: "17-64", 64: "17-64"}
+        edges.update({65: "65-256", 256: "65-256", 257: "257+", 4096: "257+"})
+        for m, name in edges.items():
+            self.assertEqual(m_bucket(m), name, m)
+        self.assertEqual(set(edges.values()), set(M_BUCKET_NAMES))
 
 
 class GetOutputShapeGivenTFPaddingTest(test_case.TestCase):

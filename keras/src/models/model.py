@@ -10,6 +10,7 @@ from keras.src.api_export import keras_export
 from keras.src.layers.core.input_layer import InputLayer
 from keras.src.layers.layer import Layer
 from keras.src.models.variable_mapping import map_saveable_variables
+from keras.src.quantizers import kernels
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.quantization_config import validate_and_resolve_config
 from keras.src.quantizers.report import QuantizationReport
@@ -484,6 +485,11 @@ class Model(Trainer, Layer):
         `model._quantization_report` lists them, and the compiled functions
         are reset when at least one layer changed.
 
+        A layer quantized to 4-bit weights runs a kernel in place of its
+        reference path where the backend has a measured one for the
+        device, the dtype and the shapes of the call;
+        `keras.config.disable_quantized_kernels()` turns the kernels off.
+
         Args:
             mode: The mode of the quantization. Supported modes are:
                 `"int8"`, `"int4"`, `"float8"`, `"ternary"`, `"gptq"` and
@@ -499,9 +505,10 @@ class Model(Trainer, Layer):
                     GEMM; activation scales are computed dynamically per call.
                 -   `"int4"`: **W4A16 weight-only**, **grouped** with
                     `block_size=128` by default. Only weights are quantized (to
-                    4 bits, packed two per `int8` byte); this is storage-only
-                    today (weights are dequantized to float before each
-                    matmul). Pass `Int4QuantizationConfig(block_size=-1)` for
+                    4 bits, packed two per `int8` byte); a kernel contracts the
+                    packed weights where the backend has one, and the
+                    reference path dequantizes them to float before each
+                    matmul. Pass `Int4QuantizationConfig(block_size=-1)` for
                     per-channel.
                 -   `"float8"`: **float8 QDQ** mixed-precision training scheme
                     (not post-training compression); weights and activations
@@ -971,46 +978,49 @@ class Model(Trainer, Layer):
         if format == "torch" and backend.backend() != "torch":
             raise ValueError("Torch export requires PyTorch backend.")
 
-        if format == "tf_saved_model":
-            export_saved_model(
-                self,
-                filepath,
-                verbose,
-                input_signature=input_signature,
-                **kwargs,
-            )
-        elif format == "onnx":
-            export_onnx(
-                self,
-                filepath,
-                verbose,
-                input_signature=input_signature,
-                **kwargs,
-            )
-        elif format == "openvino":
-            export_openvino(
-                self,
-                filepath,
-                verbose,
-                input_signature=input_signature,
-                **kwargs,
-            )
-        elif format == "litert":
-            export_litert(
-                self,
-                filepath,
-                verbose=verbose,
-                input_signature=input_signature,
-                **kwargs,
-            )
-        elif format == "torch":
-            export_torch(
-                self,
-                filepath,
-                verbose=verbose,
-                input_signature=input_signature,
-                **kwargs,
-            )
+        # Every format traces the reference path of a quantized layer, so
+        # the artifact holds no kernel of this host.
+        with kernels.policy("off"):
+            if format == "tf_saved_model":
+                export_saved_model(
+                    self,
+                    filepath,
+                    verbose,
+                    input_signature=input_signature,
+                    **kwargs,
+                )
+            elif format == "onnx":
+                export_onnx(
+                    self,
+                    filepath,
+                    verbose,
+                    input_signature=input_signature,
+                    **kwargs,
+                )
+            elif format == "openvino":
+                export_openvino(
+                    self,
+                    filepath,
+                    verbose,
+                    input_signature=input_signature,
+                    **kwargs,
+                )
+            elif format == "litert":
+                export_litert(
+                    self,
+                    filepath,
+                    verbose=verbose,
+                    input_signature=input_signature,
+                    **kwargs,
+                )
+            elif format == "torch":
+                export_torch(
+                    self,
+                    filepath,
+                    verbose=verbose,
+                    input_signature=input_signature,
+                    **kwargs,
+                )
 
     @classmethod
     def from_config(cls, config, custom_objects=None):

@@ -18,7 +18,9 @@ from keras.src import random
 from keras.src import saving
 from keras.src import testing
 from keras.src.backend.common import standardize_dtype
+from keras.src.layers.core.einsum_dense import EinsumAxes
 from keras.src.layers.core.einsum_dense import _analyze_einsum_string
+from keras.src.quantizers import kernels
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
@@ -1039,7 +1041,10 @@ class EinsumDenseTest(testing.TestCase):
 
             temp_filepath = os.path.join(self.get_temp_dir(), "exported_model")
             ref_input = tf.random.normal(input_shape)
-            ref_output = model(ref_input)
+            # The export traces the reference path (the kernel policy
+            # `"off"`), so the reference output comes from that path too.
+            with kernels.policy("off"):
+                ref_output = model(ref_input)
             model.export(temp_filepath, format="tf_saved_model")
             reloaded_layer = export.TFSMLayer(temp_filepath)
             self.assertAllClose(
@@ -2200,6 +2205,62 @@ class EinsumDenseTest(testing.TestCase):
             atol=1e-6,
             rtol=1e-6,
         )
+
+
+class MatmulContractedAxesTest(testing.TestCase):
+    @parameterized.named_parameters(
+        ("matmul", "ab,bc->ac", 2, 1),
+        ("qkv", "btd,dnh->btnh", 3, 1),
+        ("query", "btd,ndh->btnh", 3, 1),
+        ("output", "btnh,nhd->btd", 4, 2),
+        ("expert_gate", "btd,edi->btei", 3, 1),
+        ("contracted_first", "abc,cde->abde", 3, 1),
+        ("two_contracted_apart", "abcd,ced->abe", 4, 2),
+        ("outer_product", "bt,nh->btnh", 2, 0),
+        ("left_ellipsis", "...b,bc->...c", 3, 1),
+        ("batch_axis", "ebd,edf->ebf", 3, None),
+        ("summed_input_axis", "abc,cd->ad", 3, None),
+        ("contracted_out_of_order", "abcd,edc->abe", 4, None),
+        ("outputs_permuted", "btd,dnh->bnth", 3, None),
+        ("kernel_free_permuted", "btd,dnh->bthn", 3, None),
+    )
+    def test_verdict(self, equation, rank, contracted):
+        axes = EinsumAxes.from_equation(equation, rank)
+        self.assertEqual(axes.matmul_contracted_axes(), contracted)
+
+    @parameterized.named_parameters(
+        (
+            "qkv",
+            "btd,dnh->btnh",
+            (None, 4, 16),
+            (None, 3, 64),
+            (64, 1, (4, 16)),
+        ),
+        (
+            "output",
+            "btnh,nhd->btd",
+            (None, 96),
+            (None, 3, 4, 32),
+            (128, 2, (96,)),
+        ),
+        (
+            "query",
+            "btd,ndh->btnh",
+            (None, 4, 16),
+            (None, 3, 64),
+            (64, 1, (4, 16)),
+        ),
+        ("batch_axis", "ebd,edf->ebf", (None, 16), (3, 2, 64), None),
+    )
+    def test_geometry_matrix_contraction(
+        self, equation, output_shape, input_shape, expected
+    ):
+        # The geometry turns the verdict into the `(rows, contracted,
+        # columns)` triple of the kernel's sizes, in kernel order.
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        geometry = layer._quantization_geometry()
+        self.assertEqual(geometry.matrix_contraction(), expected)
 
 
 class EinsumDenseLoRATest(testing.TestCase):

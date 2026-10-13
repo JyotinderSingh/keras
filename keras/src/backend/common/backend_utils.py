@@ -370,6 +370,23 @@ def standardize_axis_for_numpy(axis):
     return tuple(axis) if isinstance(axis, list) else axis
 
 
+# The M buckets of a measured row of a quantized contraction. A row of
+# `quantizers.kernels` names a bucket.
+M_BUCKET_NAMES = ("1-16", "17-64", "65-256", "257+")
+# The largest M of each bucket but the last.
+_M_BUCKET_EDGES = (16, 64, 256)
+
+
+def m_bucket(m):
+    """The name of the M bucket that holds `m` rows."""
+    # A plain loop: Dynamo traces this in a route selection, and
+    # `bisect` is a function it skips (a graph break).
+    for index, edge in enumerate(_M_BUCKET_EDGES):
+        if m <= edge:
+            return M_BUCKET_NAMES[index]
+    return M_BUCKET_NAMES[-1]
+
+
 def check_conv_input_channels(inputs, kernel, data_format):
     """Validate a conv input against its kernel shape.
 

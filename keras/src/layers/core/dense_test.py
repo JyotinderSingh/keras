@@ -19,6 +19,7 @@ from keras.src import saving
 from keras.src import testing
 from keras.src.backend.common import keras_tensor
 from keras.src.backend.common import standardize_dtype
+from keras.src.quantizers import kernels
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
@@ -730,7 +731,10 @@ class DenseTest(testing.TestCase):
 
             temp_filepath = os.path.join(self.get_temp_dir(), "exported_model")
             ref_input = tf.random.normal((2, 8))
-            ref_output = model(ref_input)
+            # The export traces the reference path (the kernel policy
+            # `"off"`), so the reference output comes from that path too.
+            with kernels.policy("off"):
+                ref_output = model(ref_input)
             model.export(temp_filepath, format="tf_saved_model")
             reloaded_layer = export.TFSMLayer(temp_filepath)
             self.assertAllClose(

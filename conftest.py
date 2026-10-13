@@ -6,14 +6,31 @@ try:
 except ImportError:
     torch = None
 
+import contextlib  # noqa: E402
 import os  # noqa: E402
 
 import pytest  # noqa: E402
 
 from keras.src.backend import SUPPORTS_GRADIENT  # noqa: E402
+from keras.src.backend import config as backend_config  # noqa: E402
 from keras.src.backend.config import PLUGGABLE_BACKENDS
 from keras.src.backend.config import backend  # noqa: E402
+from keras.src.quantizers import kernels  # noqa: E402
 from keras.src.utils.module_utils import get_pluggable_backend_module
+
+
+def pytest_addoption(parser):
+    parser.addoption(
+        "--kernel-policy",
+        choices=("auto", "off", "require"),
+        default="auto",
+        help=(
+            "The policy of the quantized kernels for the session. `auto` "
+            "leaves the policy as it is. Under `off` or `require`, a test "
+            "that leaves another policy fails. `require` fails at the "
+            "start on a platform with no kernel."
+        ),
+    )
 
 
 def pytest_configure(config):
@@ -45,6 +62,45 @@ def pytest_configure(config):
     elif backend() == "torch":
         if torch.cuda.is_available():
             torch.backends.cudnn.allow_tf32 = False
+
+    # `require` on a platform with no kernel fails here, once, with the
+    # requirements of each kernel.
+    try:
+        kernels._check_policy(config.getoption("--kernel-policy"))
+    except ValueError as error:
+        raise pytest.UsageError(str(error)) from error
+
+
+@pytest.fixture(scope="session", autouse=True)
+def kernel_policy(request):
+    """Runs the session under `--kernel-policy`."""
+    value = request.config.getoption("--kernel-policy")
+    if value == "auto":
+        context = contextlib.nullcontext()
+    else:
+        context = kernels.policy(value)
+    with context:
+        yield
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_runtest_teardown(item, nextitem):
+    """Under `--kernel-policy=off` or `require`, fails a test that leaves
+    another kernel policy, and sets the option again for the next test.
+
+    `trylast`: this runs after the teardown of the fixtures. After the
+    last test, the session fixture has put the previous policy back.
+    """
+    expected = item.config.getoption("--kernel-policy")
+    if expected == "auto" or nextitem is None:
+        return
+    policy = backend_config._quantized_kernels_policy()
+    if policy != expected:
+        backend_config._set_quantized_kernels_policy(expected)
+        pytest.fail(
+            f'The test leaves the kernel policy "{policy}", not "{expected}".',
+            pytrace=False,
+        )
 
 
 def pytest_collection_modifyitems(config, items):

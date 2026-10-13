@@ -690,3 +690,27 @@ class EinsumAxes:
             for i in kernel_axes
             if self.kernel[i] in self.inputs
         )
+
+    def matmul_contracted_axes(self):
+        """How many trailing input axes a 2-D matmul contracts, or `None`.
+
+        The stored rows hold the contracted kernel axes and the columns the
+        free kernel axes, each in kernel order. The inputs reshaped to
+        `(M, K)` line up with them when the equation has no batch axis,
+        every input label is in the output or in the kernel, the
+        contracted labels are the last input labels, in kernel order, and
+        the output labels are the free input labels in input order, then
+        the free kernel labels in kernel order.
+        """
+        inputs, kernel, output = self.inputs, self.kernel, self.output
+        contracted = "".join(label for label in kernel if label not in output)
+        free = "".join(label for label in kernel if label in output)
+        leading = inputs[: max(len(inputs) - len(contracted), 0)]
+        if (
+            set(free) & set(inputs)
+            or not set(inputs) <= set(output + kernel)
+            or inputs[len(leading) :] != contracted
+            or output != leading + free
+        ):
+            return None
+        return len(contracted)

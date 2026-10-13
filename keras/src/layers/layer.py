@@ -1624,6 +1624,11 @@ class Layer(BackendLayer, Operation):
         from calibration data, so they raise here; `Model.quantize` runs
         them.
 
+        A layer quantized to 4-bit weights runs a kernel in place of its
+        reference path where the backend has a measured one for the
+        device, the dtype and the shapes of the call;
+        `keras.config.disable_quantized_kernels()` turns the kernels off.
+
         Args:
             mode: The quantization mode, e.g. `"int8"`. Optional if `config`
                 is provided.
