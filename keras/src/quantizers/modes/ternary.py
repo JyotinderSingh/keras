@@ -80,6 +80,7 @@ class TernaryStrategy(QuantizationStrategy):
             layout=TernaryTrits(axis=-1, orig_len=shape[-1]),
             scheme=WeightScheme(code_range=(-1, 1), scale_form="multiplier"),
             shape=shape,
+            scale_axes=(),
         )
 
     def call(self, layer, inputs, **kwargs):
