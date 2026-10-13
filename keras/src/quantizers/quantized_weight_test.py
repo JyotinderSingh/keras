@@ -519,6 +519,29 @@ class LayerViewTest(testing.TestCase):
         layer.quantize("float8")
         self.assertIsNone(layer._quantized_weight())
 
+    def test_apply_scale_multiplies_by_a_multiplier_scale(self):
+        # The ternary forward pass contracts with the codes and multiplies
+        # the outputs by the scalar scale.
+        layer, _ = _quantized(
+            layers.Dense(4, use_bias=False), (None, 11), "ternary"
+        )
+        view = layer._quantized_weight()
+        inputs = np.random.default_rng(1).normal(size=(3, 11))
+        inputs = inputs.astype("float32")
+        outputs = ops.matmul(inputs, ops.cast(view.unpack(), "float32"))
+        self.assertAllClose(view.apply_scale(outputs), layer(inputs))
+
+    def test_apply_scale_refuses_a_zero_point(self):
+        layer, _ = _quantized(
+            layers.Dense(4),
+            (None, 8),
+            "int4",
+            Int4QuantizationConfig(block_size=2),
+        )
+        view = layer._quantized_weight()
+        with self.assertRaisesRegex(ValueError, "zero point"):
+            view.apply_scale(ops.zeros((3, 4)))
+
 
 class QuantizationSummaryTest(testing.TestCase):
     def test_summary_counts_logical_parameters_exactly(self):
