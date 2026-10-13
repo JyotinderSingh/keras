@@ -108,11 +108,10 @@ def _untested():
 def _routes(rows=None, required=None, **sources):
     """Adds `matrix` and `sources` to the route table, sets the allow-list
     to `rows`, and sets `required` as this backend's `"require"` kernels
-    (`{}` for none). Then it puts back the allow-list and the platform's
-    own `"require"` kernels."""
+    (`{}` for none). The tables are as before when the block ends."""
     sources = {"matrix": kernels.RouteSource(_matrix), **sources}
     allow_list = dict(kernels._ALLOW_LIST)
-    platform_kernels = kernels._REQUIRED.get(backend.backend())
+    required_kernels = dict(kernels._REQUIRED)
     kernels._ROUTES.update(sources)
     kernels._ALLOW_LIST.clear()
     kernels._ALLOW_LIST.update(rows or {})
@@ -130,9 +129,8 @@ def _routes(rows=None, required=None, **sources):
             del kernels._ROUTES[name]
         kernels._ALLOW_LIST.clear()
         kernels._ALLOW_LIST.update(allow_list)
-        kernels._REQUIRED.pop(backend.backend(), None)
-        if platform_kernels is not None:
-            kernels._REQUIRED[backend.backend()] = platform_kernels
+        kernels._REQUIRED.clear()
+        kernels._REQUIRED.update(required_kernels)
 
 
 def _device_type():
@@ -925,7 +923,9 @@ class PolicyTest(testing.TestCase):
         self.assertEqual(self.state(), self.initial)
 
     def test_require_raises_without_a_kernel(self):
-        # A CUDA host with Triton has a kernel, so the test removes it.
+        """The test clears this backend's `"require"` kernels, because the
+        static entries of `_REQUIRED` give a GPU one: Triton K1 on a CUDA
+        host with Triton (torch), and Mosaic GPU K1 on JAX."""
         with _routes(required={}):
             with self.assertRaisesRegex(ValueError, "needs a platform with"):
                 kernels.set_policy("require")
@@ -943,6 +943,7 @@ class PolicyTest(testing.TestCase):
         refused = _layer(REFUSED["batch_axis"])
         x = _random(REFUSED["batch_axis"][2])
         required = {_device_type(): "untested"}
+        static = {name: dict(row) for name, row in kernels._REQUIRED.items()}
         with _routes(required=required, untested=_untested()):
             with kernels.policy("require"):
                 counts = [
@@ -953,6 +954,8 @@ class PolicyTest(testing.TestCase):
         self.assertEqual(
             counts, [{"untested": 1}, {"reference": 1}, {"reference": 1}]
         )
+        # The static entries of the platforms with a kernel stay.
+        self.assertEqual(kernels._REQUIRED, static)
 
 
 class VersionTest(testing.TestCase):
