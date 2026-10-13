@@ -215,48 +215,16 @@ class Embedding(Layer):
         a_initializer="he_uniform",
         b_initializer="zeros",
     ):
-        if self.embeddings_constraint:
-            raise ValueError(
-                "Lora is incompatible with embedding constraints. "
-                "In order to enable lora on this layer, remove the "
-                "`embeddings_constraint` argument."
-            )
-        if not self.built:
-            raise ValueError(
-                "Cannot enable lora on a layer that isn't yet built."
-            )
-        if self.lora_enabled:
-            raise ValueError(
-                "lora is already enabled. This can only be done once per layer."
-            )
-        self._check_lora_supported(self.quantization_mode)
-        self._tracker.unlock()
+        self._enable_lora(
+            "embeddings",
+            rank,
+            lora_alpha=lora_alpha,
+            a_initializer=a_initializer,
+            b_initializer=b_initializer,
+        )
 
-        # LoRA weights should be float32 to avoid the risk of underflow or
-        # overflow during fine-tuning.
-        # When deploying the model, these weights should be merged with the
-        # original embedding while maintaining the original embedding's dtype.
-        self.lora_embeddings_a = self.add_weight(
-            name="lora_embeddings_a",
-            shape=(self.input_dim, rank),
-            initializer=initializers.get(a_initializer),
-            dtype="float32",
-            regularizer=self.embeddings_regularizer,
-        )
-        self.lora_embeddings_b = self.add_weight(
-            name="lora_embeddings_b",
-            shape=(rank, self.output_dim),
-            initializer=initializers.get(b_initializer),
-            dtype="float32",
-            regularizer=self.embeddings_regularizer,
-        )
-        # Freeze the underlying variable, not the `embeddings` property, which
-        # returns a throwaway unpacked tensor in int4 mode.
-        self._embeddings.trainable = False
-        self._tracker.lock()
-        self.lora_enabled = True
-        self.lora_rank = rank
-        self.lora_alpha = lora_alpha if lora_alpha is not None else rank
+    def _lora_weight_shape(self):
+        return (self.input_dim, self.output_dim)
 
     def save_own_variables(self, store):
         self._save_serialized_variables(store, "embeddings")

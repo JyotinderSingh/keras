@@ -242,7 +242,8 @@ class Layer(BackendLayer, Operation):
     """
 
     # Whether this layer's own weights carry a LoRA update. A layer that
-    # supports LoRA sets it in `enable_lora()`.
+    # supports LoRA defines `enable_lora()`, which calls `_enable_lora()`
+    # to set it.
     lora_enabled = False
 
     def __new__(cls, *args, **kwargs):
@@ -1477,6 +1478,98 @@ class Layer(BackendLayer, Operation):
                 f"lora is not currently supported with {mode.upper()} "
                 "quantization."
             )
+
+    def _enable_lora(
+        self,
+        name,
+        rank,
+        lora_alpha=None,
+        a_initializer="he_uniform",
+        b_initializer="zeros",
+    ):
+        """Adds the LoRA factors of the weight `name` and freezes the weight.
+
+        The public `enable_lora` of a layer that supports LoRA calls this.
+        The layer holds the weight at `_<name>`, and `_lora_weight_shape()`
+        returns the weight's float shape. The attributes
+        `<name>_constraint` and `<name>_regularizer` are optional: a
+        constraint refuses LoRA, and the regularizer also applies to the
+        factors.
+
+        The factors are `lora_<name>_a`, the weight's shape with `rank` as
+        its last axis, and `lora_<name>_b`, `(rank, last axis)`, so that
+        `lora_<name>_a @ lora_<name>_b` has the weight's shape. The
+        quantized forward passes and the merged save
+        (`_get_weight_with_merged_lora`) rely on this layout. The factors
+        are `float32` whatever the policy.
+
+        The checks run before `_lora_weight_shape()`, because an unbuilt
+        layer may not know its weight's shape. Called from `build()`, this
+        leaves the tracker open, and `build()` locks it.
+
+        Args:
+            name: The weight's name, such as `"kernel"` or `"embeddings"`.
+            rank: The rank of the factors.
+            lora_alpha: The numerator of the update's scale
+                `lora_alpha / rank`. Defaults to `rank`.
+            a_initializer: The initializer of `lora_<name>_a`.
+            b_initializer: The initializer of `lora_<name>_b`.
+        """
+        if getattr(self, f"{name}_constraint", None):
+            raise ValueError(
+                f"Lora is incompatible with {name.removesuffix('s')} "
+                "constraints. In order to enable lora on this layer, remove "
+                f"the `{name}_constraint` argument."
+            )
+        if not self.built:
+            raise ValueError(
+                "Cannot enable lora on a layer that isn't yet built."
+            )
+        if self.lora_enabled:
+            raise ValueError(
+                "lora is already enabled. This can only be done once per layer."
+            )
+        self._check_lora_supported(self.quantization_mode)
+        shape = tuple(self._lora_weight_shape())
+        regularizer = getattr(self, f"{name}_regularizer", None)
+        # Called from `build()`, the tracker stays open for the state a
+        # subclass adds after `super().build()`, and `build()` locks it
+        # with the standard message.
+        locked = self._tracker.locked
+        self._tracker.unlock()
+        # LoRA weights should be float32 to avoid the risk of underflow or
+        # overflow during fine-tuning.
+        # When deploying the model, these weights should be merged with the
+        # original weight while maintaining the original weight's dtype.
+        for factor, factor_shape, initializer in (
+            ("a", shape[:-1] + (rank,), a_initializer),
+            ("b", (rank, shape[-1]), b_initializer),
+        ):
+            setattr(
+                self,
+                f"lora_{name}_{factor}",
+                self.add_weight(
+                    name=f"lora_{name}_{factor}",
+                    shape=factor_shape,
+                    initializer=initializers.get(initializer),
+                    dtype="float32",
+                    regularizer=regularizer,
+                ),
+            )
+        if self._quantized_weight() is None:
+            # The float weight of an unquantized layer (float8, which keeps
+            # it, refuses LoRA above); a quantized weight's codes were
+            # built non-trainable.
+            getattr(self, f"_{name}").trainable = False
+        if locked:
+            self._tracker.lock()
+        self.lora_enabled = True
+        self.lora_rank = rank
+        self.lora_alpha = lora_alpha if lora_alpha is not None else rank
+
+    def _lora_weight_shape(self):
+        """Returns the float shape of the weight that `_enable_lora` reads."""
+        raise self._not_implemented_error(self._lora_weight_shape)
 
     def _check_quantized_build_attributes(self, geometry):
         """Raises if the layer lacks an attribute `geometry` reads."""
