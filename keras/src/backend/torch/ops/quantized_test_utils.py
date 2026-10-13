@@ -7,15 +7,15 @@ from keras.src.quantizers import kernels
 
 
 def register_interpret_routes():
-    """Adds `"triton_interpret"` to the matmul routes under the Triton
-    interpreter, and returns `{"triton_interpret": "triton"}`. Elsewhere,
-    it adds nothing and returns `{}`.
+    """Adds `"triton_interpret"` to the matmul and the logits routes under
+    the Triton interpreter, and returns `{"triton_interpret": "triton"}`.
+    Elsewhere, it adds nothing and returns `{}`.
 
     The routes of `KERNELS` pass no CPU device: no measurement runs the
-    Triton interpreter. The interpret route is the route `"triton"` with
-    the device check "a CPU device", so `force_route` and a measured row
-    run the kernel on CPU through real layers. It has no `kernel`, so
-    `"require"` does not run it. `kernels_test_utils` calls this at
+    Triton interpreter. The interpret routes are the routes `"triton"`
+    with the device check "a CPU device", so `force_route` and a measured
+    row run the kernel on CPU through real layers. They have no `kernel`,
+    so `"require"` does not run them. `kernels_test_utils` calls this at
     import.
     """
     if not quantized.INTERPRETED:
@@ -25,8 +25,11 @@ def register_interpret_routes():
         kernel,
         supports_device=lambda device_class: device_class.startswith("cpu-"),
     )
-    matmul, _ = kernels._kernel_routes(kernel)
+    matmul, logits = kernels._kernel_routes(kernel)
     kernels._ROUTES["triton_interpret"] = dataclasses.replace(
         matmul, kernel=None
+    )
+    kernels._LOGITS_ROUTES["triton_interpret"] = dataclasses.replace(
+        logits, kernel=None
     )
     return {"triton_interpret": "triton"}
