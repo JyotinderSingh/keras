@@ -8,9 +8,9 @@ Importing this module registers test routes in both route tables:
   for the reverse lookup, the custom gradient), so its outputs must equal
   those of the reference path bit for bit.
 - The interpret routes of the backend: `"mosaic_gpu_interpret"` on JAX
-  (the matmul table only) and `"triton_interpret"` on torch under the
-  Triton interpreter. They run the kernels of the backend on a CPU host
-  and have no `kernel`, so `"require"` does not run them.
+  and `"triton_interpret"` on torch under the Triton interpreter. They
+  run the kernels of the backend on a CPU host and have no `kernel`, so
+  `"require"` does not run them.
 
 `route_tables` adds the `"matrix"` routes, which contract the `(M, K)`
 inputs with the stored matrix.
