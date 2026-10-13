@@ -1,5 +1,3 @@
-from unittest import mock
-
 import numpy as np
 import pytest
 from absl.testing import parameterized
@@ -699,23 +697,25 @@ class GeometryDispatchTest(testing.TestCase):
     @parameterized.named_parameters(
         ("build", "_build_projection"),
         ("call", "_call_projection"),
+        ("quantize", "_quantize_projection"),
         ("quantized_weight", "_get_projection_quantized_weight"),
+        ("encode", "_encode_lookup"),
+        ("reverse_view", "_get_reverse_lookup_quantized_weight"),
     )
-    def test_missing_handler_refuses_before_the_layer_changes(self, handler):
-        incomplete = type("Incomplete", (Int8Strategy,), {handler: None})
-        layer = layers.Dense(4)
-        layer.build((None, 3))
-        kernel = ops.convert_to_numpy(layer._kernel)
-        modes = {"int8": incomplete()}
-        with mock.patch.dict(strategy_registry._MODE_TO_STRATEGY, modes):
-            with self.assertRaisesRegex(NotImplementedError, handler):
-                layer.quantize("int8")
-        self.assertIsNone(layer.quantization_mode)
-        self.assertIsNone(layer.quantization_config)
-        self.assertAllEqual(layer._kernel, kernel)
+    def test_register_refuses_a_mode_that_lacks_a_handler(self, handler):
+        incomplete = type(
+            "Incomplete", (Int8Strategy,), {"name": "incomplete", handler: None}
+        )
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy, "incomplete"
+        )
+        with self.assertRaisesRegex(ValueError, f"does not define `{handler}`"):
+            strategy_registry.register_quantization_strategy(incomplete)
+        self.assertFalse(strategy_registry.is_registered("incomplete"))
 
     def test_overridden_verb_needs_no_handler(self):
         class OwnCall(Int8Strategy):
+            name = "own_call"
             _call_projection = None
 
             def call(self, layer, *args, **kwargs):
@@ -723,9 +723,49 @@ class GeometryDispatchTest(testing.TestCase):
                     self, layer, *args, **kwargs
                 )
 
-        layer = layers.Dense(4)
-        layer.build((None, 3))
-        modes = {"int8": OwnCall()}
-        with mock.patch.dict(strategy_registry._MODE_TO_STRATEGY, modes):
-            layer.quantize("int8")
-        self.assertEqual(layer.quantization_mode, "int8")
+        strategy_registry.register_quantization_strategy(OwnCall)
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy, "own_call"
+        )
+        self.assertIs(type(strategy_registry.get_strategy("own_call")), OwnCall)
+
+    def test_overridden_view_or_merge_needs_no_handler(self):
+        # A mode that lists the views itself needs no reverse view handler,
+        # and one that merges LoRA itself needs no encode handler.
+        class OwnViews(Int8Strategy):
+            name = "own_views"
+            _get_reverse_lookup_quantized_weight = None
+
+            def quantized_weights(self, layer):
+                return Int8Strategy.quantized_weights(self, layer)
+
+        class OwnMerge(Int8Strategy):
+            name = "own_merge"
+            _encode_projection = None
+
+            def merge_lora_delta(self, layer, delta):
+                return Int8Strategy.merge_lora_delta(self, layer, delta)
+
+        for strategy in (OwnViews, OwnMerge):
+            strategy_registry.register_quantization_strategy(strategy)
+            self.addCleanup(
+                strategy_registry.unregister_quantization_strategy,
+                strategy.name,
+            )
+            self.assertTrue(strategy_registry.is_registered(strategy.name))
+
+    def test_a_mode_without_lora_needs_no_encode_handler(self):
+        no_lora = type(
+            "NoLoRA",
+            (Int8Strategy,),
+            {
+                "name": "no_lora",
+                "supports_lora": False,
+                "_encode_projection": None,
+            },
+        )
+        strategy_registry.register_quantization_strategy(no_lora)
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy, "no_lora"
+        )
+        self.assertTrue(strategy_registry.is_registered("no_lora"))

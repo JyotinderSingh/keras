@@ -13,7 +13,9 @@ from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.geometry import LookupGeometry
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.gptq_config import GPTQConfig
+from keras.src.quantizers.modes.calibration import GPTQStrategy
 from keras.src.quantizers.quantization_config import QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import Pointwise1D
 
 
 class StrategyRegistryTest(testing.TestCase):
@@ -31,7 +33,7 @@ class StrategyRegistryTest(testing.TestCase):
 
     def test_register_requires_name(self):
         class Nameless(strategy_registry.QuantizationStrategy):
-            requires_config = True
+            pass
 
         with self.assertRaisesRegex(ValueError, "non-empty string `name`"):
             strategy_registry.register_quantization_strategy(Nameless)
@@ -39,7 +41,6 @@ class StrategyRegistryTest(testing.TestCase):
     def test_register_rejects_duplicates(self):
         class Duplicate(strategy_registry.QuantizationStrategy):
             name = "int8"
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, "already registered"):
             strategy_registry.register_quantization_strategy(Duplicate)
@@ -54,9 +55,8 @@ class StrategyRegistryTest(testing.TestCase):
         # built-in mode without capturing its policy strings.
         prefixed_name = name
 
-        class Prefixed(strategy_registry.QuantizationStrategy):
+        class Prefixed(ToyHalfStrategy):
             name = prefixed_name
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(Prefixed)
         try:
@@ -72,13 +72,11 @@ class StrategyRegistryTest(testing.TestCase):
     def test_register_allows_custom_prefix_overlap(self):
         # Policy strings route by the exact mode name, so two modes may
         # share a prefix without ambiguity.
-        class Custom(strategy_registry.QuantizationStrategy):
+        class Custom(ToyHalfStrategy):
             name = "custom"
-            requires_config = True
 
-        class CustomTwo(strategy_registry.QuantizationStrategy):
+        class CustomTwo(ToyHalfStrategy):
             name = "custom2"
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(Custom)
         try:
@@ -100,7 +98,6 @@ class StrategyRegistryTest(testing.TestCase):
 
         class Reserved(strategy_registry.QuantizationStrategy):
             name = reserved_name
-            requires_config = True
 
         with self.assertRaisesRegex(ValueError, error):
             strategy_registry.register_quantization_strategy(Reserved)
@@ -117,9 +114,8 @@ class StrategyRegistryTest(testing.TestCase):
         # not capture it.
         registered_name = mode_name
 
-        class Mode(strategy_registry.QuantizationStrategy):
+        class Mode(ToyHalfStrategy):
             name = registered_name
-            requires_config = True
 
         strategy_registry.register_quantization_strategy(Mode)
         try:
@@ -133,9 +129,8 @@ class StrategyRegistryTest(testing.TestCase):
         # Registering returns its argument, so a decorated strategy stays
         # a class and can still be subclassed.
         @strategy_registry.register_quantization_strategy
-        class Decorated(strategy_registry.QuantizationStrategy):
+        class Decorated(ToyHalfStrategy):
             name = "decorated"
-            requires_config = True
 
         try:
             self.assertIsInstance(Decorated, type)
@@ -148,15 +143,77 @@ class StrategyRegistryTest(testing.TestCase):
         finally:
             strategy_registry.unregister_quantization_strategy("decorated")
 
-    def test_register_requires_config_source(self):
-        # A mode must be able to produce a config: via config_cls, via
-        # requires_config (explicit config mandatory), or by overriding
-        # default_config. Registration fails otherwise, not first use.
-        class NoConfig(strategy_registry.QuantizationStrategy):
-            name = "noconfig"
+    @parameterized.named_parameters(
+        ("config_cls", {"config_cls": None}, "`config_cls`"),
+        ("geometry_families", {"geometry_families": ()}, "`geometry_families`"),
+        (
+            "build",
+            {"build": strategy_registry.QuantizationStrategy.build},
+            "`build`",
+        ),
+        (
+            "call",
+            {"call": strategy_registry.QuantizationStrategy.call},
+            "`call`",
+        ),
+        (
+            "quantize",
+            {"quantize": strategy_registry.QuantizationStrategy.quantize},
+            "`quantize`",
+        ),
+    )
+    def test_register_refuses_an_incomplete_strategy(self, attributes, missing):
+        incomplete = type(
+            "Incomplete",
+            (ToyHalfStrategy,),
+            {"name": "incomplete", **attributes},
+        )
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy, "incomplete"
+        )
+        with self.assertRaisesRegex(ValueError, f"does not define {missing}"):
+            strategy_registry.register_quantization_strategy(incomplete)
+        self.assertFalse(strategy_registry.is_registered("incomplete"))
 
-        with self.assertRaisesRegex(ValueError, "must define `config_cls`"):
-            strategy_registry.register_quantization_strategy(NoConfig)
+    @parameterized.named_parameters(
+        ("policy_cls", "policy_cls"), ("calibrator_cls", "calibrator_cls")
+    )
+    def test_register_refuses_a_calibration_mode_without(self, attribute):
+        incomplete = type(
+            "Incomplete",
+            (GPTQStrategy,),
+            {"name": "incomplete", attribute: None},
+        )
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy, "incomplete"
+        )
+        with self.assertRaisesRegex(
+            ValueError, f"does not define `{attribute}`"
+        ):
+            strategy_registry.register_quantization_strategy(incomplete)
+        self.assertFalse(strategy_registry.is_registered("incomplete"))
+
+    def test_register_refuses_a_lora_mode_with_a_view_and_no_encode(self):
+        class ViewNoEncode(ToyHalfStrategy):
+            name = "view_no_encode"
+
+            def quantized_weight(self, layer):
+                return None
+
+        self.addCleanup(
+            strategy_registry.unregister_quantization_strategy,
+            "view_no_encode",
+        )
+        with self.assertRaisesRegex(ValueError, "does not define `encode`"):
+            strategy_registry.register_quantization_strategy(ViewNoEncode)
+        self.assertFalse(strategy_registry.is_registered("view_no_encode"))
+
+        # Without LoRA, the save never merges, so `encode` is not needed.
+        class ViewNoLoRA(ViewNoEncode):
+            supports_lora = False
+
+        strategy_registry.register_quantization_strategy(ViewNoLoRA)
+        self.assertTrue(strategy_registry.is_registered("view_no_encode"))
 
 
 class PolicyCodecCorpusTest(testing.TestCase):
@@ -374,7 +431,11 @@ class ToyDense(layers.Dense):
 
 
 class ToyModeRegistrationTest(testing.TestCase):
-    """End-to-end test of a new mode: a strategy and a spec entry."""
+    """Registry dispatch, through a toy strategy and a spec entry.
+
+    The registration mechanism accepts the toy strategy, but Keras neither
+    supports nor documents modes beyond the built-in ones.
+    """
 
     def setUp(self):
         super().setUp()
@@ -565,3 +626,158 @@ class ProjectionOnlyModeTest(testing.TestCase):
         self.assertIsNone(model.get_layer("emb").quantization_mode)
         self.assertEqual(model.get_layer("proj").quantization_mode, "float8")
         model(np.array([[1, 2, 3]]))
+
+
+RECIPE_PROJECTION_SPEC = {
+    None: ["kernel"],
+    "int8": ["kernel", "kernel_scale"],
+    "int4": ["kernel", "kernel_scale", "kernel_zero", "g_idx"],
+    "float8": [
+        "kernel",
+        "inputs_scale",
+        "inputs_amax_history",
+        "kernel_scale",
+        "kernel_amax_history",
+        "outputs_grad_scale",
+        "outputs_grad_amax_history",
+    ],
+    "ternary": ["kernel", "kernel_scale"],
+}
+
+
+class RecipeProjection(layers.Layer):
+    """A third-party 2-D projection written per the `geometry.py` recipe.
+
+    It has no `units` attribute, and its `bias` and `activation` are `None`.
+    """
+
+    def __init__(self, features, **kwargs):
+        super().__init__(**kwargs)
+        self.features = features
+        self.activation = None
+
+    def build(self, input_shape):
+        self.kernel_shape = (input_shape[-1], self.features)
+        if self.quantization_mode:
+            self.quantized_build(
+                self.kernel_shape,
+                mode=self.quantization_mode,
+                config=self.quantization_config,
+            )
+        if not self._strategy_owns_weight_storage():
+            self._kernel = self.add_weight(
+                name="kernel", shape=self.kernel_shape
+            )
+        self.bias = None
+
+    @property
+    def kernel(self):
+        quantized_weight = self._quantized_weight()
+        if quantized_weight is None:
+            return self._kernel
+        return quantized_weight.unpack()
+
+    def call(self, inputs):
+        return ops.matmul(inputs, self._kernel)
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+    @property
+    def variable_serialization_spec(self):
+        return RECIPE_PROJECTION_SPEC
+
+    def save_own_variables(self, store):
+        self._save_serialized_variables(store, "kernel")
+
+    def load_own_variables(self, store):
+        self._load_serialized_variables(store, "kernel")
+
+
+class WithoutActivation(RecipeProjection):
+    """A `RecipeProjection` that does not set `activation`.
+
+    It defines `_quantization_geometry()`, so the type check of `quantize()`
+    accepts it.
+    """
+
+    def __init__(self, **kwargs):
+        super().__init__(4, **kwargs)
+        del self.activation
+
+    def _quantization_geometry(self):
+        return ProjectionGeometry(self)
+
+
+class CustomProjectionTest(testing.TestCase):
+    """Third-party projections stay quantizable with the built-in modes."""
+
+    @parameterized.named_parameters(
+        ("int8", "int8"),
+        ("int4", "int4"),
+        ("float8", "float8"),
+        ("ternary", "ternary"),
+    )
+    def test_quantizes_saves_and_loads(self, mode):
+        layer = RecipeProjection(4)
+        layer.build((None, 6))
+        x = np.random.uniform(-1, 1, size=(3, 6)).astype("float32")
+        layer.quantize(mode)
+        self.assertEqual(layer.quantization_mode, mode)
+        y = layer(x)
+        store = {}
+        layer.save_own_variables(store)
+        restored = RecipeProjection(4, dtype=layer.dtype_policy.name)
+        restored.build((None, 6))
+        restored.load_own_variables(store)
+        self.assertAllClose(restored(x), y)
+
+    def test_ternary_refuses_a_kernel_that_is_not_2d(self):
+        layer = Pointwise1D(4)
+        layer.build((None, 5, 6))
+        kernel = ops.convert_to_numpy(layer._kernel)
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.quantize("ternary")
+        # Refused before the layer changes.
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+        self.assertAllEqual(layer._kernel, kernel)
+
+    def test_ternary_build_refuses_a_kernel_that_is_not_2d(self):
+        # A layer built from a ternary policy, as on load.
+        layer = Pointwise1D(4, dtype="ternary_from_float32")
+        with self.assertRaisesRegex(NotImplementedError, "only a 2-D kernel"):
+            layer.build((None, 5, 6))
+
+    def test_model_quantize_skips_a_kernel_that_is_not_2d(self):
+        model = models.Sequential(
+            [
+                layers.Input((5, 6)),
+                Pointwise1D(4, name="pointwise"),
+                layers.Dense(3, name="dense"),
+            ]
+        )
+        pointwise = model.get_layer("pointwise")
+        dense = model.get_layer("dense")
+        report = model.quantize("ternary", verbose=False)
+        self.assertIn((pointwise.path, report.SKIP_NO_SUPPORT), report.skipped)
+        self.assertIn(dense.path, [path for path, *_ in report.quantized])
+        self.assertIsNone(pointwise.quantization_mode)
+        self.assertEqual(dense.quantization_mode, "ternary")
+        model(np.ones((2, 5, 6), "float32"))
+
+    def test_missing_build_attributes_are_refused_before_the_change(self):
+        layer = WithoutActivation()
+        layer.build((None, 6))
+        with self.assertRaisesRegex(ValueError, "did not set activation"):
+            layer.quantize("int8")
+        self.assertIsNone(layer.quantization_mode)
+        self.assertIsNone(layer.quantization_config)
+        self.assertFalse(layer._is_quantized)
+        self.assertEqual(tuple(layer._kernel.shape), (6, 4))
+
+    def test_model_quantize_raises_on_missing_build_attributes(self):
+        model = models.Sequential([layers.Input((6,)), WithoutActivation()])
+        with self.assertRaisesRegex(ValueError, "did not set activation"):
+            model.quantize("int8", verbose=False)
