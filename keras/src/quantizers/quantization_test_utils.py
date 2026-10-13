@@ -14,8 +14,12 @@ layers: `PermutedDense` (a 2-D kernel whose geometry overrides
 The third-party layers use only the quantization protocol of
 `keras.src.quantizers.geometry`, so they show that a layer outside Keras
 is quantizable with the built-in modes.
+
+`oracle_contract` is the float64 NumPy reference that the route tests
+(`kernels_test.py`) compare a 4-bit contraction with.
 """
 
+import ml_dtypes
 import numpy as np
 
 from keras.src import backend
@@ -761,6 +765,57 @@ def input_gradient(layer, x):
         tape.watch(v)
         y = tf.reduce_sum(layer(v))
     return tape.gradient(y, v).numpy()
+
+
+def oracle_contract(
+    inputs,
+    codes,
+    scale,
+    *,
+    columns,
+    kernel_shape,
+    permutation=None,
+    zero_point=None,
+    g_idx=None,
+    input_scales=None,
+    equation=None,
+    dtype="float32",
+):
+    """A float64 NumPy reference of a 4-bit weight-only contraction.
+
+    It shares no code with Keras. `codes` holds two 4-bit codes per byte
+    along its last axis, the low nibble first, and int8 storage
+    sign-extends each nibble. With `g_idx`, row `r` of the stored matrix
+    is `(q - zero_point[g]) * scale[g]` for its group `g = g_idx[r]`.
+    Without it, column `c` is `q / scale[c]`. `input_scales` (AWQ) divide
+    the rows. The matrix goes back to `kernel_shape` through
+    `permutation`, and the inputs, rounded to `dtype`, contract against
+    it in float64: by `equation`, or by a matmul.
+    """
+    stored = np.asarray(codes)
+    packed = stored.astype(np.int64)
+    q = np.stack([packed & 15, (packed >> 4) & 15], axis=-1)
+    q = q.reshape(stored.shape[0], -1)[:, :columns]
+    if stored.dtype == np.int8:
+        q = np.where(q > 7, q - 16, q)
+    scale = np.asarray(scale, np.float64)
+    if g_idx is None:
+        weight = q / scale
+    else:
+        groups = np.asarray(g_idx).astype(np.int64)
+        zero_point = np.asarray(zero_point).astype(np.int64)
+        weight = (q - zero_point[groups]) * scale[groups]
+    if input_scales is not None:
+        weight = weight / np.asarray(input_scales, np.float64)[:, None]
+    if permutation is None:
+        permutation = tuple(range(len(kernel_shape)))
+    permuted = [kernel_shape[axis] for axis in permutation]
+    kernel = np.transpose(weight.reshape(permuted), np.argsort(permutation))
+    rounding = ml_dtypes.bfloat16 if dtype == "bfloat16" else dtype
+    x = np.asarray(inputs, np.float32).astype(rounding).astype(np.float64)
+    if equation is None:
+        return np.matmul(x, kernel)
+    return np.einsum(equation, x, kernel)
 
 
 def policy_built(layer):
