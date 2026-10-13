@@ -14,11 +14,10 @@ Two geometry families exist today:
   one projection implementation and the geometry supplies what differs per
   layer: how to contract (a plain matmul for `Dense` and `TernaryDense`,
   `ProjectionGeometry`; an einsum for `EinsumDense`,
-  `EinsumProjectionGeometry`, whose axis analysis lives on the layer
-  itself and is reached through the geometry's hooks), the roles of the
-  kernel's axes (`KernelAxes`), from which int4, GPTQ and AWQ lay the
-  kernel out, how a scale lines up with the kernel and with the outputs,
-  and which axes the quantizers reduce over.
+  `EinsumProjectionGeometry`, which reads the equation's labels), the
+  roles of the kernel's axes (`KernelAxes`), from which int8, int4, GPTQ
+  and AWQ lay the kernel out, how an activation scale lines up with the
+  outputs, and the layout of a stored per-channel scale.
 - Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
   plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
   projection (`ReversibleLookupGeometry`).
@@ -55,9 +54,12 @@ quantizable layer must define:
 - Projections: `_kernel` (the float kernel variable), `kernel_shape` (its
   shape, recorded in `build()`), `bias` and `activation` (either may be
   `None`). `EinsumProjectionGeometry` additionally relies on the
-  `einsum_axes` record `EinsumDense` derives from its equation in
-  `build()`, and on the equation analysis `EinsumDense` prepares in
-  `_set_quantization_info()` (called through the geometry's `prepare()`).
+  `einsum_axes` record `EinsumDense` derives from its equation in `build()`.
+  `ProjectionGeometry` describes a 2D `(input_dim, units)` kernel. A
+  kernel of another layout overrides `kernel_axes`, plus `contract`,
+  `contract_grad` and `add_lora_delta` for its own contraction; the
+  stored scale layout and the calibration view derive from
+  `kernel_axes` (see `ProjectionGeometry`).
 - Lookups: `_embeddings`, `input_dim` and `output_dim`. A reversible
   lookup adds `tie_weights`, `logit_soft_cap`, and, when untied, the
   `reverse_embeddings` variables.
@@ -105,6 +107,7 @@ import math
 import string
 
 from keras.src import ops
+from keras.src.quantizers.quantized_weight import lay_out_scale
 from keras.src.quantizers.quantizers import ternarize
 
 
@@ -117,6 +120,19 @@ class KernelAxes:
     inputs, the kernel and the output (the experts of a
     mixture-of-experts down projection): each of its indices is an
     independent problem with its own slice of the inputs.
+
+    The modes lay the kernel out from this record. With `B`, `K` and `N`
+    the sizes of the batch, contracted and free axes:
+
+    - int8 keeps the N-D kernel and reduces its scale over `contracted`.
+    - int4 stores `matrix(shape, batch_in="columns")`, `(K, B * N)`: every
+      column belongs to one problem, which keeps the released bytes of a
+      kernel whose contracted axes lead.
+    - GPTQ and AWQ store `matrix(shape, batch_in="rows")`, `(B * K, N)`:
+      act-order `g_idx` and AWQ's input scales differ per problem and lie
+      along the rows.
+
+    Without a batch axis the two matrices are the same.
     """
 
     contracted: tuple
@@ -268,11 +284,43 @@ class QuantizationGeometry:
         )
 
 
+# Projection hooks that no mode reads, and the hook that describes the
+# same fact. A geometry that defines one of them is refused when its class
+# is created: the override would have no effect.
+_REPLACED_PROJECTION_HOOKS = {
+    "kernel_reduced_axes": "kernel_axes",
+    "kernel_scale_shape": "kernel_scale_axes",
+    "kernel_scale_axis": "kernel_scale_axes",
+    "kernel_scale_for_storage": "kernel_scale_axes",
+    "kernel_scale_for_dequant": "kernel_scale_axes",
+}
+
+
 class ProjectionGeometry(QuantizationGeometry):
-    """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul."""
+    """Geometry of a 2D kernel `(input_dim, units)` contracted by matmul.
+
+    A kernel of another layout overrides `kernel_axes`, plus `contract`,
+    `contract_grad` and `add_lora_delta` for its own contraction. The
+    defaults of `kernel_scale_axes` and `contraction_view` derive from
+    `kernel_axes`; their docstrings say when a layer overrides them too.
+    """
 
     family = "projection"
     build_attributes = ("kernel_shape", "bias", "activation")
+
+    def __init_subclass__(cls, **kwargs):
+        super().__init_subclass__(**kwargs)
+        replaced = sorted(set(vars(cls)) & set(_REPLACED_PROJECTION_HOOKS))
+        if replaced:
+            raise TypeError(
+                f"`{cls.__name__}` defines geometry hooks that no "
+                "quantization mode reads. Replace "
+                + ", ".join(
+                    f"`{name}` with `{_REPLACED_PROJECTION_HOOKS[name]}`"
+                    for name in replaced
+                )
+                + "."
+            )
 
     @property
     def weight_shape(self):
@@ -282,9 +330,6 @@ class ProjectionGeometry(QuantizationGeometry):
         logical shape every strategy reads rather than a variable's shape.
         """
         return tuple(self.layer.kernel_shape)
-
-    def prepare(self):
-        """Computes any layout analysis the geometry needs (idempotent)."""
 
     @property
     def kernel_axes(self):
@@ -314,11 +359,6 @@ class ProjectionGeometry(QuantizationGeometry):
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
     @property
-    def kernel_reduced_axes(self):
-        """Kernel axes a weight quantizer reduces over."""
-        return 0
-
-    @property
     def inputs_quantization_axis(self):
         """Input axes an activation quantizer reduces over."""
         return -1
@@ -327,26 +367,19 @@ class ProjectionGeometry(QuantizationGeometry):
         """Aligns an activation scale with the contraction's outputs."""
         return scale
 
-    def kernel_scale_shape(self, kernel_shape):
-        """Shape of a per-channel scale stored alongside the kernel."""
-        return (kernel_shape[1],)
-
     @property
-    def kernel_scale_axis(self):
-        """Kernel axis a per-channel scale is shared along.
+    def kernel_scale_axes(self):
+        """Layout of a per-channel scale stored with the kernel (int8).
 
-        `None` when the stored scale is laid out for the outputs and
-        `kernel_scale_for_dequant` lays it out against the kernel instead.
+        For each axis of the stored scale, the kernel axis it runs along,
+        or `None` for an axis of size one. int8 divides the contraction's
+        outputs by the stored scale, so the scale follows the outputs'
+        trailing axes. The default is the free and batch axes in the
+        kernel's order: a layer whose outputs end with them in another
+        order overrides it.
         """
-        return 0
-
-    def kernel_scale_for_storage(self, scale):
-        """Aligns a freshly computed kernel scale with its stored layout."""
-        return ops.squeeze(scale, axis=0)
-
-    def kernel_scale_for_dequant(self, scale):
-        """Aligns the stored kernel scale with the kernel for dequantization."""
-        return scale
+        axes = self.kernel_axes
+        return tuple(sorted(axes.free + axes.batch))
 
     def add_lora_delta(self, inputs, x):
         """Adds the LoRA update to the contraction's output, when enabled."""
@@ -415,15 +448,11 @@ def _lora_equations(equation):
 class EinsumProjectionGeometry(ProjectionGeometry):
     """Geometry of an N-D einsum kernel (`EinsumDense`).
 
-    The equation-derived axis analysis (reduced/transpose/expand/squeeze
-    axes, the custom-gradient equation) is the layer's own geometry
-    implementation; this class routes the strategies to it.
+    Every hook derives from the labels of the equation, which
+    `EinsumDense` records in `build()` (`einsum_axes`).
     """
 
     build_attributes = ("kernel_shape", "einsum_axes", "bias", "activation")
-
-    def prepare(self):
-        self.layer._set_quantization_info()
 
     @property
     def kernel_axes(self):
@@ -467,30 +496,23 @@ class EinsumProjectionGeometry(ProjectionGeometry):
         )
 
     @property
-    def kernel_reduced_axes(self):
-        return self.layer._kernel_reduced_axes
-
-    @property
     def inputs_quantization_axis(self):
         return self.layer.einsum_axes.input_reduced_axes
 
     def align_inputs_scale(self, scale):
-        return self.layer._adjust_scale_for_quant(scale, "input")
-
-    def kernel_scale_shape(self, kernel_shape):
-        return self.layer._get_kernel_scale_shape(kernel_shape)
+        axes = self.layer.einsum_axes
+        return lay_out_scale(scale, axes.inputs, axes.output)
 
     @property
-    def kernel_scale_axis(self):
-        # The equation analysis may transpose or expand the stored scale
-        # even for a 2-D kernel; `kernel_scale_for_dequant` lays it out.
-        return None
-
-    def kernel_scale_for_storage(self, scale):
-        return self.layer._adjust_scale_for_quant(scale, "kernel")
-
-    def kernel_scale_for_dequant(self, scale):
-        return self.layer._adjust_scale_for_dequant(scale)
+    def kernel_scale_axes(self):
+        # In the outputs' layout: the kernel's free and batch axes in the
+        # order of the output, and an axis of size one for every output
+        # axis the kernel does not have.
+        axes = self.layer.einsum_axes
+        return tuple(
+            axes.kernel.index(label) if label in axes.kernel else None
+            for label in axes.output
+        )
 
     def add_lora_delta(self, inputs, x):
         layer = self.layer
