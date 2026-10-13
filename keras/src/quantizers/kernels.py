@@ -5,7 +5,8 @@ dequantizes the weight and contracts it. A route is a backend kernel or
 a formulation in `keras.ops`. It runs forward only: its
 caller owns the gradient, and the backward does not call the route. A
 mode's projection reaches it through `contract_quantized` of
-`keras.src.quantizers.modes.common`.
+`keras.src.quantizers.modes.common`, and the reverse lookup through
+`LookupHandlers._contract_routed`.
 
 Static checks select the route and never read a tensor value. In order:
 the policy allows routes (`_policy_allows`); the codes pack two per byte
@@ -25,11 +26,13 @@ private, for CI (`pytest --kernel-policy=require`, from the root
 `conftest.py`). It runs the platform's kernels and ignores the measured
 rows and the version range. A device that no kernel supports raises when
 `"require"` is set. A call whose shape or dtype each kernel refuses runs
-the reference path.
+the reference path, and so does a reverse lookup on a device with no
+logits kernel.
 
 A backend's kernels are the `Kernel` records of `KERNELS` in its
 `ops/quantized.py` (`keras.src.backend.common.quantized_kernels`).
-`_kernel_route` turns each record into a route of `_ROUTES`.
+`_kernel_routes` turns each record into a route of `_ROUTES` and, when it
+has a logits variant, a route of `_LOGITS_ROUTES`.
 
 `route_counts` counts the selections per route name, `"reference"`
 included, for tests. On JAX a selection happens at trace time. Under
@@ -60,6 +63,9 @@ _KERNEL_MODULE = getattr(getattr(backend, "ops", None), "quantized", None)
 # reference path at each measured shape of its cell and passed the route
 # tests there. `"auto"` runs a route only where a row names it.
 _MEASURED_ROWS = {}
+# The rows of the reverse lookup, as `_MEASURED_ROWS`. The compute dtype is
+# the reverse dtype of the layer, when it has one.
+_MEASURED_LOGITS_ROWS = {}
 route_counts = collections.Counter()
 
 
@@ -77,9 +83,10 @@ class Route:
 
     A `matrix` route runs `fn(quantized_weight, inputs, dtype)` forward:
     it takes the inputs as `(M, K)` in the compute dtype `dtype` and
-    returns `(M, N)` in stored column order. Any other route runs
-    `fn(layer, geometry, quantized_weight, inputs)` and takes and returns
-    the shapes of the layer.
+    returns `(M, N)` in stored column order. A route of the reverse
+    lookup takes the stored table and the `(M, D)` inputs and returns
+    `(M, V)`. Any other route runs `fn(layer, geometry, quantized_weight,
+    inputs)` and takes and returns the shapes of the layer.
 
     `dtypes` holds the compute dtypes that the route supports (empty for
     every dtype). `available(device_class, m, k, n, quantized_weight,
@@ -122,6 +129,8 @@ def _reference(layer, geometry, quantized_weight, inputs):
 
 # Route name -> `Route` of a projection.
 _ROUTES = {}
+# Route name -> `Route` of a reverse lookup.
+_LOGITS_ROUTES = {}
 
 
 @contextlib.contextmanager
@@ -150,10 +159,10 @@ def force_route(name):
     contraction, the rows, the dtype, the device and the shape. It skips
     the distribution check, the measured rows and the version range.
     """
-    if name not in _ROUTES:
+    if name not in _ROUTES and name not in _LOGITS_ROUTES:
         raise ValueError(
             "Unknown route. Expected one of "
-            f"{sorted(_ROUTES)}. "
+            f"{sorted(set(_ROUTES) | set(_LOGITS_ROUTES))}. "
             f"Received: name={name!r}"
         )
     previous = _state.route
@@ -215,6 +224,34 @@ def select_route(layer, geometry, quantized_weight, inputs):
     return selection
 
 
+def select_logits_route(layer, table, inputs):
+    """Returns the `Selection` of a reverse lookup, or `None` for the
+    reference path.
+
+    The caller, the reverse lookup of `ReversibleEmbedding` with no
+    activation quantizer, gives the stored table: the forward table
+    `(V, D)` of a tied layer, or the reverse table `(D, V)` of an untied
+    one. `inputs` are `(..., D)` in the reverse dtype.
+    """
+
+    def contraction():
+        if not isinstance(table.layout, Int4Pairs):
+            return None
+        vocabulary = table.shape[0 if _tied(table) else 1]
+        return table.layout.orig_len, 1, (vocabulary,)
+
+    selection = _select(
+        _LOGITS_ROUTES,
+        _MEASURED_LOGITS_ROWS,
+        table,
+        inputs,
+        layer.reverse_dtype or layer.compute_dtype,
+        contraction,
+    )
+    _count(selection)
+    return selection
+
+
 def _select(routes, measured_rows, view, inputs, dtype, contraction):
     """The first route of `routes` whose checks pass, as a `Selection`.
 
@@ -245,6 +282,7 @@ def _select(routes, measured_rows, view, inputs, dtype, contraction):
     # A forced route and `"require"` skip the version range.
     measured = not forced and current == "auto"
     for name in candidates:
+        # A forced name can belong to the other table.
         route = routes.get(name)
         if (
             route is not None
@@ -371,6 +409,12 @@ def _default_device_class():
     return f"cpu-{platform.machine()}"
 
 
+def _tied(table):
+    """Whether a lookup table is the forward table `(V, D)` of a tied layer:
+    it packs its codes along axis 1."""
+    return table.layout.axis % 2 == 1
+
+
 def run_route(selection, layer, geometry, quantized_weight, inputs):
     """Runs `selection` forward only."""
     route = selection.route
@@ -382,9 +426,13 @@ def run_route(selection, layer, geometry, quantized_weight, inputs):
     return ops.reshape(y, tuple(free) + selection.columns)
 
 
-def _kernel_route(kernel):
-    """The route of a backend `Kernel`: it unpacks the stored tensors of a
-    `QuantizedWeight` for the kernel's matmul."""
+def _kernel_routes(kernel):
+    """The routes of a backend `Kernel`: its matmul, and its logits or
+    `None`.
+
+    Each route unpacks the stored tensors of a `QuantizedWeight` for the
+    kernel.
+    """
 
     def matmul(view, inputs, dtype):
         return kernel.matmul(
@@ -399,6 +447,17 @@ def _kernel_route(kernel):
             g_idx=view.g_idx,
         )
 
+    def logits(table, inputs, dtype):
+        return kernel.logits(
+            inputs,
+            table.codes,
+            table.scale,
+            table.zero_point,
+            group_size=table.scheme.group_size,
+            per_channel=table.scheme.group_size is None,
+            orientation="tied" if _tied(table) else "untied",
+        )
+
     def available(kernel_available):
         def check(device_class, m, k, n, view, dtype):
             return kernel.supports_device(device_class) and kernel_available(
@@ -407,19 +466,26 @@ def _kernel_route(kernel):
 
         return check
 
-    return Route(
+    route = Route(
         matmul,
         dtypes=kernel.dtypes,
         available=available(kernel.available),
         tested=kernel.tested,
         kernel=kernel,
     )
+    if kernel.logits is None:
+        return route, None
+    return route, dataclasses.replace(
+        route, fn=logits, available=available(kernel.logits_available)
+    )
 
 
 def _register_kernels():
-    """Adds the routes of the backend's `KERNELS` to the route table."""
+    """Adds the routes of the backend's `KERNELS` to the route tables."""
     for kernel in getattr(_KERNEL_MODULE, "KERNELS", ()):
-        _ROUTES[kernel.name] = _kernel_route(kernel)
+        _ROUTES[kernel.name], logits = _kernel_routes(kernel)
+        if logits is not None:
+            _LOGITS_ROUTES[kernel.name] = logits
 
 
 _register_kernels()
