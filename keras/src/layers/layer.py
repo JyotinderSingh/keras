@@ -1433,14 +1433,17 @@ class Layer(BackendLayer, Operation):
             )
 
     def _check_quantized_build_attributes(self, geometry):
-        """Raises if `build()` did not set an attribute `geometry` reads."""
+        """Raises if the layer lacks an attribute `geometry` reads."""
         missing = [a for a in geometry.build_attributes if not hasattr(self, a)]
         if missing:
             raise ValueError(
                 f"Layer '{self.name}' (of type '{type(self).__name__}') "
-                f"cannot be quantized: its `build()` did not set "
-                f"{', '.join(missing)}. "
-                "A subclass that overrides `build()` must call "
+                f"cannot be quantized: it did not set {', '.join(missing)}. "
+                f"Its {type(geometry).__name__} reads "
+                f"{', '.join(geometry.build_attributes)} from the layer. "
+                "A projection records `kernel_shape` in `build()` and sets "
+                "`bias` and `activation`, each of which may be `None`; a "
+                "subclass that overrides `build()` must also call "
                 "`super().build()`."
             )
 
