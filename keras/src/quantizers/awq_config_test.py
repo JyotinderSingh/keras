@@ -151,6 +151,36 @@ class AWQConfigTest(testing.TestCase):
         restored = AWQConfig.from_config(config.get_config())
         self.assertFalse(restored.apply_clip)
 
+    def test_config_clip_skip_patterns(self):
+        """The reference's exclusion list is the default; it round-trips."""
+        config = AWQConfig(dataset=None, tokenizer=None)
+        self.assertEqual(
+            config.clip_skip_patterns, ("q_", "k_", "query", "key", "Wqkv")
+        )
+        config = AWQConfig(
+            dataset=None, tokenizer=None, clip_skip_patterns=["attn_q"]
+        )
+        self.assertEqual(config.clip_skip_patterns, ("attn_q",))
+        restored = AWQConfig.from_config(config.get_config())
+        self.assertEqual(restored.clip_skip_patterns, ("attn_q",))
+        self.assertEqual(
+            AWQConfig(
+                dataset=None, tokenizer=None, clip_skip_patterns=()
+            ).clip_skip_patterns,
+            (),
+        )
+        self.assertEqual(
+            AWQConfig(
+                dataset=None, tokenizer=None, clip_skip_patterns={"attn_q"}
+            ).clip_skip_patterns,
+            ("attn_q",),
+        )
+        for invalid in ([""], [3], "q_proj", None, 5, {"q_": 1}):
+            with self.assertRaisesRegex(ValueError, "non-empty strings"):
+                AWQConfig(
+                    dataset=None, tokenizer=None, clip_skip_patterns=invalid
+                )
+
     def test_dtype_policy_string(self):
         """Test dtype policy string generation."""
         config = AWQConfig(
