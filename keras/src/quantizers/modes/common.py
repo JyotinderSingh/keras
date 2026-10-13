@@ -5,7 +5,6 @@ sequence its call sites emitted inline, so modes that adopt them keep
 producing identical traced programs.
 """
 
-from keras.src import backend
 from keras.src import ops
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
 
@@ -49,7 +48,7 @@ class GeometryDispatchStrategy(QuantizationStrategy):
     def call(self, layer, *args, **kwargs):
         geometry = self.require_geometry(layer)
         handler = self._handler("call", geometry.family, layer)
-        return handler(layer, *args, **kwargs)
+        return handler(layer, geometry, *args, **kwargs)
 
     def quantize(self, layer, config):
         geometry = self.require_geometry(layer)
@@ -90,11 +89,22 @@ class GeometryDispatchStrategy(QuantizationStrategy):
         return handler
 
 
-def cast_lookup_inputs(inputs):
-    """Casts embedding-lookup indices to `int32` unless already integral."""
-    if backend.standardize_dtype(inputs.dtype) not in ("int32", "int64"):
-        inputs = ops.cast(inputs, "int32")
-    return inputs
+def add_group_index(layer, length, initializer="zeros"):
+    """Adds `g_idx`, the group of each of `length` positions along an axis.
+
+    Stored as `float32` because TF has no GPU kernel for int32 resource
+    variables (it would pin the variable to CPU and break `jit_compile` on
+    GPU); consumers cast to int32 on-device. Not autocast: bfloat16 holds
+    integers exactly only up to 256.
+    """
+    return layer.add_weight(
+        name="g_idx",
+        shape=(length,),
+        initializer=initializer,
+        dtype="float32",
+        trainable=False,
+        autocast=False,
+    )
 
 
 def apply_bias_activation(layer, x):
@@ -104,92 +114,3 @@ def apply_bias_activation(layer, x):
     if layer.activation is not None:
         x = layer.activation(x)
     return x
-
-
-def add_lookup_lora_delta(layer, inputs, outputs):
-    """Adds the LoRA update to gathered embeddings, when LoRA is enabled."""
-    if layer.lora_enabled:
-        lora_outputs = ops.take(layer.lora_embeddings_a, inputs, axis=0)
-        lora_outputs = ops.matmul(lora_outputs, layer.lora_embeddings_b)
-        outputs = ops.add(
-            outputs, (layer.lora_alpha / layer.lora_rank) * lora_outputs
-        )
-        outputs = ops.cast(outputs, dtype=layer.compute_dtype)
-    return outputs
-
-
-def apply_logit_soft_cap(layer, logits):
-    """Applies the reverse-projection logit soft cap, when configured."""
-    if layer.logit_soft_cap is not None:
-        soft_cap = layer.logit_soft_cap
-        logits = ops.multiply(ops.tanh(ops.divide(logits, soft_cap)), soft_cap)
-    return logits
-
-
-def reverse_lookup_params(layer, with_zero_point=False):
-    """The stored table, scale and zero point of the reverse projection.
-
-    An untied layer stores the reverse table in its own layout. A tied layer
-    stores only the forward table, `(input_dim, ...)`, so its tensors are
-    transposed into the reverse layout (transposing the 1-D per-channel
-    scale is a no-op, so per-channel and grouped take the same path). The
-    zero point is `None` unless `with_zero_point`.
-    """
-    if not layer.tie_weights:
-        return (
-            layer.reverse_embeddings,
-            layer.reverse_embeddings_scale,
-            layer.reverse_embeddings_zero if with_zero_point else None,
-        )
-    return (
-        ops.transpose(layer._embeddings),
-        ops.transpose(layer.embeddings_scale),
-        ops.transpose(layer.embeddings_zero) if with_zero_point else None,
-    )
-
-
-def reverse_lookup_dtype(layer):
-    """The dtype the reverse projection computes in.
-
-    Mirrors the float layer, which casts the inputs and the kernel to
-    `reverse_dtype` when it is set and otherwise runs in `compute_dtype`.
-    """
-    return layer.reverse_dtype or layer.compute_dtype
-
-
-def add_reverse_lookup_lora_delta(layer, inputs, logits):
-    """Adds the LoRA update to reverse-projection logits, when enabled.
-
-    Only a tied layer projects back through the adapted table (an untied
-    layer's reverse table has no adapter), and the delta is taken from the
-    float inputs, before any activation quantization.
-    """
-    if layer.tie_weights and layer.lora_enabled:
-        lora_logits = ops.matmul(inputs, ops.transpose(layer.lora_embeddings_b))
-        lora_logits = ops.matmul(
-            lora_logits, ops.transpose(layer.lora_embeddings_a)
-        )
-        logits = ops.add(
-            logits,
-            ops.cast(
-                (layer.lora_alpha / layer.lora_rank) * lora_logits, logits.dtype
-            ),
-        )
-    return logits
-
-
-def encode_reverse_lookup(strategy, layer, geometry, config):
-    """Quantizes the reverse table by the forward rule on its transpose.
-
-    The reverse table is the forward layout transposed, so encoding its
-    transpose and transposing the results back applies exactly the rule the
-    forward table gets, including a user-supplied `weight_quantizer`.
-    """
-    codes, scale, zero_point = strategy._encode_lookup(
-        layer, geometry, ops.transpose(layer.reverse_embeddings), config
-    )
-    return (
-        ops.transpose(codes),
-        ops.transpose(scale),
-        None if zero_point is None else ops.transpose(zero_point),
-    )
