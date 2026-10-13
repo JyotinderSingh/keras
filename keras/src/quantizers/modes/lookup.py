@@ -14,7 +14,9 @@ import math
 from keras.src import backend
 from keras.src import ops
 from keras.src.backend.common import standardize_dtype
+from keras.src.quantizers import kernels
 from keras.src.quantizers.modes.common import add_group_index
+from keras.src.quantizers.modes.common import contract_with_stored_tensors
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantized_weight import NoPack
 from keras.src.quantizers.quantized_weight import QuantizedWeight
@@ -40,7 +42,9 @@ class LookupHandlers:
     precision of the scale. The reverse projection contracts with the
     codes and applies the scales to the logits (`apply_scale`), or, when
     the scheme has a zero point, contracts with the table dequantized in
-    the precision of its scale.
+    the precision of its scale. A route of `kernels.py` can replace the
+    int4 reverse contraction with no activation quantizer; it runs inside
+    a custom gradient that repeats the reference's.
     """
 
     # --- What a mode supplies ---------------------------------------------
@@ -150,28 +154,54 @@ class LookupHandlers:
     def _get_reverse_lookup_quantized_weight(self, layer, geometry):
         if layer.tie_weights:
             # A tied layer's reverse table is its forward table transposed.
-            # Its scale is read through its `value`, so its dtype is the
-            # one it reads in.
-            codes = ops.transpose(layer._embeddings)
-            scale = layer.embeddings_scale.value
-            zero_point = layer.embeddings_zero
-            if zero_point is not None:
-                # Grouped parameters are 2-D, `(input_dim, n_groups)`.
-                scale = ops.transpose(scale)
-                zero_point = ops.transpose(zero_point)
-        else:
-            codes = layer.reverse_embeddings
-            scale = layer.reverse_embeddings_scale
-            zero_point = layer.reverse_embeddings_zero
+            # The forward view reads its tensors, its scale through its
+            # `value`, so the scale's dtype is the one it reads in. A new
+            # view holds them, not `with_tensors`: under `torch.compile`
+            # its `copy.copy` breaks the graph (one frame becomes four for
+            # a per-channel table), and inductor then gives other bits to
+            # bfloat16 logits and gradients.
+            forward = self._get_lookup_quantized_weight(layer, geometry)
+            codes, scale, *zero_point = forward.read_tensors()
+            forward = QuantizedWeight(
+                codes=codes,
+                scale=scale,
+                zero_point=zero_point[0] if zero_point else None,
+                layout=forward.layout,
+                scheme=forward.scheme,
+                shape=forward.shape,
+                axis=forward.axis,
+                scale_axes=forward.scale_axes,
+            )
+            return self._transposed_lookup_view(layer, forward)
         return QuantizedWeight(
-            codes=codes,
-            scale=scale,
-            zero_point=zero_point,
+            codes=layer.reverse_embeddings,
+            scale=layer.reverse_embeddings_scale,
+            zero_point=layer.reverse_embeddings_zero,
             layout=self._get_lookup_layout(0, layer.output_dim),
             scheme=self._get_lookup_scheme(layer, layer.quantization_config),
             shape=(layer.output_dim, layer.input_dim),
             axis=None if layer.g_idx is None else 0,
             scale_axes=(1,) if layer.g_idx is None else None,
+        )
+
+    def _transposed_lookup_view(self, layer, table):
+        """Returns the `(D, V)` view of the forward table `table`, `(V, D)`.
+
+        It transposes the codes, and the scale and the zero point when
+        they are grouped, `(input_dim, n_groups)`.
+        """
+        grouped = table.zero_point is not None
+        return QuantizedWeight(
+            codes=ops.transpose(table.codes),
+            scale=ops.transpose(table.scale) if grouped else table.scale,
+            zero_point=ops.transpose(table.zero_point) if grouped else None,
+            layout=self._get_lookup_layout(0, layer.output_dim),
+            scheme=table.scheme,
+            shape=table.shape[::-1],
+            # A grouped scale runs per group and column, a per-channel
+            # scale per column.
+            axis=0 if grouped else None,
+            scale_axes=None if grouped else (1,),
         )
 
     # --- Forward passes ---------------------------------------------------
@@ -205,26 +235,45 @@ class LookupHandlers:
         # As the float layer: `reverse_dtype` when set, else `compute_dtype`.
         dtype = layer.reverse_dtype or layer.compute_dtype
         inputs = ops.cast(inputs, dtype)
-        table = self._get_reverse_lookup_quantized_weight(layer, geometry)
-        inputs_q, inputs_scale = inputs, None
-        if layer.inputs_quantizer:
-            inputs_q, inputs_scale = layer.inputs_quantizer(inputs)
-        if table.scheme.has_zero_point:
-            table = table.with_tensors(table.read_tensors())
-            # A zero point cannot be pulled out of the matmul, so the table
-            # is dequantized first, in the precision its scale reads in:
-            # below it, only the inputs and the logits are cast to `dtype`.
-            float_table = table.dequantize(
-                backend.result_type(dtype, table.scale.dtype)
+        selection = None
+        if not layer.inputs_quantizer:
+            # A route reads the table as stored: a tied table is the
+            # forward table.
+            if layer.tie_weights:
+                stored = self._get_lookup_quantized_weight(layer, geometry)
+            else:
+                stored = self._get_reverse_lookup_quantized_weight(
+                    layer, geometry
+                )
+            selection = kernels.select_logits_route(layer, stored, inputs)
+        if selection is not None:
+            logits = self._contract_routed(
+                selection, layer, geometry, stored, inputs, dtype
             )
-            logits = ops.matmul(inputs_q, float_table)
-            if inputs_scale is not None:
-                logits = ops.divide(logits, inputs_scale)
         else:
-            # Matmul on the codes, then the view applies the scales to the
-            # logits.
-            logits = ops.cast(ops.matmul(inputs_q, table.unpack()), dtype)
-            logits = table.apply_scale(logits, inputs_scale)
+            # The reference contraction stays inline: in a method of its
+            # own, Dynamo breaks the graph at other places, and a compiled
+            # bfloat16 gradient gets other bits.
+            table = self._get_reverse_lookup_quantized_weight(layer, geometry)
+            inputs_q, inputs_scale = inputs, None
+            if layer.inputs_quantizer:
+                inputs_q, inputs_scale = layer.inputs_quantizer(inputs)
+            if table.scheme.has_zero_point:
+                table = table.with_tensors(table.read_tensors())
+                # A zero point cannot be pulled out of the matmul, so the table
+                # is dequantized first, in the precision its scale reads in:
+                # below it, only the inputs and the logits are cast to `dtype`.
+                float_table = table.dequantize(
+                    backend.result_type(dtype, table.scale.dtype)
+                )
+                logits = ops.matmul(inputs_q, float_table)
+                if inputs_scale is not None:
+                    logits = ops.divide(logits, inputs_scale)
+            else:
+                # Matmul on the codes, then the view applies the scales to the
+                # logits.
+                logits = ops.cast(ops.matmul(inputs_q, table.unpack()), dtype)
+                logits = table.apply_scale(logits, inputs_scale)
         # The scales are float32 variables; the projection reports its own
         # dtype, as the float layer does.
         logits = ops.cast(logits, dtype)
@@ -250,6 +299,33 @@ class LookupHandlers:
                 ops.tanh(ops.divide(logits, soft_cap)), soft_cap
             )
         return logits
+
+    def _contract_routed(
+        self, selection, layer, geometry, stored, inputs, dtype
+    ):
+        """Runs a reverse lookup route with the gradient of the reference.
+
+        `stored` is the stored table. The route runs forward only. The
+        backward repeats the arithmetic of autodiff through the reference
+        contraction of `_reverse_lookup`, on the `(D, V)` view of the
+        stored tensors, so the input gradient is the reference's. Its
+        matmul can sum in another order than autodiff's: with oneDNN on
+        x86, TensorFlow runs autodiff's `MatMul`, which transposes the
+        table, as another gemm call.
+        """
+
+        def forward(inputs, table):
+            logits = kernels.run_route(
+                selection, layer, geometry, table, inputs
+            )
+            return ops.cast(logits, dtype)
+
+        def backward(inputs, table, upstream):
+            if layer.tie_weights:
+                table = self._transposed_lookup_view(layer, table)
+            return _reverse_lookup_grad(table, upstream, dtype)
+
+        return contract_with_stored_tensors(stored, inputs, forward, backward)
 
     # --- Conversion -------------------------------------------------------
 
@@ -319,3 +395,23 @@ class LookupHandlers:
             table.scale.assign(scale)
             if zero_point is not None:
                 table.zero_point.assign(zero_point)
+
+
+def _reverse_lookup_grad(table, upstream, dtype):
+    """The input gradient of the reference reverse contraction.
+
+    `table` is the `(D, V)` view, and `upstream` the gradient of the
+    logits. A grouped table is dequantized in the precision of its scale.
+    A per-channel table divides the upstream gradient by its scale, then
+    contracts with its codes.
+    """
+    if table.zero_point is not None:
+        precision = backend.result_type(dtype, table.scale.dtype)
+        grad = ops.matmul(
+            ops.cast(upstream, precision),
+            ops.transpose(table.dequantize(precision)),
+        )
+    else:
+        grad = ops.cast(ops.divide(upstream, table.scale), dtype)
+        grad = ops.matmul(grad, ops.transpose(ops.cast(table.unpack(), dtype)))
+    return ops.cast(grad, dtype)

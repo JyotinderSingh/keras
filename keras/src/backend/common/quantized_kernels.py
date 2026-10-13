@@ -41,6 +41,12 @@ class Kernel:
             are int8. `input_scales` (AWQ) divide `x`. `g_idx` is the
             `(K,)` group of each row, or `None` when row `k` is in group
             `k // group_size`.
+        logits: `logits(x, codes, scale, zero, *, group_size, per_channel,
+            orientation)` returns the `(M, V)` logits of the `(M, D)`
+            activations with a stored lookup table that packs two codes
+            per byte along `D`: `(V, D / 2)` for a `"tied"` table, or
+            `(D / 2, V)` for an `"untied"` one. `None` when the kernel has
+            no logits variant.
         dtypes: The compute dtypes that the kernel supports.
         supports_device: `supports_device(device_class)` says whether the
             kernel runs on a device class with the installed library. It
@@ -52,6 +58,8 @@ class Kernel:
             says whether the kernel runs one matmul: the shape, the group
             size and the compute dtype on a device class that
             `supports_device` passes.
+        logits_available: `logits_available(device_class, m, d, v,
+            group_size, dtype)`, the same check for `logits`.
         tested: `tested()` says whether the installed version of an
             experimental compiler is in the range that a run on hardware
             passed. `None` when the kernel has no such range. The
@@ -64,4 +72,6 @@ class Kernel:
     supports_device: object
     requirements: str
     available: object
+    logits: object = None
+    logits_available: object = None
     tested: object = None

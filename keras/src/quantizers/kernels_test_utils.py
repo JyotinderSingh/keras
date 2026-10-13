@@ -1,12 +1,14 @@
 """Test routes and fixtures of `kernels.py`.
 
-Importing this module registers the test route `"reference_wrapped"`:
-the reference path of a projection, run as a route through `force_route`
-only. A wrapped call takes the path of a selected route (the selection
-and the count), so its outputs must equal those of the reference path
-bit for bit.
+Importing this module registers test routes in both route tables:
 
-`route_tables` adds the `"matrix"` route, which contracts the `(M, K)`
+- `"reference_wrapped"`: the reference path of a projection and of a
+  reverse lookup, run as a route through `force_route` only. A wrapped
+  call takes the path of a selected route (the selection, the count and,
+  for the reverse lookup, the custom gradient), so its outputs must equal
+  those of the reference path bit for bit.
+
+`route_tables` adds the `"matrix"` routes, which contract the `(M, K)`
 inputs with the stored matrix.
 
 The route tests check, by label:
@@ -31,6 +33,24 @@ from keras.src import distribution
 from keras.src import ops
 from keras.src.backend.common import AutocastScope
 from keras.src.quantizers import kernels
+from keras.src.quantizers import strategy_registry
+
+
+def _reference_logits(layer, geometry, table, inputs):
+    """The reference reverse contraction, with no activation quantizer.
+
+    A grouped table is dequantized in the precision of its scale. A
+    per-channel table contracts its codes, then divides by its scale.
+    """
+    dtype = layer.reverse_dtype or layer.compute_dtype
+    view = table
+    if layer.tie_weights:
+        strategy = strategy_registry.get_strategy(layer.quantization_mode)
+        view = strategy._transposed_lookup_view(layer, table)
+    if view.zero_point is not None:
+        precision = backend.result_type(dtype, view.scale.dtype)
+        return ops.matmul(inputs, view.dequantize(precision))
+    return view.apply_scale(ops.cast(ops.matmul(inputs, view.unpack()), dtype))
 
 
 def _matrix(quantized_weight, inputs, dtype):
@@ -41,39 +61,69 @@ def _matrix(quantized_weight, inputs, dtype):
     return ops.matmul(inputs, ops.reshape(kernel, (inputs.shape[-1], -1)))
 
 
+def _matrix_logits(table, inputs, dtype):
+    """The `(M, D)` inputs times the table as stored."""
+    weight = table.dequantize(dtype)
+    if kernels._tied(table):
+        weight = ops.transpose(weight)
+    return ops.matmul(inputs, weight)
+
+
 def matrix_route(**changes):
     """The `"matrix"` route of a projection, with the fields `changes`."""
     return kernels.Route(_matrix, **changes)
 
 
+def matrix_logits_route(**changes):
+    """The `"matrix"` route of a reverse lookup, with the fields
+    `changes`."""
+    return kernels.Route(_matrix_logits, **changes)
+
+
 kernels._ROUTES["reference_wrapped"] = kernels.Route(
     kernels._reference, matrix=False
+)
+kernels._LOGITS_ROUTES["reference_wrapped"] = kernels.Route(
+    _reference_logits, matrix=False
 )
 
 
 @contextlib.contextmanager
-def route_tables(rows=None, routes=None, required=None):
+def route_tables(
+    rows=None, logits_rows=None, routes=None, logits_routes=None, required=None
+):
     """Runs a block with test route tables, under `"auto"`.
 
-    The block adds the `"matrix"` route, then `routes`, to the route
-    table, and sets the measured rows to `rows` (none by default). With
-    `required`, a tuple of route names, the other kernel routes leave the
-    table, so `"require"` runs only those.
+    The block adds the `"matrix"` routes, then `routes` and
+    `logits_routes`, to the route tables, and sets the measured rows to
+    `rows` and `logits_rows` (none by default). With `required`, a tuple
+    of route names, the other kernel routes leave both tables, so
+    `"require"` runs only those.
 
     Only `"auto"` reads the measured rows, and `pytest --kernel-policy`
     can set another policy for the process. So the block runs under
     `"auto"`. A block inside this block can set a different policy. The
     tables and the policy are as before when the block ends.
     """
-    tables = (kernels._ROUTES, kernels._MEASURED_ROWS)
+    tables = (
+        kernels._ROUTES,
+        kernels._LOGITS_ROUTES,
+        kernels._MEASURED_ROWS,
+        kernels._MEASURED_LOGITS_ROWS,
+    )
     saved = [dict(table) for table in tables]
     if required is not None:
-        for name, route in list(kernels._ROUTES.items()):
-            if route.kernel is not None and name not in required:
-                del kernels._ROUTES[name]
+        for table in tables[:2]:
+            for name, route in list(table.items()):
+                if route.kernel is not None and name not in required:
+                    del table[name]
     kernels._ROUTES.update({"matrix": matrix_route(), **(routes or {})})
-    kernels._MEASURED_ROWS.clear()
-    kernels._MEASURED_ROWS.update(rows or {})
+    kernels._LOGITS_ROUTES.update(
+        {"matrix": matrix_logits_route(), **(logits_routes or {})}
+    )
+    for table, measured_rows in zip(tables[2:], (rows, logits_rows)):
+        table.clear()
+        table.update(measured_rows or {})
     try:
         with kernels.policy("auto"):
             yield
@@ -88,10 +138,11 @@ def row_key(dtype, bucket):
     return (backend.backend(), kernels._device_class(), dtype, bucket)
 
 
-def counts(layer, x):
-    """The routes that one call `layer(x)` selects."""
+def counts(layer, x, **call_kwargs):
+    """The routes that one call `layer(x, **call_kwargs)` selects, for
+    example with `reverse=True`."""
     kernels.route_counts.clear()
-    layer(x)
+    layer(x, **call_kwargs)
     return dict(kernels.route_counts)
 
 
@@ -111,17 +162,31 @@ def floor_and_bound(dtype):
     return 1e-3, 2**-7
 
 
-def admitted(layer, x):
+def lookup_table(layer):
+    """The stored table of the reverse lookup: the forward table `(V, D)`
+    of a tied layer, or the reverse table `(D, V)` of an untied one."""
+    strategy = strategy_registry.get_strategy(layer.quantization_mode)
+    if layer.tie_weights:
+        return strategy._get_lookup_quantized_weight(layer, None)
+    return strategy._get_reverse_lookup_quantized_weight(layer, None)
+
+
+def admitted(layer, x, reverse=False):
     """The routes that `force_route` runs for a call of `layer` on `x`.
 
     They are the routes of the table whose dtypes, device check and shape
     check pass.
     """
-    routes, view = kernels._ROUTES, layer._quantized_weight()
-    dtype = layer.compute_dtype
-    geometry = layer._quantization_geometry()
-    k, contracted, columns = geometry.matrix_contraction()
-    n = math.prod(columns)
+    if reverse:
+        routes, view = kernels._LOGITS_ROUTES, lookup_table(layer)
+        dtype = layer.reverse_dtype or layer.compute_dtype
+        k, contracted, n = layer.output_dim, 1, layer.input_dim
+    else:
+        routes, view = kernels._ROUTES, layer._quantized_weight()
+        dtype = layer.compute_dtype
+        geometry = layer._quantization_geometry()
+        k, contracted, columns = geometry.matrix_contraction()
+        n = math.prod(columns)
     shape = tuple(x.shape)
     m = math.prod(shape[: len(shape) - contracted])
     device_class = kernels._device_class()
@@ -146,3 +211,33 @@ def direct(layer, x):
         inputs = ops.cast(x, layer.compute_dtype)
         selection = kernels.select_route(layer, geometry, view, inputs)
         return kernels.run_route(selection, layer, geometry, view, inputs)
+
+
+def direct_logits(layer, x, in_model=False):
+    """A direct call of the route that a reverse lookup of `layer` on `x`
+    selects, on the tensors that the layer reads, with the tied LoRA term
+    and the soft cap of the reverse lookup after it.
+
+    On its own, a layer under a mixed policy reads its variables in the
+    compute dtype. In a model, the `autocast=False` of the layer clears
+    the autocast scope of the model.
+    """
+    dtype = layer.reverse_dtype or layer.compute_dtype
+    with AutocastScope(None if in_model else layer.compute_dtype):
+        table = lookup_table(layer)
+        table = table.with_tensors(table.read_tensors())
+        inputs = ops.cast(x, dtype)
+        selection = kernels.select_logits_route(layer, table, inputs)
+        logits = kernels.run_route(selection, layer, None, table, inputs)
+        logits = ops.cast(logits, dtype)
+        if layer.tie_weights and layer.lora_enabled:
+            lora = ops.matmul(inputs, ops.transpose(layer.lora_embeddings_b))
+            lora = ops.matmul(lora, ops.transpose(layer.lora_embeddings_a))
+            lora = (layer.lora_alpha / layer.lora_rank) * lora
+            logits = ops.add(logits, ops.cast(lora, dtype))
+        if layer.logit_soft_cap is not None:
+            soft_cap = layer.logit_soft_cap
+            logits = ops.multiply(
+                ops.tanh(ops.divide(logits, soft_cap)), soft_cap
+            )
+    return logits
