@@ -41,7 +41,8 @@ The policy is private. `"auto"` (the default) runs the route of the
 allow-list row, `"off"` runs the reference path, and `"require"` runs
 the platform's kernel. `"require"` ignores the allow-list and the
 version range, and `set_policy("require")` raises on a platform without
-a kernel.
+a kernel. Under `"require"`, a call on a device that the kernel does
+not support raises too.
 
 `route_counts` counts the selections per route name for tests. On JAX a
 selection happens at trace time. Under `torch.compile` the counter does
@@ -663,3 +664,74 @@ def run_lookup_route(route, layer, table, orientation, inputs):
     x = ops.reshape(inputs, (-1, route.rows))
     y = source.fn(layer, table, orientation, x, route.config)
     return ops.reshape(y, tuple(ops.shape(inputs)[:-1]) + route.columns)
+
+
+# Triton K1 (torch with CUDA): `backend.ops.quantized.w4a16_matmul`, a
+# `matrix` route. It is in `_ROUTES` only where Triton imports, and it has
+# no allow-list row until the GPU sessions measure one. It is the kernel of
+# `"require"` on a CUDA device (device type "gpu" in `list_devices`), but
+# not on ROCm, where `pytorch-triton-rocm` imports as `triton`.
+# The Triton releases that a run under `"require"` passed on (GPU CI or a
+# pod).
+TRITON_TESTED = ("3.8",)
+
+
+def _triton(layer, geometry, quantized_weight, inputs, config=None):
+    """Triton K1: the `(M, K)` inputs with the stored 4-bit codes."""
+    view = quantized_weight
+    return backend.ops.quantized.w4a16_matmul(
+        inputs,
+        view.codes,
+        view.scale,
+        view.zero_point,
+        view.g_idx,
+        group_size=view.scheme.group_size,
+        signed=ops.dtype(view.codes) == "int8",
+        per_channel=view.g_idx is None,
+        config=config,
+        awq_scales=view.input_scales,
+    )
+
+
+def _triton_available(m, k, n, view):
+    """Gate 5 of Triton K1: the device gate and the int32 offsets.
+
+    The device is CUDA (not ROCm) with compute capability 8.0 or newer,
+    or 7.5 with float16 compute. Under `"require"`, a CUDA device that
+    fails this check raises. On CPU, the gate passes only under the
+    Triton interpreter, for `force_route` in the tests: no CPU row exists.
+    """
+    # The kernel indexes with int32 offsets. The split-K workspace, which
+    # can hold more elements, has int64 offsets.
+    if max(m * k, m * n, k * n) >= 2**31:
+        return False
+    # The view of a GPTQ or AWQ call holds the layer's variables.
+    device = getattr(view.codes, "value", view.codes).device
+    if device.type == "cpu":
+        return backend.ops.quantized.INTERPRETED
+    if device.type != "cuda" or torch.version.hip is not None:
+        return False
+    capability = backend.ops.quantized.device_capability(device)
+    # Inside the autocast scope, the scale reads in the compute dtype.
+    dtype = ops.dtype(view.scale)
+    if capability >= (8, 0) or (capability == (7, 5) and dtype == "float16"):
+        return True
+    if _state.policy == "require":
+        raise ValueError(
+            "The kernel policy 'require' needs a CUDA device with compute "
+            "capability 8.0 or newer, or 7.5 with float16 compute. "
+            f"Received: capability={capability}, compute dtype={dtype}"
+        )
+    return False
+
+
+if backend.backend() == "torch" and backend.ops.quantized.triton is not None:
+    _ROUTES["triton"] = RouteSource(
+        _triton,
+        dtypes=("bfloat16", "float16", "float32"),
+        available=_triton_available,
+        version=lambda: backend.ops.quantized.triton.__version__,
+        tested_versions=TRITON_TESTED,
+    )
+    if torch.version.hip is None:
+        _REQUIRED["torch"] = {"gpu": "triton"}

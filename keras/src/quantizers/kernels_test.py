@@ -109,13 +109,16 @@ def _untested():
 @contextlib.contextmanager
 def _routes(rows=None, required=None, **sources):
     """Adds `matrix` and `sources` to the route table, sets the allow-list
-    to `rows`, and sets `required` as this backend's `"require"` kernels."""
+    to `rows`, and sets `required` as this backend's `"require"` kernels
+    (`{}` for none). Then it puts back the allow-list and the platform's
+    own `"require"` kernels."""
     sources = {"matrix": kernels.RouteSource(_matrix), **sources}
     allow_list = dict(kernels._ALLOW_LIST)
+    platform_kernels = kernels._REQUIRED.get(backend.backend())
     kernels._ROUTES.update(sources)
     kernels._ALLOW_LIST.clear()
     kernels._ALLOW_LIST.update(rows or {})
-    if required:
+    if required is not None:
         kernels._REQUIRED[backend.backend()] = required
     try:
         # Only `"auto"` reads the allow-list, and a test runner can set
@@ -130,6 +133,8 @@ def _routes(rows=None, required=None, **sources):
         kernels._ALLOW_LIST.clear()
         kernels._ALLOW_LIST.update(allow_list)
         kernels._REQUIRED.pop(backend.backend(), None)
+        if platform_kernels is not None:
+            kernels._REQUIRED[backend.backend()] = platform_kernels
 
 
 def _device_type():
@@ -970,17 +975,19 @@ class PolicyTest(testing.TestCase):
         with self.assertRaisesRegex(ValueError, "must be one of"):
             kernels.set_policy("fast")
         with self.assertRaisesRegex(ValueError, "Unknown route"):
-            with kernels.force_route("triton"):
+            with kernels.force_route("unknown"):
                 pass
         self.assertEqual(self.state(), self.initial)
 
     def test_require_raises_without_a_kernel(self):
-        with self.assertRaisesRegex(ValueError, "needs a platform with a"):
-            kernels.set_policy("require")
-        with self.assertRaisesRegex(ValueError, "needs a platform with a"):
-            with kernels.policy("require"):
-                pass
-        self.assertEqual(self.state(), ("auto", None))
+        # A CUDA host with Triton has a kernel, so the test removes it.
+        with _routes(required={}):
+            with self.assertRaisesRegex(ValueError, "needs a platform with"):
+                kernels.set_policy("require")
+            with self.assertRaisesRegex(ValueError, "needs a platform with"):
+                with kernels.policy("require"):
+                    pass
+        self.assertEqual(self.state(), self.initial)
 
     @pytest.mark.skipif(
         backend.backend() == "numpy", reason="NumPy lists no devices."
