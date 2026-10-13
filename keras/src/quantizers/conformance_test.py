@@ -41,6 +41,8 @@ from keras.src.quantizers.quantization_test_utils import CALIBRATION_MODES
 from keras.src.quantizers.quantization_test_utils import CUSTOM_OBJECTS
 from keras.src.quantizers.quantization_test_utils import LAYERS
 from keras.src.quantizers.quantization_test_utils import ReleasedProtocolLayer
+from keras.src.quantizers.quantization_test_utils import StandardProjection
+from keras.src.quantizers.quantization_test_utils import TokenTable
 from keras.src.quantizers.quantization_test_utils import build_layer
 from keras.src.quantizers.quantization_test_utils import calibrate_layer
 from keras.src.quantizers.quantization_test_utils import calibration_config
@@ -341,7 +343,12 @@ def _documented_weight(view, convention):
     elif convention == "scalar":
         weight = codes * scale
     else:
-        groups = _numpy(view.g_idx).astype("int64")
+        if view.g_idx is None:
+            # The mode fixes the groups: position `i` is in group `i // G`.
+            length = codes.shape[view.axis]
+            groups = np.arange(length) // view.scheme.group_size
+        else:
+            groups = _numpy(view.g_idx).astype("int64")
         zero_point = _numpy(view.zero_point).astype("float32")
         weight = np.take(scale, groups, axis=view.axis) * (
             codes - np.take(zero_point, groups, axis=view.axis)
@@ -868,3 +875,46 @@ class ReleasedProtocolTest(testing.TestCase):
         report = model.quantize("int8", verbose=False)
         self.assertEqual(model.layers[0].quantization_mode, "int8")
         self.assertLen(report.quantized, 1)
+
+
+class FixedGroupsTest(testing.TestCase):
+    """A third-party layer gets the fixed group index of its mode from
+    `add_group_index` and the calibration build."""
+
+    @parameterized.named_parameters(("int4", "int4"), ("awq", "awq"))
+    def test_third_party_layer_gets_fixed_groups(self, mode):
+        """int4 and AWQ in groups of 64: the `g_idx` of the layer holds
+        `k // 64`, its view has no `g_idx`, and a write of other groups
+        changes no output."""
+        layer = StandardProjection(32, use_bias=False)
+        layer.build((None, 256))
+        rng = np.random.default_rng(0)
+        x = rng.standard_normal((3, 256)).astype("float32")
+        if mode == "int4":
+            config = Int4QuantizationConfig(block_size=64)
+            layer.quantize("int4", config=config)
+        else:
+            batch = rng.standard_normal((16, 256)).astype("float32")
+            calibrate_layer(
+                layer, calibration_config("awq", group_size=64), batch
+            )
+        self.assertAllEqual(layer.g_idx, np.arange(256) // 64)
+        self.assertIsNone(layer._quantized_weight().g_idx)
+        expected = _numpy(layer(x))
+        weights = layer.get_weights()
+        index = [v.name for v in layer.weights].index("g_idx")
+        weights[index] = rng.permutation(np.arange(256) // 64)
+        layer.set_weights(weights)
+        self.assertAllEqual(_numpy(layer(x)), expected)
+
+    def test_third_party_lookup_gets_fixed_groups(self):
+        """A grouped int4 `TokenTable` holds `d // G`, and its view has no
+        `g_idx`: column `d` is in group `d // G`."""
+        layer = TokenTable(10, 8)
+        layer.build()
+        layer.quantize("int4", config=Int4QuantizationConfig(block_size=4))
+        self.assertAllEqual(layer.g_idx, np.arange(8) // 4)
+        self.assertIsNone(layer._quantized_weight().g_idx)
+        self.assertAllEqual(
+            layer._quantized_weight().group_index(), [0] * 4 + [1] * 4
+        )
