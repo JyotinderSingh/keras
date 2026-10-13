@@ -14,6 +14,7 @@ import math
 from keras.src import backend
 from keras.src import ops
 from keras.src.backend.common import standardize_dtype
+from keras.src.quantizers import kernels
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.quantization_config import QuantizationConfig
 from keras.src.quantizers.quantized_weight import NoPack
@@ -40,7 +41,9 @@ class LookupHandlers:
     precision of the scale. The reverse projection contracts with the
     codes and applies the scales to the logits (`apply_scale`), or, when
     the scheme has a zero point, contracts with the table dequantized in
-    the precision of its scale.
+    the precision of its scale. A route of `kernels.py` can replace the
+    int4 reverse contraction with no activation quantizer; it runs inside
+    a custom gradient that repeats the reference's.
     """
 
     # --- What a mode supplies ---------------------------------------------
@@ -207,26 +210,45 @@ class LookupHandlers:
         # As the float layer: `reverse_dtype` when set, else `compute_dtype`.
         dtype = layer.reverse_dtype or layer.compute_dtype
         inputs = ops.cast(inputs, dtype)
-        table = self._get_reverse_lookup_quantized_weight(layer, geometry)
-        inputs_q, inputs_scale = inputs, None
-        if layer.inputs_quantizer:
-            inputs_q, inputs_scale = layer.inputs_quantizer(inputs)
-        if table.scheme.has_zero_point:
-            table = table.with_tensors(table.read_tensors())
-            # A zero point cannot be pulled out of the matmul, so the table
-            # is dequantized first, in the precision its scale reads in:
-            # below it, only the inputs and the logits are cast to `dtype`.
-            float_table = table.dequantize(
-                backend.result_type(dtype, table.scale.dtype)
+        route = None
+        if not layer.inputs_quantizer:
+            # A route reads the table as stored: a tied table is the
+            # forward table.
+            orientation = "tied" if layer.tie_weights else "untied"
+            if layer.tie_weights:
+                stored = self._get_lookup_quantized_weight(layer, geometry)
+            else:
+                stored = self._get_reverse_lookup_quantized_weight(
+                    layer, geometry
+                )
+            route = kernels.select_lookup_route(
+                layer, stored, orientation, inputs
             )
-            logits = ops.matmul(inputs_q, float_table)
-            if inputs_scale is not None:
-                logits = ops.divide(logits, inputs_scale)
+        if route is not None:
+            logits = _contract_routed(
+                route, layer, stored, orientation, inputs, dtype
+            )
         else:
-            # Matmul on the codes, then the view applies the scales to the
-            # logits.
-            logits = ops.cast(ops.matmul(inputs_q, table.unpack()), dtype)
-            logits = table.apply_scale(logits, inputs_scale)
+            table = self._get_reverse_lookup_quantized_weight(layer, geometry)
+            inputs_q, inputs_scale = inputs, None
+            if layer.inputs_quantizer:
+                inputs_q, inputs_scale = layer.inputs_quantizer(inputs)
+            if table.scheme.has_zero_point:
+                table = table.with_tensors(table.read_tensors())
+                # A zero point cannot be pulled out of the matmul, so the table
+                # is dequantized first, in the precision its scale reads in:
+                # below it, only the inputs and the logits are cast to `dtype`.
+                float_table = table.dequantize(
+                    backend.result_type(dtype, table.scale.dtype)
+                )
+                logits = ops.matmul(inputs_q, float_table)
+                if inputs_scale is not None:
+                    logits = ops.divide(logits, inputs_scale)
+            else:
+                # Matmul on the codes, then the view applies the scales to the
+                # logits.
+                logits = ops.cast(ops.matmul(inputs_q, table.unpack()), dtype)
+                logits = table.apply_scale(logits, inputs_scale)
         # The scales are float32 variables; the projection reports its own
         # dtype, as the float layer does.
         logits = ops.cast(logits, dtype)
@@ -321,3 +343,46 @@ class LookupHandlers:
             table.scale.assign(scale)
             if zero_point is not None:
                 table.zero_point.assign(zero_point)
+
+
+def _contract_routed(route, layer, table, orientation, inputs, dtype):
+    """Runs a reverse lookup `route` with the gradient of the reference.
+
+    `table` is the stored table. The route runs forward only. The
+    backward repeats the arithmetic of autodiff through the reference
+    contraction of `_reverse_lookup`, on the `(D, V)` view of the stored
+    tensors, so the input gradient is the reference's bit for bit. Only
+    the stored tensors are kept for it, and they get no gradient: the
+    table is frozen.
+    """
+
+    @ops.custom_gradient
+    def contract(inputs, *tensors):
+        stored = table.with_tensors(tensors)
+
+        def grad_fn(*args, upstream=None):
+            if upstream is None:
+                (upstream,) = args
+            view = kernels.reverse_lookup_view(stored, orientation)
+            if view.zero_point is not None:
+                precision = backend.result_type(dtype, view.scale.dtype)
+                grad = ops.matmul(
+                    ops.cast(upstream, precision),
+                    ops.transpose(view.dequantize(precision)),
+                )
+            else:
+                grad = ops.cast(ops.divide(upstream, view.scale), dtype)
+                grad = ops.matmul(
+                    grad, ops.transpose(ops.cast(view.unpack(), dtype))
+                )
+            return (ops.cast(grad, dtype),) + (None,) * len(tensors)
+
+        logits = kernels.run_lookup_route(
+            route, layer, stored, orientation, inputs
+        )
+        return ops.cast(logits, dtype), grad_fn
+
+    # Read inside the autocast scope: on TensorFlow eager the gradient
+    # runs after it, and the scale variable would then read in another
+    # dtype.
+    return contract(inputs, *table.read_tensors())
