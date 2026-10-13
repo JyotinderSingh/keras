@@ -779,4 +779,197 @@ if backend.backend() == "torch" and backend.ops.quantized.triton is not None:
         tested_versions=TRITON_TESTED,
     )
     if torch.version.hip is None:
-        _REQUIRED["torch"] = {"gpu": "triton"}
+        _REQUIRED.setdefault("torch", {})["gpu"] = "triton"
+
+
+# Mosaic GPU K1 (JAX, NVIDIA): `mosaic_gpu_w4a16_matmul` of the JAX
+# backend's `ops.quantized`. Under `"auto"`, it runs only with equal jax
+# and jaxlib versions in `MOSAIC_GPU_TESTED_JAX`: the Mosaic GPU compiler
+# ships in jaxlib, and a jax release accepts an older jaxlib. A version
+# enters the constant after a correctness run on a GPU passes on it.
+MOSAIC_GPU_TESTED_JAX = ("0.11.2", "0.12.0")
+# The device gate: CUDA compute capabilities. A ROCm device reports a
+# `gfx` name.
+_MOSAIC_GPU_CAPABILITIES = ("8.0", "8.6", "8.9", "9.0")
+
+
+def _mosaic_gpu(layer, geometry, view, inputs, config, interpret=False):
+    """Mosaic GPU K1: the `(M, K)` inputs against the 4-bit codes.
+
+    With no configuration in the allow-list row, the row of
+    `MOSAIC_GPU_CONFIGS` for the device gives it. Interpret mode runs on
+    CPU and takes the rows of compute capability 8.9.
+    """
+    quantized = backend.ops.quantized
+    m, k = inputs.shape
+    if config is None:
+        if interpret:
+            capability = "8.9"
+        else:
+            capability = jax.devices()[0].compute_capability
+        key = (capability, layer.compute_dtype, _m_bucket(m))
+        config = quantized.MOSAIC_GPU_CONFIGS[key]
+    grouped = view.g_idx is not None
+    return quantized.mosaic_gpu_w4a16_matmul(
+        inputs,
+        view.codes,
+        view.scale,
+        view.zero_point,
+        group_size=min(view.scheme.group_size, k) if grouped else None,
+        signed=standardize_dtype(view.codes.dtype) == "int8",
+        per_channel=not grouped,
+        config=config,
+        input_scales=view.input_scales,
+        interpret=interpret,
+    )
+
+
+def _mosaic_gpu_aligned(k, n, group_size):
+    """The alignment gate: whole K steps of 128 rows, whole blocks of 32
+    code columns, and groups of whole K steps. A per-channel weight has
+    no `group_size`."""
+    group = k if group_size is None else min(group_size, k)
+    return n % 64 == 0 and k % 128 == 0 and group % 128 == 0
+
+
+def _mosaic_gpu_available(m, k, n, view):
+    """Gate 5 of Mosaic GPU K1: the device gate and the alignment gate.
+
+    Under `"require"`, a device or a JAX that cannot run the kernel raises.
+    """
+    if backend.backend() != "jax":
+        return False
+    device = jax.devices()[0]
+    capability = getattr(device, "compute_capability", None)
+    if not (
+        device.platform == "gpu"
+        and capability in _MOSAIC_GPU_CAPABILITIES
+        and backend.ops.quantized.plgpu.available
+    ):
+        if _state.policy == "require":
+            raise ValueError(
+                "The kernel policy 'require' runs Mosaic GPU K1, which needs "
+                "an NVIDIA GPU of compute capability "
+                f"{', '.join(_MOSAIC_GPU_CAPABILITIES)} and a JAX with "
+                f"`plgpu.mma` (0.11.2 or newer). Received: device={device}, "
+                f"compute_capability={capability}, jax={jax.__version__}"
+            )
+        return False
+    return _mosaic_gpu_aligned(k, n, view.scheme.group_size)
+
+
+def _mosaic_gpu_interpret_available(m, k, n, view):
+    """The interpret route: a JAX with Mosaic GPU, and the alignment gate."""
+    return (
+        backend.backend() == "jax"
+        and backend.ops.quantized.plgpu.available
+        and _mosaic_gpu_aligned(k, n, view.scheme.group_size)
+    )
+
+
+_ROUTES["mosaic_gpu"] = RouteSource(
+    _mosaic_gpu,
+    dtypes=("bfloat16", "float16"),
+    available=_mosaic_gpu_available,
+    version=lambda: backend.ops.quantized.mosaic_gpu_versions(),
+    tested_versions=MOSAIC_GPU_TESTED_JAX,
+    contiguous_groups=True,
+)
+# Test helper, through `force_route` only: Mosaic GPU K1 in GPU interpret
+# mode on CPU, with `jnp.dot` in place of `plgpu.mma`. It does not support
+# `jax.vmap` of a guarded (grouped) call: interpret mode has an IO effect,
+# which JAX does not support in a vmap-of-cond.
+_ROUTES["mosaic_gpu_interpret"] = RouteSource(
+    functools.partial(_mosaic_gpu, interpret=True),
+    dtypes=("bfloat16", "float16"),
+    available=_mosaic_gpu_interpret_available,
+    contiguous_groups=True,
+)
+_REQUIRED.setdefault("jax", {})["gpu"] = "mosaic_gpu"
+
+
+@contextlib.contextmanager
+def mosaic_gpu_lowering(compute_capability):
+    """Test helper: lowers the Mosaic GPU kernels for a GPU on a CPU host.
+
+    Inside the block, `jax.export.export(..., platforms=["cuda"])` lowers
+    a Mosaic GPU kernel for `compute_capability`, for example `"8.9"`. It
+    runs the Pallas lowering, the pipeline of that capability (`cp.async`
+    below 9.0, TMA from 9.0) and the Mosaic GPU layout inference, but no
+    `ptxas`. `AbstractDevice` has no compute capability, so the helper
+    sets the private `jax.experimental.mosaic.gpu.utils._infer_arch`.
+
+    It also wraps the private `LaunchContext.async_copy`. An untiled copy
+    from GMEM reads its block as the base address plus the flat SMEM
+    index, so a block that is not one contiguous run of its GMEM array
+    lowers, passes interpret mode, and reads the wrong bytes on a GPU.
+    The wrap raises `ValueError` for such a block. It changes nothing
+    else.
+
+    The pipeline reads the capability when `mosaic_gpu_w4a16_matmul`
+    traces, and the function keeps its traces. So the helper clears them
+    on entry and on exit: a trace for another capability does not serve
+    the block, and a trace of the block does not serve a later call.
+
+    Raises `NotImplementedError` when JAX has no `plgpu.mma`, or when a
+    private name moved.
+    """
+    try:
+        if not backend.ops.quantized.plgpu.available:
+            raise AttributeError("`plgpu.mma`")
+        mosaic = jax.experimental.mosaic.gpu
+        utils, context = mosaic.utils, mosaic.launch_context.LaunchContext
+        infer_arch, async_copy = utils._infer_arch, context.async_copy
+    except AttributeError as e:
+        raise NotImplementedError(
+            "`mosaic_gpu_lowering` needs a Mosaic GPU name that JAX "
+            f"{jax.__version__} does not have: {e}"
+        ) from e
+    arch = tuple(int(part) for part in compute_capability.split("."))
+
+    def checked_copy(self, *, src_ref, gmem_slice=(), **kwargs):
+        source, transform = src_ref.type, kwargs.get("gmem_transform")
+        if source.memory_space is None and not transform:
+            shape = tuple(source.shape)
+            if not _contiguous_block(shape, gmem_slice):
+                raise ValueError(
+                    "An untiled GMEM to SMEM copy reads a block that is not "
+                    f"one contiguous run of its array. Received: array "
+                    f"shape={shape}, block={_block_shape(shape, gmem_slice)}"
+                )
+        return async_copy(
+            self, src_ref=src_ref, gmem_slice=gmem_slice, **kwargs
+        )
+
+    kernel = backend.ops.quantized.mosaic_gpu_w4a16_matmul
+    kernel.clear_cache()
+    utils._infer_arch = lambda: arch
+    context.async_copy = checked_copy
+    try:
+        yield
+    finally:
+        utils._infer_arch, context.async_copy = infer_arch, async_copy
+        kernel.clear_cache()
+
+
+def _block_shape(shape, gmem_slice):
+    """The length of a GMEM block along each axis of its array."""
+    index = gmem_slice if isinstance(gmem_slice, tuple) else (gmem_slice,)
+    index += (slice(None),) * (len(shape) - len(index))
+    return tuple(
+        len(range(size)[item])
+        if isinstance(item, slice)
+        else getattr(item, "length", 1)
+        for size, item in zip(shape, index)
+    )
+
+
+def _contiguous_block(shape, gmem_slice):
+    """Whether a block is one contiguous run of a row-major array: each
+    axis after the first axis longer than 1 spans its whole array axis."""
+    longer = False
+    for length, size in zip(_block_shape(shape, gmem_slice), shape):
+        if longer and length != size:
+            return False
+        longer = longer or length != 1
+    return True
