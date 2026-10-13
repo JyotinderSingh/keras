@@ -471,15 +471,15 @@ def _set_weights(
             )
         writes.append((symbolic_weights[i], weight_value))
     # A quantization mode can fix the value of a variable. Its check
-    # (`_assign_check`) refuses another value. Every check runs before the
-    # first write, so a refused load leaves the layer as it was. Under
-    # `skip_mismatch`, a refused value skips the layer with a warning.
+    # (`_assign_check`) refuses another value, and `assign` runs it. Every
+    # check runs here before the first write too, so a refused load leaves
+    # the layer as it was. Under `skip_mismatch`, a refused value skips the
+    # layer with a warning.
     for variable, weight_value in writes:
-        check = getattr(variable, "_assign_check", None)
-        if check is None:
+        if variable._assign_check is None:
             continue
         try:
-            check(weight_value)
+            variable._assign_check(weight_value)
         except ValueError as e:
             if not skip_mismatch:
                 raise
