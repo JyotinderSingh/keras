@@ -32,6 +32,14 @@ class Int8Strategy(GeometryDispatchStrategy):
     config_cls = Int8QuantizationConfig
     geometry_families = ("projection", "lookup")
 
+    def check_compute_dtype(self, compute_dtype):
+        if compute_dtype == "float16":
+            raise NotImplementedError(
+                f"Quantization mode='{self.name}' doesn't work well with "
+                "compute_dtype='float16'. Use a dtype policy that computes "
+                "in another dtype, such as 'mixed_bfloat16' or 'float32'."
+            )
+
     # --- Projection (Dense, EinsumDense) ----------------------------------
 
     def _build_projection(self, layer, geometry, kernel_shape, config):

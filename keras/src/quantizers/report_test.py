@@ -80,6 +80,23 @@ class QuantizationReportTest(testing.TestCase):
         self.assertIn("Skipped 1 layer(s):", rendered)
         self.assertIn("act: no quantize support", rendered)
 
+    def test_detail_of_a_skip_reaches_render_and_warning(self):
+        report = QuantizationReport(mode="int8")
+        report.add_skipped("act", QuantizationReport.SKIP_NO_SUPPORT)
+        report.add_skipped("b", QuantizationReport.SKIP_NO_SUPPORT, "Refused.")
+        self.assertEqual(
+            report.skipped,
+            [
+                ("act", QuantizationReport.SKIP_NO_SUPPORT),
+                ("b", QuantizationReport.SKIP_NO_SUPPORT),
+            ],
+        )
+        self.assertEqual(report.details, {"b": "Refused."})
+        rendered = report.render().splitlines()
+        self.assertIn("  - act: no quantize support", rendered)
+        self.assertIn("  - b: no quantize support (Refused.)", rendered)
+        self.assertTrue(report.summary_warning().endswith(" 'b': Refused."))
+
     def test_repr(self):
         report = QuantizationReport(mode="int4")
         report.add_quantized("dense", "int4", "int4/-1_from_float32")
