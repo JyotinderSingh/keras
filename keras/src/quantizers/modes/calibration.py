@@ -8,6 +8,12 @@ scales that the quantized weight divides out. `GPTQStrategy` and
 `AWQStrategy`, at the end of this module, declare these differences as
 class attributes.
 
+The forward pass calls `contract_quantized`, as int4 does, which runs a
+route in place of the dequantize and the contraction when
+`kernels.select_route` selects one, with the custom input gradient of
+`contract_with_float_kernel_gradient`. With no route, the reference path
+runs without a custom gradient, and autodiff takes the input gradient.
+
 A LoRA update trains against the dequantized weight, as it does for int8
 and int4: the forward pass adds it to the contraction, the calibrators
 quantize the base kernel so the update stays a separate term, and a
@@ -28,6 +34,7 @@ from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import contract_quantized
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
 from keras.src.quantizers.quantized_weight import NoPack
@@ -414,8 +421,16 @@ class CalibrationStrategy(QuantizationStrategy):
 
     def call(self, layer, inputs, training=False):
         geometry = self.require_geometry(layer)
-        W = self.quantized_weight(layer).dequantize(layer.compute_dtype)
-        y = geometry.contract(inputs, W)
+        view = self.quantized_weight(layer)
+
+        def reference(inputs, quantized_weight):
+            # No custom gradient: wrapped, the float32 input gradients of
+            # JAX and torch move by up to 4 ulps, torch keeps 5.5 times
+            # the bytes for the backward pass, and NumPy warns.
+            W = quantized_weight.dequantize(layer.compute_dtype)
+            return geometry.contract(inputs, W)
+
+        y = contract_quantized(layer, geometry, view, inputs, reference)
         y = geometry.add_lora_delta(inputs, y)
         return apply_bias_activation(layer, y)
 

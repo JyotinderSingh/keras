@@ -47,8 +47,11 @@ from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_test_utils import PermutedDense
 from keras.src.quantizers.quantization_test_utils import Pointwise1D
 from keras.src.quantizers.quantization_test_utils import StandardProjection
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import input_gradient
 from keras.src.quantizers.quantization_test_utils import oracle_contract
+from keras.src.quantizers.quantization_test_utils import reordered_sum_bound
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.testing.test_utils import named_product
 from keras.src.utils.module_utils import torch_xla
@@ -78,6 +81,13 @@ REFUSED = {
     "batch_axis": ("ebd,edf->ebf", (None, 16), (3, 2, 128)),
     "summed_input_axis": ("abc,cd->ad", (16,), (2, 3, 128)),
     "contracted_out_of_order": ("abcd,edc->abe", (None, 32), (2, 4, 8, 16)),
+}
+# name -> (mode, group size, activation order).
+CALIBRATED = {
+    "gptq": ("gptq", 128, False),
+    "gptq_per_channel": ("gptq", -1, False),
+    "gptq_act_order": ("gptq", 128, True),
+    "awq": ("awq", 128, False),
 }
 
 
@@ -118,6 +128,16 @@ def _layer(case, block_size=32, dtype="float32", bias=False):
     layer = _float_layer(case, dtype, bias)
     config = Int4QuantizationConfig(block_size=block_size)
     layer.quantize("int4", config=config)
+    return layer
+
+
+def _calibrated(case, mode, dtype="float32"):
+    """A layer of `case`, calibrated in the `CALIBRATED` mode `mode`."""
+    layer = _float_layer(case, dtype)
+    mode, group_size, activation_order = CALIBRATED[mode]
+    kwargs = {"activation_order": True} if activation_order else {}
+    config = calibration_config(mode, group_size=group_size, **kwargs)
+    calibrate_layer(layer, config, _random((16,) + case[2][1:], seed=4))
     return layer
 
 
@@ -165,9 +185,11 @@ def _check_route(test, layer, x, name):
     """Runs the forced route `name` against the oracle and the reference.
 
     The error is at most 1.25 times the reference's plus a floor, and at
-    most an absolute bound (G1, G2). The outputs are finite (G4) and
-    deterministic (G5), and equal a direct call of the route (G8).
-    Returns the outputs of the route and of the reference path.
+    most an absolute bound (G1, G2). Where the reference path's own error
+    is above that bound (bfloat16 GPTQ, on some data), G2 takes the
+    reference path's error. The outputs are finite (G4) and deterministic
+    (G5), and equal a direct call of the route (G8). Returns the outputs
+    of the route and of the reference path.
     """
     oracle = _oracle(layer, x)
     with kernels.policy("off"):
@@ -183,7 +205,7 @@ def _check_route(test, layer, x, name):
     test.assertAllEqual(_numpy(called), y)
     err, reference_err = _err(y, oracle), _err(reference, oracle)
     test.assertLessEqual(err, 1.25 * reference_err + floor)
-    test.assertLessEqual(err, bound)
+    test.assertLessEqual(err, max(bound, reference_err))
     return y, reference
 
 
@@ -299,6 +321,58 @@ class RouteSuiteTest(testing.TestCase):
             for name in self.routes(layer, x):
                 with kernels.force_route(name):
                     self.assertAllEqual(input_gradient(layer, x), expected)
+
+    @parameterized.named_parameters(
+        named_product(
+            case=["dense_aligned", "dense_ragged", "query_ndh", "output_nhd"],
+            mode=sorted(CALIBRATED),
+            dtype=["float32", "mixed_bfloat16", "mixed_float16"],
+        )
+    )
+    def test_calibrated(self, case, mode, dtype):
+        """GPTQ and AWQ codes (uint8 storage)."""
+        layer = _calibrated(ROUTABLE[case], mode, dtype)
+        x = _random(ROUTABLE[case][2])
+        with route_tables():
+            for name in self.routes(layer, x):
+                _check_route(self, layer, x, name)
+
+    @parameterized.named_parameters(
+        named_product(
+            case=["dense_aligned", "query_ndh"],
+            mode=["gptq", "gptq_act_order", "awq"],
+            dtype=["float32", "mixed_bfloat16"],
+        )
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "numpy", reason="NumPy has no gradients."
+    )
+    def test_calibrated_input_gradient(self, case, mode, dtype):
+        """A route runs inside the custom gradient of a routed GPTQ or AWQ
+        call, so its input gradient is the wrapped reference's, bit for
+        bit (G7). For `Dense` in float32, it is also the reference path's.
+        Autodiff takes that gradient with another matmul, which can sum
+        the `N` products of an entry in another order:
+        `reordered_sum_bound`."""
+        layer = _calibrated(ROUTABLE[case], mode, dtype)
+        x = _random(ROUTABLE[case][2])
+        with kernels.force_route("reference_wrapped"):
+            expected = input_gradient(layer, x)
+        with route_tables():
+            for name in self.routes(layer, x):
+                with kernels.force_route(name):
+                    self.assertAllEqual(input_gradient(layer, x), expected)
+        if case == "dense_aligned" and dtype == "float32":
+            # The output gradient is ones, so entry `k` sums row `k` of
+            # the `(K, N)` kernel.
+            kernel = _numpy(layer._quantized_weight().dequantize("float32"))
+            bound = reordered_sum_bound(
+                np.max(np.sum(np.abs(kernel), axis=1)), kernel.shape[1]
+            )
+            with kernels.policy("off"):
+                self.assertAllClose(
+                    input_gradient(layer, x), expected, atol=bound, rtol=0
+                )
 
 
 class FallbackTest(testing.TestCase):
