@@ -180,7 +180,7 @@ def _direct(layer, x, in_model=False, **kwargs):
         table.scale,
         table.zero_point,
         group_size=table.scheme.group_size,
-        per_channel=table.g_idx is None,
+        per_channel=table.scheme.group_size is None,
         orientation=orientation,
         **kwargs,
     )
@@ -220,7 +220,8 @@ def _oracle(layer, x):
     if zero is None:
         weight = q / scale[:, None]
     else:
-        groups = ops.convert_to_numpy(table.g_idx).astype("int64")
+        # Column `d` of the table is in group `d // G`.
+        groups = np.arange(layer.output_dim) // table.scheme.group_size
         weight = (q - zero[:, groups]) * scale[:, groups]
     dtype = layer.reverse_dtype or layer.compute_dtype
     rounding = ml_dtypes.bfloat16 if dtype == "bfloat16" else dtype
@@ -434,6 +435,7 @@ def _compile_for_cuda(capability, jobs):
                 "XOR": 8,
                 "PER_CHANNEL": per_channel,
                 "PACK_K": True,
+                "CONTIGUOUS": True,
                 "UPCAST_DOT": False,
                 "INPUT_PRECISION": job["precision"],
                 "SPLIT_K": config.split_k,
@@ -554,7 +556,7 @@ class W4A16LogitsTest(testing.TestCase):
             untied(table.scale),
             untied(table.zero_point),
             group_size=table.scheme.group_size,
-            per_channel=table.g_idx is None,
+            per_channel=table.scheme.group_size is None,
             orientation="untied",
         )
         self.assertAllEqual(_numpy(y), expected)
@@ -594,7 +596,7 @@ class W4A16LogitsTest(testing.TestCase):
         layer = _layer(orientation == "tied", block_size, reverse_dtype=dtype)
         table, _ = _table(layer)
         x = ops.cast(ops.convert_to_tensor(_random((3, 256), 1)), dtype)
-        per_channel = table.g_idx is None
+        per_channel = table.scheme.group_size is None
         zero = table.scale if per_channel else table.zero_point
         group_size = 256 if per_channel else 128
         # The tensors, then group size, per-channel, orientation, the

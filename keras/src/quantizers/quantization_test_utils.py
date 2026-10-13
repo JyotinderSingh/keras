@@ -796,6 +796,7 @@ def oracle_contract(
     permutation=None,
     zero_point=None,
     g_idx=None,
+    group_size=None,
     input_scales=None,
     equation=None,
     dtype="float32",
@@ -804,9 +805,10 @@ def oracle_contract(
 
     It shares no code with Keras. `codes` holds two 4-bit codes per byte
     along its last axis, the low nibble first, and int8 storage
-    sign-extends each nibble. With `g_idx`, row `r` of the stored matrix
-    is `(q - zero_point[g]) * scale[g]` for its group `g = g_idx[r]`.
-    Without it, column `c` is `q / scale[c]`. `input_scales` (AWQ) divide
+    sign-extends each nibble. With `zero_point`, row `r` of the stored
+    matrix is `(q - zero_point[g]) * scale[g]` for its group `g`:
+    `g_idx[r]`, or `r // group_size` with no `g_idx`. Without
+    `zero_point`, column `c` is `q / scale[c]`. `input_scales` (AWQ) divide
     the rows. The matrix goes back to `kernel_shape` through
     `permutation`, and the inputs, rounded to `dtype`, contract against
     it in float64: by `equation`, or by a matmul.
@@ -818,10 +820,13 @@ def oracle_contract(
     if stored.dtype == np.int8:
         q = np.where(q > 7, q - 16, q)
     scale = np.asarray(scale, np.float64)
-    if g_idx is None:
+    if zero_point is None:
         weight = q / scale
     else:
-        groups = np.asarray(g_idx).astype(np.int64)
+        if g_idx is None:
+            groups = np.arange(q.shape[0]) // group_size
+        else:
+            groups = np.asarray(g_idx).astype(np.int64)
         zero_point = np.asarray(zero_point).astype(np.int64)
         weight = (q - zero_point[groups]) * scale[groups]
     if input_scales is not None:

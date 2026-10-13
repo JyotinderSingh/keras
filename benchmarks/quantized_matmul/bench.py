@@ -373,6 +373,7 @@ def _dense_oracle(layer, mode, x):
         kernel_shape=(x.shape[1], columns),
         zero_point=None if zero is None else zero[:, :cols],
         g_idx=_numpy(view.g_idx),
+        group_size=view.scheme.group_size,
         input_scales=_numpy(view.input_scales),
     )
 

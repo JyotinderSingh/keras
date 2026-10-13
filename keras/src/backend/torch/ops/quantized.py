@@ -14,18 +14,24 @@ One formula covers signed and unsigned codes: with `XOR = 8` for int8
 storage and `XOR = 0` for uint8 storage, `q = nibble ^ XOR` and
 `z' = z + XOR` give `d = q - z'`.
 
-A program runs the K tiles of its split in one of two loops. Before the
-loops, one check reads the `g_idx` rows of all these tiles:
+A program runs the K tiles of its split in one of two loops:
 
-- Fast loop: each tile lies in the group `k0 // G` (`g_idx` holds
-  contiguous groups), and that group exists. Per tile, the kernel reads
-  one scale row and one zero row at that static index.
+- Fast loop: each tile lies in the group `k0 // G`, and that group
+  exists. Per tile, the kernel reads one scale row and one zero row at
+  that static index.
 - General loop: any other program, for example under GPTQ's activation
   order. The kernel clamps the group of each row to `[0, n_groups - 1]`,
   gathers its scale and zero point, dequantizes each weight in float32
   and casts it to the dot dtype, as the reference path rounds it.
 - Per-channel int4: no zero point and no group index. The fast loop
   gives `d = q - XOR`, and the epilogue divides each column by its scale.
+
+A weight whose mode fixes its groups (int4, AWQ, GPTQ with one group)
+has no `g_idx`: row `k` is in group `k // G`. When each K tile lies in
+one group, the constexpr `CONTIGUOUS` compiles the fast loop only, with
+no check and no `g_idx` load. Any other grouped call has a `g_idx`, and
+one check per program reads the `g_idx` rows of all its tiles before the
+loops to select one of them.
 
 No loop body has a runtime branch, so the compiler can pipeline the
 loads of the next tiles.
@@ -42,8 +48,9 @@ lookup table that packs its codes along `D`, the contracted axis. The low
 nibble of byte `j` is row `2j` and the high nibble is row `2j + 1`. So per
 K tile, the even and the odd columns of the activations contract with the
 two planes into one accumulator, and the scale of the tile's group
-multiplies the partial sum. A lookup table has contiguous groups, so the
-variant runs the fast loop only. The kernel reads the stored table
+multiplies the partial sum. Column `d` of a lookup table is in group
+`d // G`, so the variant sets `CONTIGUOUS` and runs the fast loop only.
+The kernel reads the stored table
 through its strides: a tied table `(V, ceil(D/2))` and an untied table
 `(ceil(D/2), V)` need no transposed copy.
 
@@ -169,6 +176,17 @@ def _block_k(group_size, k):
     return max(16, min(128, group_size & -group_size))
 
 
+def _contiguous(g_idx, group_size, k, block_k):
+    """Whether the kernel takes the group of a K tile from its start.
+
+    Without `g_idx`, row `k` is in group `k // G`. When each K tile lies in
+    one group (`G >= K`, or the tile divides `G`), the kernel takes the
+    group of the tile and reads no `g_idx` (`CONTIGUOUS`). Else the general
+    loop reads the groups. A call with a `g_idx` reads its groups.
+    """
+    return g_idx is None and (group_size >= k or group_size % block_k == 0)
+
+
 def shared_bytes(config, block_k, sizes, per_channel, capability):
     """An estimate of the shared memory of one block, in bytes.
 
@@ -178,8 +196,10 @@ def shared_bytes(config, block_k, sizes, per_channel, capability):
     `num_stages - 1` buffers. The general loop has one buffer for each of
     its tiles: `x`, the codes, the scale, the zero point and `g_idx`. A
     float32 dot also stages the weight tiles. On sm_90, a 16-bit dot with
-    64 rows or more (wgmma) stages `x` and the weight tiles. The compile
-    test checks that no compiled row needs more than its estimate.
+    64 rows or more (wgmma) stages `x` and the weight tiles. A
+    `CONTIGUOUS` variant compiles the fast loop only, and the estimate
+    keeps the general loop for it, so its rows fit as with a `g_idx`. The
+    compile test checks that no compiled row needs more than its estimate.
     """
     x_size, scale_size, zero_size, g_idx_size = sizes
     block_m, block_nh = config.block_m, config.block_nh
@@ -307,8 +327,9 @@ def w4a16_matmul(
             per-channel int4.
         zero: The `(n_groups, N)` zero point, or `None` for per-channel
             int4.
-        g_idx: The `(K,)` group of each row, or `None` for per-channel
-            int4.
+        g_idx: The `(K,)` group of each row, or `None` when row `k` is in
+            group `k // group_size` (int4, AWQ, GPTQ with one group) and
+            for per-channel int4.
         group_size: `G`, or `None` for per-channel int4.
         signed: Whether the codes are int8 (sign-extended nibbles).
         per_channel: Whether the weight is per-channel int4.
@@ -336,13 +357,23 @@ def w4a16_matmul(
         # The kernel reads no zero point and no group index.
         zero, g_idx, group_size = scale, scale, k
     block_k = config.block_k or _block_k(None if per_channel else group_size, k)
+    contiguous = _contiguous(g_idx, group_size, k, block_k)
     if fit:
-        sizes = tuple(t.element_size() for t in (x, scale, zero, g_idx))
+        # The estimate counts the float32 `g_idx` of the general loop for
+        # a contiguous call too, so the row fits as for a stored `g_idx`.
+        index = 4 if g_idx is None else g_idx.element_size()
+        sizes = tuple(t.element_size() for t in (x, scale, zero)) + (index,)
         capability = device_capability(x.device)
         limit = device_shared_memory(x.device)
         config = fit_config(
             config, block_k, sizes, per_channel, capability, limit
         )
+    if contiguous:
+        # The kernel reads no group index: the scale stands in for it.
+        g_idx = scale
+    elif g_idx is None:
+        g_idx = torch.arange(k, dtype=torch.float32, device=x.device)
+        g_idx = torch.floor_divide(g_idx, group_size)
     return torch.ops.keras.w4a16_matmul(
         x.contiguous(),
         codes.contiguous(),
@@ -360,6 +391,7 @@ def w4a16_matmul(
         config.split_k,
         input_precision,
         upcast_dot,
+        contiguous,
     )
 
 
@@ -478,6 +510,7 @@ if triton is not None:
         XOR: tl.constexpr,
         PER_CHANNEL: tl.constexpr,
         PACK_K: tl.constexpr,
+        CONTIGUOUS: tl.constexpr,
         UPCAST_DOT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         SPLIT_K: tl.constexpr,
@@ -517,8 +550,10 @@ if triton is not None:
         tiles = tl.cdiv(tl.cdiv(K, BK), SPLIT_K)
         first = pid_k * tiles
         last = tl.minimum((pid_k + 1) * tiles, tl.cdiv(K, BK))
+        # The K-packed codes have no general loop.
+        tl.static_assert(CONTIGUOUS or not PACK_K)
         uniform = True
-        if not (PER_CHANNEL or PACK_K):
+        if not (PER_CHANNEL or CONTIGUOUS):
             # One check per program, `CHECK` rows of `g_idx` per step: each
             # row of tile `t` is in the group `t * BK // G`, and the group
             # of the last tile exists.
@@ -540,7 +575,7 @@ if triton is not None:
         # (`triton_w4a16.py`). Triton makes a tensor of `uniform = True`,
         # so a constexpr in the condition keeps the general loop out of the
         # variants that never run it.
-        if PER_CHANNEL or PACK_K or uniform:
+        if PER_CHANNEL or CONTIGUOUS or uniform:
             for tile in tl.range(first, last):
                 k0 = tile * BK
                 if PACK_K:
@@ -595,9 +630,8 @@ if triton is not None:
                         acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
                         acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
                 elif PACK_K:
-                    # The scale and the zero row of the tile's group: a
-                    # lookup table has contiguous groups, so the logits run
-                    # the fast loop only.
+                    # The scale and the zero row of the tile's group. Column
+                    # `d` of a table is in group `d // G`.
                     row = (k0 // group_size) * stride_sg + columns * stride_sn
                     s_row = tl.load(scale_ptr + row, column_mask, other=0.0)
                     z_row = tl.load(zero_ptr + row, column_mask, other=0)
@@ -719,8 +753,8 @@ if triton is not None:
 
         `nh` is the row stride of N-packed codes, `strides` holds the four
         strides of the kernel, and `constants` its `XOR`, `PER_CHANNEL`,
-        `PACK_K`, `UPCAST_DOT` and `INPUT_PRECISION`. With split-K,
-        `_splitk_sum` adds the float32 partials of the splits.
+        `PACK_K`, `CONTIGUOUS`, `UPCAST_DOT` and `INPUT_PRECISION`. With
+        split-K, `_splitk_sum` adds the float32 partials of the splits.
         """
         m, k = x.shape
         y = x.new_empty((m, n))
@@ -781,6 +815,7 @@ if triton is not None:
         split_k: int,
         input_precision: str,
         upcast_dot: bool,
+        contiguous: bool,
     ) -> torch.Tensor:
         # The operands are contiguous, so the kernel reads no strides.
         return _launch(
@@ -803,6 +838,7 @@ if triton is not None:
             XOR=8 if signed else 0,
             PER_CHANNEL=per_channel,
             PACK_K=False,
+            CONTIGUOUS=contiguous,
             UPCAST_DOT=upcast_dot,
             INPUT_PRECISION=input_precision,
         )
@@ -845,7 +881,7 @@ if triton is not None:
             codes,
             scale,
             zero,
-            scale,  # No group index: the groups are contiguous.
+            scale,  # No group index: column `d` is in group `d // G`.
             codes.shape[v_axis],
             n_groups,
             group_size,
@@ -860,6 +896,7 @@ if triton is not None:
             XOR=8 if codes.dtype == torch.int8 else 0,
             PER_CHANNEL=per_channel,
             PACK_K=True,
+            CONTIGUOUS=True,
             UPCAST_DOT=upcast_dot,
             INPUT_PRECISION=input_precision,
         )
