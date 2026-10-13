@@ -94,6 +94,17 @@ jobs:
       - name: Run Tests
         run: pytest keras --ignore keras/src/applications --cov=keras --cov-config=pyproject.toml
 
+      - name: Run the Triton and quantization tests under the "require" kernel policy
+        # A test that needs another policy sets it for its block. The runner
+        # fails a test that leaves a policy other than "require".
+        if: ${{ matrix.backend == 'torch' }}
+        run: |
+          PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py \
+            keras/src/backend/torch/ops/quantized_matmul_test.py \
+            keras/src/quantizers \
+            keras/src/layers/core/dense_test.py \
+            keras/src/layers/core/einsum_dense_test.py
+
       - name: Convert Coverage
         run: coverage xml --omit='keras/src/applications/*,keras/api' -o core-coverage.xml
 
