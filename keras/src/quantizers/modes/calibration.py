@@ -8,6 +8,11 @@ scales that the quantized weight divides out. `GPTQStrategy` and
 `AWQStrategy`, at the end of this module, declare these differences as
 class attributes.
 
+The forward pass runs a route in place of the dequantize and the
+contraction when `kernels.select_route` selects one. A route runs forward
+only, so it runs inside `contract_with_float_kernel_gradient`, as int4
+does. With no route, autodiff takes the input gradient.
+
 A LoRA update trains against the dequantized weight, as it does for int8
 and int4: the forward pass adds it to the contraction, the calibrators
 quantize the base kernel so the update stays a separate term, and a
@@ -21,6 +26,7 @@ import warnings
 from keras.src import ops
 from keras.src.dtype_policies.dtype_policy import AWQDTypePolicy
 from keras.src.dtype_policies.dtype_policy import GPTQDTypePolicy
+from keras.src.quantizers import kernels
 from keras.src.quantizers.awq import AWQCalibrator
 from keras.src.quantizers.awq_config import AWQConfig
 from keras.src.quantizers.calibration_run import CalibrationRun
@@ -28,6 +34,9 @@ from keras.src.quantizers.gptq import GPTQCalibrator
 from keras.src.quantizers.gptq_config import GPTQConfig
 from keras.src.quantizers.modes.common import add_group_index
 from keras.src.quantizers.modes.common import apply_bias_activation
+from keras.src.quantizers.modes.common import (
+    contract_with_float_kernel_gradient,
+)
 from keras.src.quantizers.quantized_weight import Int2Quads
 from keras.src.quantizers.quantized_weight import Int4Pairs
 from keras.src.quantizers.quantized_weight import NoPack
@@ -387,8 +396,21 @@ class CalibrationStrategy(QuantizationStrategy):
 
     def call(self, layer, inputs, training=False):
         geometry = self.require_geometry(layer)
-        W = self.quantized_weight(layer).dequantize(layer.compute_dtype)
-        y = geometry.contract(inputs, W)
+        view = self.quantized_weight(layer)
+        route = kernels.select_route(layer, geometry, view, inputs)
+        if route is None:
+            W = view.dequantize(layer.compute_dtype)
+            y = geometry.contract(inputs, W)
+        else:
+            y = contract_with_float_kernel_gradient(
+                layer,
+                geometry,
+                view,
+                inputs,
+                lambda inputs, weight: kernels.run_route(
+                    route, layer, geometry, weight, inputs
+                ),
+            )
         y = geometry.add_lora_delta(inputs, y)
         return apply_bias_activation(layer, y)
 
