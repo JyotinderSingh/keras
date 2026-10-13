@@ -203,6 +203,7 @@ def _oracle(layer, x):
         permutation=view.permutation,
         zero_point=read(view.zero_point),
         g_idx=read(view.g_idx),
+        group_size=view.scheme.group_size,
         input_scales=read(view.input_scales, scale=True),
         equation=getattr(layer, "equation", None),
         dtype=layer.compute_dtype,
@@ -606,6 +607,40 @@ class LoweringTest(testing.TestCase):
                 exported.mlir_module().count("tpu_custom_call"), count
             )
 
+    @parameterized.named_parameters(
+        ("v5e", DEVICE_KINDS[0]), ("v6e", DEVICE_KINDS[1])
+    )
+    def test_guard_only_where_g_idx_is_read(self, device_kind):
+        """Through a layer and the real route: int4 and AWQ in groups of
+        128 and GPTQ with one group fix their groups, so the module holds
+        the kernel and no guard (`stablehlo.case`) or reference
+        contraction. GPTQ in groups of 128 holds the guard, whose
+        reference branch contracts the dequantized weight."""
+        real = dataclasses.replace(
+            kernels._ROUTES["pallas_tpu"],
+            available=kernels._ROUTES["pallas_interpret"].available,
+            version=None,
+        )
+        args = jax.ShapeDtypeStruct(CASES["dense"][2], "float32")
+        for mode, group, guarded in (
+            ("int4", 128, False),
+            ("awq", 128, False),
+            ("gptq", -1, False),
+            ("gptq", 128, True),
+        ):
+            layer = _layer(CASES["dense"], mode, group)
+            with _routes(_row("bfloat16", 3, "real"), real=real):
+                with kernels.policy("auto"):
+                    call = jax.jit(lambda v: layer(v))
+                    with kernels.pallas_tpu_lowering(device_kind):
+                        exported = jax.export.export(call, platforms=["tpu"])(
+                            args
+                        )
+            text = exported.mlir_module()
+            self.assertEqual(text.count("tpu_custom_call"), 1, mode)
+            self.assertEqual(text.count("stablehlo.case"), guarded, mode)
+            self.assertEqual("stablehlo.dot_general" in text, guarded, mode)
+
 
 class InterpretTest(InterpretTestCase):
     """The kernel through real layers, in TPU interpret mode on a host
@@ -730,7 +765,7 @@ class InterpretTest(InterpretTestCase):
         view = layer._quantized_weight()
         with AutocastScope(layer.compute_dtype):
             view = view.with_tensors(view.read_tensors())
-        grouped = view.g_idx is not None
+        grouped = view.scheme.group_size is not None
         group_size = view.scheme.group_size if grouped else None
         args = (
             ops.cast(_random((3, 1024)), layer.compute_dtype),

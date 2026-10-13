@@ -34,9 +34,11 @@ the policy and the library versions, and never a tensor value:
 N5 (`"n5"`) is the one route in backend-agnostic `keras.ops`. It
 contracts the inputs with the exact small integers `q - z` of each
 group, and the group scale multiplies the float32 partial sum. It reads
-the group of row `k` as `k // G`, so `run_route` runs it only when
-`g_idx` holds those groups, and the reference path otherwise (GPTQ's
-activation order).
+the group of row `k` as `k // G`. A grouped view with no `g_idx` (int4,
+AWQ, GPTQ with one group) has these groups by construction, so it needs
+no guard. For a view with a `g_idx` (GPTQ with several groups),
+`run_route` runs N5 only when `g_idx` holds those groups, and the
+reference path otherwise (GPTQ's activation order).
 
 The policy is private. `"auto"` (the default) runs the route of the
 allow-list row, `"off"` runs the reference path, and `"require"` runs
@@ -127,7 +129,8 @@ class RouteSource:
     `version()` returns the installed library version, or the
     `(jax, jaxlib)` pair, and `tested_versions` holds the release
     prefixes of the tested range. A source with `contiguous_groups`
-    reads the group of row `k` as `k // G`, so `run_route` guards it.
+    reads the group of row `k` as `k // G`, so `run_route` guards it on a
+    view with a `g_idx`.
     """
 
     fn: object
@@ -198,7 +201,7 @@ def _sum_then_scale(layer, geometry, quantized_weight, inputs, config=None):
     inputs, view = _wait_for_inputs(inputs, quantized_weight)
     dtype = layer.compute_dtype
     rows, columns = view.codes.shape[0], view.layout.orig_len
-    grouped = view.g_idx is not None
+    grouped = view.scheme.group_size is not None
     groups = rows // min(view.scheme.group_size, rows) if grouped else 1
     if standardize_dtype(view.codes.dtype) == "int8":
         # The arithmetic shifts sign-extend each nibble.
@@ -533,11 +536,14 @@ def tested(installed, prefixes):
 def run_route(route, layer, geometry, quantized_weight, inputs):
     """Runs `route` forward only, with the group guard when it needs one.
 
-    A route with `contiguous_groups` runs on a grouped weight only when
-    `g_idx[k] == k // G` for every row `k`, and the reference path runs
-    otherwise. Under a JAX trace, `ops.cond` traces both. An eager call
-    branches in Python: an eager `lax.cond` would trace and compile both
-    branches again on each call, because each call gives it new functions.
+    A route with `contiguous_groups` runs on a view with a `g_idx` (GPTQ
+    with several groups) only when `g_idx[k] == k // G` for every row
+    `k`, and the reference path runs otherwise. Under a JAX trace,
+    `ops.cond` traces both. An eager call branches in Python: an eager
+    `lax.cond` would trace and compile both branches again on each call,
+    because each call gives it new functions. A grouped view with no
+    `g_idx` (int4, AWQ, GPTQ with one group) puts row `k` in group
+    `k // G` on every path, so it needs no guard.
     """
     source = route.source
     if not source.matrix:
@@ -554,6 +560,12 @@ def run_route(route, layer, geometry, quantized_weight, inputs):
     def reference():
         return _reference(layer, geometry, quantized_weight, inputs)
 
+    # Whether the groups are contiguous is a fact of the weight, decided
+    # where `g_idx` is written or loaded and never per call. Serving stacks
+    # decide it the same way: vLLM (`marlin_utils.py`, an empty `g_idx`
+    # without activation order), SGLang (`gptq.py`), TGI
+    # (`layers/gptq/__init__.py`, `arange // G` without `desc_act`) and
+    # TensorRT-LLM (which loads no `g_idx`).
     g_idx = quantized_weight.g_idx
     if not source.contiguous_groups or g_idx is None:
         return routed()
@@ -720,7 +732,7 @@ def _triton(layer, geometry, quantized_weight, inputs, config=None):
         view.g_idx,
         group_size=view.scheme.group_size,
         signed=ops.dtype(view.codes) == "int8",
-        per_channel=view.g_idx is None,
+        per_channel=view.scheme.group_size is None,
         config=config,
         awq_scales=view.input_scales,
     )
@@ -766,7 +778,7 @@ def _triton_logits(layer, table, orientation, inputs, config=None):
         table.scale,
         table.zero_point,
         group_size=table.scheme.group_size,
-        per_channel=table.g_idx is None,
+        per_channel=table.scheme.group_size is None,
         orientation=orientation,
         config=config,
     )
@@ -840,7 +852,7 @@ def _mosaic_gpu(layer, geometry, view, inputs, config, interpret=False):
             capability = jax.devices()[0].compute_capability
         key = (capability, layer.compute_dtype, _m_bucket(m))
         config = quantized.MOSAIC_GPU_CONFIGS[key]
-    grouped = view.g_idx is not None
+    grouped = view.scheme.group_size is not None
     return quantized.mosaic_gpu_w4a16_matmul(
         inputs,
         view.codes,
@@ -908,8 +920,8 @@ _ROUTES["mosaic_gpu"] = RouteSource(
 )
 # Test helper, through `force_route` only: Mosaic GPU K1 in GPU interpret
 # mode on CPU, with `jnp.dot` in place of `plgpu.mma`. It does not support
-# `jax.vmap` of a guarded (grouped) call: interpret mode has an IO effect,
-# which JAX does not support in a vmap-of-cond.
+# `jax.vmap` of a guarded call (a view with a `g_idx`): interpret mode has
+# an IO effect, which JAX does not support in a vmap-of-cond.
 _ROUTES["mosaic_gpu_interpret"] = RouteSource(
     functools.partial(_mosaic_gpu, interpret=True),
     dtypes=("bfloat16", "float16"),
@@ -1116,7 +1128,7 @@ def _pallas_tpu(layer, geometry, view, inputs, config, interpret=False):
     """
     quantized = backend.ops.quantized
     m, k = inputs.shape
-    grouped = view.g_idx is not None
+    grouped = view.scheme.group_size is not None
     group_size = min(view.scheme.group_size, k) if grouped else None
     if config is None:
         n = view.layout.orig_len

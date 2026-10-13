@@ -161,7 +161,8 @@ def _oracle(layer, x):
         zero = ops.convert_to_numpy(table.zero_point).astype(np.int64)
         if orientation == "tied":
             scale, zero = scale.T, zero.T
-        groups = ops.convert_to_numpy(table.g_idx).astype(np.int64)
+        # Row `d` of the `(D, V)` table is in group `d // G`.
+        groups = np.arange(q.shape[0]) // table.scheme.group_size
         weight = (q - zero[groups]) * scale[groups]
     dtype = _dtype(layer)
     rounding = ml_dtypes.bfloat16 if dtype == "bfloat16" else dtype
@@ -484,6 +485,37 @@ class LoweringTest(testing.TestCase):
                 capability, m, DIM, VOCAB, group_size, orientation, config
             )
             self.assertIn("mosaic_gpu_v2", text)
+
+    @parameterized.named_parameters(
+        named_product(capability=["8.9", "9.0"], orientation=ORIENTATIONS)
+    )
+    def test_layer_lowers_no_guard(self, capability, orientation):
+        """Through a layer and the real route, an int4 table in groups of
+        128 and per channel lowers to one Mosaic GPU call, with no guard
+        (`stablehlo.case`): column `d` of a table is in group `d // G`."""
+        real = dataclasses.replace(
+            kernels._LOOKUP_ROUTES["mosaic_gpu"],
+            available=functools.partial(
+                kernels._mosaic_gpu_logits_available, interpret=True
+            ),
+            version=None,
+        )
+        key = (capability, "bfloat16", "1-16")
+        config = quantized.MOSAIC_GPU_LOGITS_CONFIGS[key]
+        args = jax.ShapeDtypeStruct((4, DIM), "float32")
+        for group in (128, -1):
+            layer = _layer(orientation, group)
+            self.assertIsNone(_table(layer)[0].g_idx)
+            with _routes(_row("bfloat16", 4, "real", config), real=real):
+                with kernels.policy("auto"):
+                    call = jax.jit(lambda v: layer(v, reverse=True))
+                    with kernels.mosaic_gpu_lowering(capability):
+                        exported = jax.export.export(call, platforms=["cuda"])(
+                            args
+                        )
+            text = exported.mlir_module()
+            self.assertEqual(text.count("mosaic_gpu_v2"), 1, group)
+            self.assertNotIn("stablehlo.case", text)
 
     def test_each_capability_traces_again(self):
         """The pipeline reads the capability at trace time: `cp.async`
