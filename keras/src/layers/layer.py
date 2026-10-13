@@ -807,6 +807,11 @@ class Layer(BackendLayer, Operation):
                     "is not compatible with provided weight "
                     f"shape {value.shape}."
                 )
+            # A quantization mode can fix the value of a variable. Its check
+            # (`_assign_check`) refuses another value.
+            check = getattr(variable, "_assign_check", None)
+            if check is not None:
+                check(value)
             variable.assign(value)
 
     @property
@@ -1855,21 +1860,23 @@ class Layer(BackendLayer, Operation):
         mode = self.quantization_mode
         if mode not in self.variable_serialization_spec:
             raise self._quantization_mode_error(mode)
-        idx = 0
+        writes = []
         for entry in self.variable_serialization_spec[mode]:
             target = self._serialized_attribute(
                 entry, f"_{name}" if entry == name else entry
             )
             if target is None:
                 continue
-            value = store[str(idx)]
+            value = store[str(len(writes))]
             if entry == "g_idx":
                 # `g_idx` is stored as `float32` (see build). Cast to the
                 # variable dtype on assign so both legacy `float32`
                 # checkpoints and any `int32`-saved ones load correctly.
                 value = ops.cast(value, target.dtype)
+            writes.append((target, value))
+        _check_writes(writes)
+        for target, value in writes:
             target.assign(value)
-            idx += 1
         for lora in factors:
             lora.assign(ops.zeros(lora.shape))
 
@@ -2026,8 +2033,10 @@ class Layer(BackendLayer, Operation):
         """
         self._check_load_own_variables(store)
         all_vars = self._trainable_variables + self._non_trainable_variables
-        for i, v in enumerate(all_vars):
-            v.assign(store[f"{i}"])
+        writes = [(v, store[f"{i}"]) for i, v in enumerate(all_vars)]
+        _check_writes(writes)
+        for v, value in writes:
+            v.assign(value)
 
     def _track_variable(self, variable):
         if variable.trainable:
@@ -2616,6 +2625,35 @@ def is_shape_tuple(s):
     return isinstance(s, (list, tuple)) and all(
         d is None or isinstance(d, int) for d in s
     )
+
+
+def _check_writes(writes):
+    """Checks the `(variable, value)` writes of a load before the first.
+
+    A quantization mode can fix the value of a variable. Its check
+    (`_assign_check`) refuses another value. When a variable of the writes
+    holds a check, a value of another shape raises first, with the shape
+    error of `assign`. So a file of another group size reports the shape
+    that differs. Then every check runs. A refused load (a warning under
+    `skip_mismatch`) leaves the layer as it was.
+    """
+    if all(getattr(v, "_assign_check", None) is None for v, _ in writes):
+        return
+    for variable, value in writes:
+        shape = getattr(value, "shape", None)
+        if shape is not None and tuple(shape) != tuple(variable.shape):
+            raise ValueError(
+                "The shape of the target variable and "
+                "the shape of the target value in "
+                "`variable.assign(value)` must match. "
+                f"variable.shape={variable.shape}, "
+                f"Received: value.shape={tuple(shape)}. "
+                f"Target variable: {variable}"
+            )
+    for variable, value in writes:
+        check = getattr(variable, "_assign_check", None)
+        if check is not None:
+            check(value)
 
 
 def might_have_unbuilt_state(layer):

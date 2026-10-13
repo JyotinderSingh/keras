@@ -198,6 +198,7 @@ class CalibrationStrategy(QuantizationStrategy):
         n_groups = view.batch * (
             1 if group_size == -1 else math.ceil(view.rows / group_size)
         )
+        group = view.rows if group_size == -1 else group_size
 
         # Stored as the view's `(batch * rows, columns)` matrix in `[in,
         # out]` orientation (the view's axis order, which may permute the
@@ -236,7 +237,29 @@ class CalibrationStrategy(QuantizationStrategy):
                     trainable=False,
                 ),
             )
-        layer.g_idx = add_group_index(layer, rows)
+        # Where the mode fixes the groups, the index starts as those groups,
+        # so a layer that no calibration has written saves and loads back.
+        contiguous = self._contiguous_groups(view, group)
+        layer.g_idx = add_group_index(
+            layer, rows, group if contiguous else None
+        )
+
+    # Whether a calibration can put the rows of a group out of order (GPTQ's
+    # activation order).
+    permutes_groups = False
+
+    def _contiguous_groups(self, view, group):
+        """Whether stored row `k` is in group `k // group` by construction.
+
+        The stored rows stack `view.batch` problems, and the groups of each
+        problem are numbered after those of the problem before. So the
+        stack has these groups when there is one problem or when each
+        problem holds whole groups. A mode that permutes the groups has
+        them only when each problem is one group.
+        """
+        if view.batch > 1 and view.rows % group:
+            return False
+        return not self.permutes_groups or group >= view.rows
 
     # --- Calibration state ------------------------------------------------
 
@@ -426,6 +449,8 @@ class GPTQStrategy(CalibrationStrategy):
     config_cls = GPTQConfig
     policy_cls = GPTQDTypePolicy
     calibrator_cls = GPTQCalibrator
+    # The activation order permutes the rows of the groups.
+    permutes_groups = True
 
 
 class AWQStrategy(CalibrationStrategy):
