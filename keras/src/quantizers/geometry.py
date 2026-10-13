@@ -15,9 +15,10 @@ Two geometry families exist today:
   layer: how to contract (a plain matmul for `Dense` and `TernaryDense`,
   `ProjectionGeometry`; an einsum for `EinsumDense`,
   `EinsumProjectionGeometry`, whose axis analysis lives on the layer
-  itself and is reached through the geometry's hooks), which axes the
-  quantizers reduce over, how a scale lines up with the kernel and with
-  the outputs, and the 2D `(rows, columns)` view of an N-D kernel.
+  itself and is reached through the geometry's hooks), the roles of the
+  kernel's axes (`KernelAxes`), from which int4, GPTQ and AWQ lay the
+  kernel out, how a scale lines up with the kernel and with the outputs,
+  and which axes the quantizers reduce over.
 - Lookup: a float embeddings table indexed by the inputs. `Embedding` is the
   plain case (`LookupGeometry`); `ReversibleEmbedding` adds a reverse
   projection (`ReversibleLookupGeometry`).
@@ -308,15 +309,6 @@ class ProjectionGeometry(QuantizationGeometry):
         """Gradient of `contract` with respect to its inputs."""
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
-    def rows_columns(self, kernel_shape):
-        """2D `(rows, columns)` shape a plain reshape of the kernel takes.
-
-        `rows` is the product of the contracted axes and `columns` that of
-        the rest, so the reshape is `(contracted, rest)` only when the
-        contracted axes lead the kernel.
-        """
-        return kernel_shape[0], kernel_shape[1]
-
     @property
     def kernel_reduced_axes(self):
         """Kernel axes a weight quantizer reduces over."""
@@ -464,16 +456,6 @@ class EinsumProjectionGeometry(ProjectionGeometry):
         return ops.einsum(
             self.layer.einsum_axes.gradient_equation, upstream, float_kernel
         )
-
-    def rows_columns(self, kernel_shape):
-        rows = 1
-        columns = 1
-        for i, dim in enumerate(kernel_shape):
-            if i in self.layer._kernel_reduced_axes:
-                rows *= dim
-            else:
-                columns *= dim
-        return rows, columns
 
     @property
     def kernel_reduced_axes(self):

@@ -20,13 +20,13 @@ from keras.src.quantizers.quantizers import (
 class Int4ProjectionHandlers:
     """The int4 build, forward, encode and view of a projection kernel.
 
-    The kernel is stored as 2-D `[rows, columns]`, a plain reshape of the
-    kernel (`geometry.rows_columns`), so `rows` are the contracted axes
-    only when those lead the kernel. The codes are packed two per byte
-    along the columns, and the scale runs per column (per-channel) or per
-    group of rows (grouped, with a zero point and a group index). The
-    forward pass dequantizes through the `QuantizedWeight` view and
-    contracts in float.
+    The kernel is stored as its 2-D `[rows, columns]` matrix
+    (`KernelAxes.matrix` with `batch_in="columns"`): the contracted axes
+    are the rows, and every other axis, in the kernel's order, makes up
+    the columns. The codes are packed two per byte along the columns, and
+    the scale runs per column (per-channel) or per group of rows (grouped,
+    with a zero point and a group index). The forward pass dequantizes
+    through the `QuantizedWeight` view and contracts in float.
     """
 
     def _build_projection(self, layer, geometry, kernel_shape, config):
@@ -34,7 +34,9 @@ class Int4ProjectionHandlers:
         layer.inputs_quantizer = (
             QuantizationConfig.activation_quantizer_or_default(config, None)
         )
-        rows, columns = geometry.rows_columns(kernel_shape)
+        _, rows, columns = geometry.kernel_axes.matrix(
+            kernel_shape, batch_in="columns"
+        )
         block_size = self.resolve_block_size(layer, config)
 
         # Codes packed two per byte along the columns.
@@ -87,7 +89,9 @@ class Int4ProjectionHandlers:
             layer.g_idx = None
 
     def _get_projection_quantized_weight(self, layer, geometry):
-        _, columns = geometry.rows_columns(geometry.weight_shape)
+        permutation, _, columns = geometry.kernel_axes.matrix(
+            geometry.weight_shape, batch_in="columns"
+        )
         return QuantizedWeight(
             codes=layer._kernel,
             scale=layer.kernel_scale,
@@ -97,6 +101,7 @@ class Int4ProjectionHandlers:
             ),
             shape=geometry.weight_shape,
             axis=0,
+            permutation=permutation,
             zero_point=layer.kernel_zero,
             g_idx=layer.g_idx,
         )
@@ -152,8 +157,12 @@ class Int4ProjectionHandlers:
         # block_size=128); a `block_size` of `None` or `-1` selects the
         # per-channel escape hatch.
         block_size = self.resolve_block_size(layer, config)
-        rows, columns = geometry.rows_columns(weight.shape)
-        flat_kernel = ops.reshape(weight, (rows, columns))
+        permutation, rows, columns = geometry.kernel_axes.matrix(
+            weight.shape, batch_in="columns"
+        )
+        flat_kernel = ops.reshape(
+            ops.transpose(weight, permutation), (rows, columns)
+        )
 
         if is_per_channel(block_size):
             # Symmetric codes with one scale per column.
