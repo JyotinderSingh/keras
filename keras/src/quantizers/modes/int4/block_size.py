@@ -13,11 +13,6 @@ def is_per_channel(block_size):
     return block_size is None or block_size == -1
 
 
-def is_grouped(block_size):
-    """Whether `block_size` selects sub-channel (grouped) quantization."""
-    return not is_per_channel(block_size)
-
-
 def int4_scheme(block_size):
     """The int4 scheme for a block size: per-channel or grouped."""
     if is_per_channel(block_size):
