@@ -163,6 +163,34 @@ def apply_bias_activation(layer, x):
     return x
 
 
+def contract_with_stored_tensors(view, inputs, forward, backward):
+    """Runs `forward(inputs, stored)` with a custom input gradient.
+
+    `stored` is `view` over the tensors that `view.read_tensors()` gives.
+    The input gradient is `backward(inputs, stored, upstream)`. The
+    custom gradient takes the stored tensors as arguments, so only they
+    are kept for the backward pass, and they get no gradient: the weight
+    is frozen.
+    """
+
+    @ops.custom_gradient
+    def contract(inputs, *tensors):
+        stored = view.with_tensors(tensors)
+
+        def grad_fn(*args, upstream=None):
+            if upstream is None:
+                (upstream,) = args
+            inputs_grad = backward(inputs, stored, upstream)
+            return (inputs_grad,) + (None,) * len(tensors)
+
+        return forward(inputs, stored), grad_fn
+
+    # Read inside the autocast scope: on TensorFlow eager the gradient
+    # runs after it, and the scale variable would then read in another
+    # dtype.
+    return contract(inputs, *view.read_tensors())
+
+
 def contract_with_float_kernel_gradient(layer, geometry, view, inputs, forward):
     """Runs `forward(inputs, quantized_weight)` with a custom input gradient.
 
@@ -175,25 +203,13 @@ def contract_with_float_kernel_gradient(layer, geometry, view, inputs, forward):
     it.
     """
 
-    @ops.custom_gradient
-    def contract(inputs, *tensors):
-        quantized_weight = view.with_tensors(tensors)
+    def backward(inputs, quantized_weight, upstream):
+        float_kernel = quantized_weight.dequantize(layer.compute_dtype)
+        return ops.broadcast_to(
+            geometry.contract_grad(upstream, float_kernel), ops.shape(inputs)
+        )
 
-        def grad_fn(*args, upstream=None):
-            if upstream is None:
-                (upstream,) = args
-            float_kernel = quantized_weight.dequantize(layer.compute_dtype)
-            inputs_grad = ops.broadcast_to(
-                geometry.contract_grad(upstream, float_kernel),
-                ops.shape(inputs),
-            )
-            return (inputs_grad,) + (None,) * len(tensors)
-
-        return forward(inputs, quantized_weight), grad_fn
-
-    # Read inside the autocast scope: on TensorFlow eager the gradient
-    # runs after it, and the scale variable would then read float32.
-    return contract(inputs, *view.read_tensors())
+    return contract_with_stored_tensors(view, inputs, forward, backward)
 
 
 def contract_quantized(layer, geometry, view, inputs, reference):
