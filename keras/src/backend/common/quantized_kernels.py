@@ -32,14 +32,15 @@ class Kernel:
     Attributes:
         name: The route name, for example `"triton"`.
         matmul: `matmul(x, codes, scale, zero, *, group_size, signed,
-            per_channel, input_scales=None, g_idx=None)` returns the `(M, N)`
+            per_channel, input_scales=None)` returns the `(M, N)`
             contraction of the `(M, K)` activations `x` with the stored
             codes `(K, N / 2)`, two per byte along `N`. A grouped weight
             has the `(n_groups, N)` multiplier `scale` and the zero point
             `zero`. A `per_channel` weight has the `(N,)` divisor `scale`,
             no `zero` and no `group_size`. `signed` says that the codes
-            are int8. `input_scales` (AWQ) divide `x`. `g_idx` is the
-            `(K,)` group of each row, or `None` when row `k` is in group
+            are int8. `input_scales` (AWQ) divide `x`. A kernel without
+            `contiguous_groups` also takes `g_idx`, the `(K,)` group of
+            each row, or `None` when row `k` is in group
             `k // group_size`.
         logits: `logits(x, codes, scale, zero, *, group_size, per_channel,
             orientation)` returns the `(M, V)` logits of the `(M, D)`
@@ -64,6 +65,10 @@ class Kernel:
             experimental compiler is in the range that a run on hardware
             passed. `None` when the kernel has no such range. The
             `"auto"` policy refuses a kernel outside its range.
+        contiguous_groups: `True` when the kernel reads the group of row
+            `k` as `k // group_size` and takes no `g_idx`. Keras then
+            runs it on a view with a `g_idx` only when `g_idx` holds
+            these groups.
     """
 
     name: str
@@ -75,3 +80,4 @@ class Kernel:
     logits: object = None
     logits_available: object = None
     tested: object = None
+    contiguous_groups: bool = False
