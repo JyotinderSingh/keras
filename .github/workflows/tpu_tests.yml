@@ -89,6 +89,17 @@ jobs:
         if: ${{ !matrix.multi_device }}
         run: pytest keras --ignore keras/src/applications --cov=keras --cov-config=pyproject.toml
 
+      - name: Run the Pallas TPU and quantization tests under the "require" kernel policy
+        # `kernels_test.py` tests the policy switch itself, from the default
+        # policy.
+        if: ${{ !matrix.multi_device }}
+        run: |
+          PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py \
+            keras/src/backend/jax/ops/quantized_tpu_test.py \
+            keras/src/quantizers --ignore keras/src/quantizers/kernels_test.py \
+            keras/src/layers/core/dense_test.py \
+            keras/src/layers/core/einsum_dense_test.py
+
       - name: Run Multi-device Tests
         if: ${{ matrix.multi_device }}
         run: pytest keras -m multi_device --cov=keras --cov-config=pyproject.toml --cov-append

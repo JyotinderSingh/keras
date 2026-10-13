@@ -1074,3 +1074,175 @@ _LOOKUP_ROUTES["mosaic_gpu_interpret"] = RouteSource(
     accepts=_mosaic_gpu_logits_accepts,
     available=functools.partial(_mosaic_gpu_logits_available, interpret=True),
 )
+
+
+# Pallas TPU K1 (JAX, TPU): `pallas_tpu_w4a16_matmul` of the JAX backend's
+# `ops.quantized`. Under `"auto"`, it runs only with equal jax and jaxlib
+# versions in `PALLAS_TPU_TESTED_JAX`: the Pallas TPU lowering ships in
+# jaxlib. A version enters the constant after a correctness run on a TPU
+# passes on it. No run has passed yet, so the constant is empty, the route
+# has no allow-list row, and `"auto"` does not run it.
+PALLAS_TPU_TESTED_JAX = ()
+
+
+def _pallas_tpu(layer, geometry, view, inputs, config, interpret=False):
+    """Pallas TPU K1: the `(M, K)` inputs against the 4-bit codes.
+
+    With no configuration in the allow-list row, `pallas_tpu_blocks` gives
+    the blocks of the shape. Interpret mode runs the kernel inside
+    `pallas_tpu_interpret`.
+    """
+    quantized = backend.ops.quantized
+    m, k = inputs.shape
+    grouped = view.g_idx is not None
+    group_size = min(view.scheme.group_size, k) if grouped else None
+    if config is None:
+        n = view.layout.orig_len
+        config = quantized.pallas_tpu_blocks(m, k, n, group_size)
+    call = functools.partial(
+        quantized.pallas_tpu_w4a16_matmul,
+        inputs,
+        view.codes,
+        view.scale,
+        view.zero_point,
+        group_size=group_size,
+        signed=standardize_dtype(view.codes.dtype) == "int8",
+        per_channel=not grouped,
+        config=config,
+        input_scales=view.input_scales,
+    )
+    if not interpret:
+        return call()
+    with pallas_tpu_interpret():
+        return call(interpret=quantized.pltpu.InterpretParams())
+
+
+def _pallas_tpu_aligned(m, k, n, group_size):
+    """The alignment gate: an even `N`, and a `BK` that divides `K` and
+    that the group size divides. A per-channel weight has no
+    `group_size`."""
+    group = None if group_size is None else min(group_size, k)
+    blocks = backend.ops.quantized.pallas_tpu_blocks(m, k, n, group)
+    return blocks is not None
+
+
+def _pallas_tpu_available(m, k, n, view):
+    """Gate 5 of Pallas TPU K1: the device gate and the alignment gate.
+
+    Under `"require"`, a device that is not a TPU raises.
+    """
+    if backend.backend() != "jax":
+        return False
+    device = jax.devices()[0]
+    if device.platform != "tpu":
+        if _state.policy == "require":
+            raise ValueError(
+                "The kernel policy 'require' runs Pallas TPU K1, which needs "
+                f"a TPU. Received: device={device}"
+            )
+        return False
+    return _pallas_tpu_aligned(m, k, n, view.scheme.group_size)
+
+
+def _pallas_tpu_interpret_available(m, k, n, view):
+    """The interpret route: the JAX backend and the alignment gate."""
+    return backend.backend() == "jax" and _pallas_tpu_aligned(
+        m, k, n, view.scheme.group_size
+    )
+
+
+# The route does not support `jax.vmap`: the batching rule of `pallas_call`
+# gives each operand in `pl.ANY` a batched block, which the Pallas TPU
+# lowering refuses.
+_ROUTES["pallas_tpu"] = RouteSource(
+    _pallas_tpu,
+    dtypes=("bfloat16", "float32"),
+    available=_pallas_tpu_available,
+    # The `(jax, jaxlib)` pair.
+    version=lambda: backend.ops.quantized.mosaic_gpu_versions(),
+    tested_versions=PALLAS_TPU_TESTED_JAX,
+    contiguous_groups=True,
+)
+# Test helper, through `force_route` only: Pallas TPU K1 in TPU interpret
+# mode on a host without a TPU. It does not support `jax.vmap` either.
+_ROUTES["pallas_interpret"] = RouteSource(
+    functools.partial(_pallas_tpu, interpret=True),
+    dtypes=("bfloat16", "float32"),
+    available=_pallas_tpu_interpret_available,
+    contiguous_groups=True,
+)
+_REQUIRED.setdefault("jax", {})["tpu"] = "pallas_tpu"
+
+
+@contextlib.contextmanager
+def pallas_tpu_lowering(device_kind):
+    """Test helper: lowers the Pallas TPU kernels for a TPU on a CPU host.
+
+    Inside the block, `jax.export.export(..., platforms=["tpu"])` lowers a
+    Pallas TPU kernel for one TPU of `device_kind`, for example
+    `"TPU v5 lite"` (v5e) or `"TPU v6 lite"` (v6e). The block runs under
+    an abstract mesh of that device. The lowering runs the Pallas TPU
+    lowering, but not the libtpu compiler.
+
+    Raises `NotImplementedError` when `jax.sharding.AbstractDevice` has no
+    `platform`, as in JAX 0.9.
+    """
+    try:
+        device = jax.sharding.AbstractDevice(
+            device_kind=device_kind, num_cores=1, platform="tpu"
+        )
+    except TypeError as e:
+        raise NotImplementedError(
+            "`pallas_tpu_lowering` needs an `AbstractDevice` with a "
+            f"`platform`, which JAX {jax.__version__} does not have: {e}"
+        ) from e
+    mesh = jax.sharding.AbstractMesh((1,), ("x",), abstract_device=device)
+    with jax.sharding.use_abstract_mesh(mesh):
+        yield
+
+
+@contextlib.contextmanager
+def pallas_tpu_interpret():
+    """Test helper: the TPU of Pallas TPU interpret mode on a host without
+    a TPU.
+
+    A Pallas TPU kernel reads the TPU generation when it traces. JAX
+    0.11.2 and newer read it from the private chip registry
+    `jax._src.tpu_info.registry`, under the device kind of the default
+    device, so inside the block that device kind (`"cpu"`, or a GPU kind
+    such as `"NVIDIA L4"`) gives a TPU v5e. `get_tpu_info` caches its
+    result, so the block clears that cache on entry and on exit: the TPU
+    v5e does not stay after the block. Older JAX reads the TPU from an
+    abstract mesh, so the block runs inside
+    `pallas_tpu_lowering("TPU v5 lite")`. The route `"pallas_interpret"`
+    enters the block for each call.
+
+    Raises `NotImplementedError` when neither form works.
+    """
+    tpu_info = getattr(jax._src, "tpu_info", None)
+    if tpu_info is None:
+        with pallas_tpu_lowering("TPU v5 lite"):
+            yield
+        return
+    try:
+        chip = tpu_info.ChipVersion.TPU_V5E
+        info = tpu_info.get_tpu_info_for_chip(chip, 1)
+        registry = tpu_info.registry
+        kind = tpu_info.get_device_kind()
+        clear_cache = tpu_info.get_tpu_info.cache_clear
+    except AttributeError as e:
+        raise NotImplementedError(
+            "`pallas_tpu_interpret` needs a TPU chip registry name that JAX "
+            f"{jax.__version__} does not have: {e}"
+        ) from e
+    previous = registry.get(kind)
+    registry[kind] = lambda: info
+    clear_cache()
+    try:
+        yield
+    finally:
+        if previous is None:
+            del registry[kind]
+        else:
+            registry[kind] = previous
+        clear_cache()
