@@ -34,6 +34,7 @@ from keras.src import ops
 from keras.src import saving
 from keras.src import testing
 from keras.src.backend.common import standardize_dtype
+from keras.src.quantizers import kernels
 from keras.src.quantizers import strategy_registry
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_config import Int8QuantizationConfig
@@ -51,6 +52,9 @@ from keras.src.quantizers.quantization_test_utils import layer_inputs
 from keras.src.quantizers.quantization_test_utils import policy_built
 from keras.src.quantizers.quantization_test_utils import tiny_calibration_model
 from keras.src.quantizers.quantization_test_utils import token_dataset
+
+if backend.backend() == "jax":
+    import jax
 
 
 class ModeCase:
@@ -884,8 +888,8 @@ class FixedGroupsTest(testing.TestCase):
     @parameterized.named_parameters(("int4", "int4"), ("awq", "awq"))
     def test_third_party_layer_gets_fixed_groups(self, mode):
         """int4 and AWQ in groups of 64: the `g_idx` of the layer holds
-        `k // 64`, its view has no `g_idx`, and a write of other groups
-        changes no output."""
+        `k // 64`, its view has no `g_idx`, the sum-then-scale route runs
+        with no guard, and a write of other groups changes no output."""
         layer = StandardProjection(32, use_bias=False)
         layer.build((None, 256))
         rng = np.random.default_rng(0)
@@ -900,12 +904,22 @@ class FixedGroupsTest(testing.TestCase):
             )
         self.assertAllEqual(layer.g_idx, np.arange(256) // 64)
         self.assertIsNone(layer._quantized_weight().g_idx)
-        expected = _numpy(layer(x))
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        kernels.route_counts.clear()
+        with kernels.force_route("sum_then_scale"):
+            y = _numpy(layer(x))
+            self.assertEqual(dict(kernels.route_counts), {"sum_then_scale": 1})
+            if backend.backend() == "jax":
+                jaxpr = str(jax.make_jaxpr(lambda v: layer(v))(x))
+                self.assertNotIn("cond[", jaxpr)
+        self.assertAllClose(y, expected, atol=1e-4, rtol=1e-4)
         weights = layer.get_weights()
         index = [v.name for v in layer.weights].index("g_idx")
         weights[index] = rng.permutation(np.arange(256) // 64)
         layer.set_weights(weights)
-        self.assertAllEqual(_numpy(layer(x)), expected)
+        with kernels.force_route("sum_then_scale"):
+            self.assertAllEqual(_numpy(layer(x)), y)
 
     def test_third_party_lookup_gets_fixed_groups(self):
         """A grouped int4 `TokenTable` holds `d // G`, and its view has no
