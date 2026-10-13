@@ -305,6 +305,8 @@ class ProjectionGeometry(QuantizationGeometry):
     `contract_grad` and `add_lora_delta` for its own contraction. The
     defaults of `kernel_scale_axes` and `contraction_view` derive from
     `kernel_axes`; their docstrings say when a layer overrides them too.
+    int8 and int4 take the input gradient from `contract_grad`, and the
+    other modes differentiate `contract`.
     """
 
     family = "projection"
@@ -366,7 +368,11 @@ class ProjectionGeometry(QuantizationGeometry):
         return ops.matmul(inputs, kernel)
 
     def contract_grad(self, upstream, float_kernel):
-        """Gradient of `contract` with respect to its inputs."""
+        """Gradient of `contract` with respect to its inputs.
+
+        The custom gradients of int8 and int4 read it. It may return a
+        gradient that broadcasts to the shape of the inputs.
+        """
         return ops.matmul(upstream, ops.transpose(float_kernel))
 
     @property
@@ -507,10 +513,21 @@ class EinsumProjectionGeometry(ProjectionGeometry):
         return ops.einsum(self.layer.equation, inputs, kernel)
 
     def contract_grad(self, upstream, float_kernel):
-        # From https://stackoverflow.com/a/47609896
-        return ops.einsum(
-            self.layer.einsum_axes.gradient_equation, upstream, float_kernel
+        # From https://stackoverflow.com/a/47609896. The gradient does not
+        # vary along an input axis that only the inputs have (`abc,cd->ad`
+        # sums `b` on its own), so the einsum leaves such an axis out and
+        # the gradient gets an axis of size one in its place.
+        axes = self.layer.einsum_axes
+        kept = "".join(
+            label
+            for label in axes.inputs
+            if label in axes.output or label in axes.kernel
         )
+        grad = ops.einsum(
+            f"{axes.output},{axes.kernel}->{kept}", upstream, float_kernel
+        )
+        summed = [i for i, label in enumerate(axes.inputs) if label not in kept]
+        return ops.expand_dims(grad, summed) if summed else grad
 
     @property
     def inputs_quantization_axis(self):

@@ -1,13 +1,18 @@
 """int4 stores an einsum kernel along its contraction, like `Dense`."""
 
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
+from keras.src import backend
 from keras.src import dtype_policies
 from keras.src import layers
 from keras.src import ops
 from keras.src import testing
 from keras.src.quantizers.quantization_config import Int4QuantizationConfig
+from keras.src.quantizers.quantization_config import Int8QuantizationConfig
+from keras.src.quantizers.quantization_test_utils import input_gradient
+from keras.src.quantizers.quantizers import AbsMaxQuantizer
 from keras.src.testing.test_utils import named_product
 
 # Each equation with the kernel permutation that puts its contracted axes
@@ -258,3 +263,89 @@ class Int4EinsumLayoutTest(testing.TestCase):
         self.assertTrue(np.all(np.isfinite(outputs[1])))
         error = np.linalg.norm(outputs[1] - outputs[0])
         self.assertLess(error / np.linalg.norm(outputs[0]), 0.05)
+
+
+# The custom gradients that read `contract_grad`: int8 with its default
+# activation quantizer and weight-only, and int4 per-channel, in groups of
+# 3 and with an activation quantizer.
+GRADIENT_MODES = [
+    dict(testcase_name="int8", mode="int8", config=Int8QuantizationConfig()),
+    dict(
+        testcase_name="int8_weight_only",
+        mode="int8",
+        config=Int8QuantizationConfig(activation_quantizer=None),
+    ),
+    dict(
+        testcase_name="int4",
+        mode="int4",
+        config=Int4QuantizationConfig(block_size=-1),
+    ),
+    dict(
+        testcase_name="int4_block_3",
+        mode="int4",
+        config=Int4QuantizationConfig(block_size=3),
+    ),
+    dict(
+        testcase_name="int4_activation_quantizer",
+        mode="int4",
+        config=Int4QuantizationConfig(
+            block_size=-1, activation_quantizer=AbsMaxQuantizer()
+        ),
+    ),
+]
+
+
+class InputGradientTest(testing.TestCase):
+    """int8 and int4 take the input gradient against the float kernel."""
+
+    @parameterized.named_parameters(named_product(EQUATIONS, GRADIENT_MODES))
+    @pytest.mark.requires_trainable_backend
+    def test_gradient_is_the_float_layers(
+        self,
+        equation,
+        input_shape,
+        output_shape,
+        permutation,
+        dims,
+        mode,
+        config,
+    ):
+        del permutation, dims
+        if (
+            mode == "int8"
+            and config.activation_quantizer is not None
+            and equation == "abc,cd->ad"
+            and backend.backend() == "torch"
+        ):
+            self.skipTest(
+                "The torch `einsum` of integer operands fails when a label "
+                "is summed out of one operand ('expected scalar type Long "
+                "but found Int'), so the int8 forward pass fails."
+            )
+        kernel = _kernel(equation, output_shape, input_shape, seed=9)
+        layer = layers.EinsumDense(equation, output_shape=output_shape)
+        layer.build(input_shape)
+        layer.kernel.assign(kernel)
+        layer.quantize(mode, config=config)
+        # A float layer that holds the dequantized kernel.
+        twin = layers.EinsumDense(equation, output_shape=output_shape)
+        twin.build(input_shape)
+        twin.kernel.assign(_dequantized(layer))
+
+        x = _inputs(input_shape, seed=10)
+        # Weight each output, so that a gradient that misplaces an axis of
+        # the upstream gradient or of the kernel differs.
+        rng = np.random.default_rng(11)
+        weights = rng.standard_normal(ops.shape(twin(x))).astype("float32")
+
+        def weighted(layer):
+            return lambda v: ops.multiply(layer(v), weights)
+
+        self.assertAllClose(
+            input_gradient(weighted(layer), x),
+            input_gradient(weighted(twin), x),
+            atol=1e-5,
+            rtol=1e-5,
+            tpu_atol=1e-2,
+            tpu_rtol=1e-2,
+        )
