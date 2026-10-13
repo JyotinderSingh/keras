@@ -36,6 +36,17 @@ stores its float32 partial, and a second kernel in the same op adds the
 partials in a fixed order and casts the sum once. The kernels are
 forward only: their caller runs them inside a custom gradient.
 
+`w4a16_logits` is the K-packed variant of the same kernel (the constexpr
+`PACK_K`): the `(M, V)` logits of `(M, D)` activations with a 4-bit
+lookup table that packs its codes along `D`, the contracted axis. The low
+nibble of byte `j` is row `2j` and the high nibble is row `2j + 1`. So per
+K tile, the even and the odd columns of the activations contract with the
+two planes into one accumulator, and the scale of the tile's group
+multiplies the partial sum. A lookup table has contiguous groups, so the
+variant runs the fast loop only. The kernel reads the stored table
+through its strides: a tied table `(V, ceil(D/2))` and an untied table
+`(ceil(D/2), V)` need no transposed copy.
+
 Triton ships with torch on Linux. Where it does not import, this module
 has no kernel.
 """
@@ -61,13 +72,15 @@ _SUM_BLOCK = 1024
 
 @dataclasses.dataclass(frozen=True)
 class KernelConfig:
-    """A launch configuration of `w4a16_matmul`.
+    """A launch configuration of `w4a16_matmul` and `w4a16_logits`.
 
-    A program computes `block_m` rows and `2 * block_nh` columns, from
-    `block_nh` bytes of codes per row. `block_k` is the K tile, or `None`
-    for the tile that the group size gives. With `split_k > 1`, that
-    number of programs shares the K tiles of an output tile, and a second
-    kernel adds their float32 partials in a fixed order.
+    A program computes `block_m` rows and `2 * block_nh` columns. Per K
+    tile of `block_k` rows, it reads `block_nh` bytes of codes per row
+    (`w4a16_matmul`), or `block_k / 2` bytes per column (`w4a16_logits`).
+    `block_k` is `None` for the tile that the group size gives. With
+    `split_k > 1`, that number of programs shares the K tiles of an output
+    tile, and a second kernel adds their float32 partials in a fixed
+    order.
     """
 
     block_m: int
@@ -115,10 +128,22 @@ _CONFIGS = {
     ((8, 9), "float16", "257+", 128): KernelConfig(256, 32, 32, 4, 3, 1),
     ((8, 9), "float16", "257+", None): KernelConfig(256, 32, 32, 4, 4, 1),
 }
+# The rows of `w4a16_logits`, keyed as `_CONFIGS`. A logits tile has the
+# bytes of a `w4a16_matmul` tile of the fast loop with the same
+# configuration, so the 16-bit default rows are the same. The logits run
+# no general loop, so their float32 rows have 64 rows of `x`.
+_LOGITS_CONFIGS = {
+    (None, None, "1-16", None): KernelConfig(16, 32, num_stages=4),
+    (None, None, "17-64", None): KernelConfig(32, 32),
+    (None, None, "65-256", None): KernelConfig(64, 64),
+    (None, None, "257+", None): KernelConfig(128, 64),
+    (None, "float32", "65-256", None): KernelConfig(64, 32, num_stages=2),
+    (None, "float32", "257+", None): KernelConfig(64, 32, num_stages=2),
+}
 
 
-def kernel_config(capability, dtype, m, group_size):
-    """The configuration of the most specific row of `_CONFIGS`."""
+def kernel_config(capability, dtype, m, group_size, table=_CONFIGS):
+    """The configuration of the most specific row of `table`."""
     bucket = next((name for top, name in _M_BUCKETS if m <= top), "257+")
     for key in (
         (capability, dtype, bucket, group_size),
@@ -126,8 +151,8 @@ def kernel_config(capability, dtype, m, group_size):
         (None, dtype, bucket, None),
         (None, None, bucket, None),
     ):
-        if key in _CONFIGS:
-            return _CONFIGS[key]
+        if key in table:
+            return table[key]
 
 
 def _block_k(group_size, k):
@@ -241,6 +266,22 @@ def device_shared_memory(device):
     return properties.shared_memory_per_block_optin
 
 
+def _launch_options(x, group_size, config, table):
+    """The configuration and the dot input precision of a call on `x`.
+
+    `config` is `None` for the most specific row of `table`.
+    """
+    if config is None:
+        capability = None
+        if x.device.type == "cuda":
+            capability = device_capability(x.device)
+        dtype = str(x.dtype).removeprefix("torch.")
+        config = kernel_config(capability, dtype, x.shape[0], group_size, table)
+    if x.dtype == torch.float32:
+        return config, float32_input_precision()
+    return config, "ieee"
+
+
 def w4a16_matmul(
     x,
     codes,
@@ -288,23 +329,16 @@ def w4a16_matmul(
     n = scale.shape[-1]
     if m == 0:
         return x.new_empty((0, n))
-    capability = None
-    if config is None:
-        if x.device.type == "cuda":
-            capability = device_capability(x.device)
-        dtype = str(x.dtype).removeprefix("torch.")
-        config = kernel_config(capability, dtype, m, group_size)
-    if x.dtype == torch.float32:
-        input_precision = float32_input_precision()
-    else:
-        input_precision = "ieee"
+    # A row of the table fits the shared memory of the device.
+    fit = config is None and x.device.type == "cuda"
+    config, input_precision = _launch_options(x, group_size, config, _CONFIGS)
     if per_channel:
         # The kernel reads no zero point and no group index.
         zero, g_idx, group_size = scale, scale, k
     block_k = config.block_k or _block_k(None if per_channel else group_size, k)
-    if capability is not None:
-        # A row of the table fits the shared memory of the device.
+    if fit:
         sizes = tuple(t.element_size() for t in (x, scale, zero, g_idx))
+        capability = device_capability(x.device)
         limit = device_shared_memory(x.device)
         config = fit_config(
             config, block_k, sizes, per_channel, capability, limit
@@ -318,6 +352,89 @@ def w4a16_matmul(
         group_size,
         signed,
         per_channel,
+        config.block_m,
+        config.block_nh,
+        block_k,
+        config.num_warps,
+        config.num_stages,
+        config.split_k,
+        input_precision,
+        upcast_dot,
+    )
+
+
+def w4a16_logits(
+    x,
+    codes,
+    scale,
+    zero,
+    *,
+    group_size,
+    per_channel,
+    orientation,
+    config=None,
+    upcast_dot=False,
+):
+    """Returns the `(M, V)` logits of `x` with a 4-bit lookup table.
+
+    The table packs two codes per byte along `D`: the low nibble of byte
+    `j` is row `2j`, and the high nibble is row `2j + 1`. The arguments
+    are the stored tensors of the table, which the kernel reads through
+    their strides.
+
+    Args:
+        x: The `(M, D)` activations: bfloat16, float16 or float32. The
+            result has the same dtype.
+        codes: The int8 codes: `(V, ceil(D/2))` for a `"tied"` table (the
+            forward table of the layer), `(ceil(D/2), V)` for an
+            `"untied"` one.
+        scale: The multiplier per column and group of `D`: `(V, n_groups)`
+            for a tied table, `(n_groups, V)` for an untied one. Or the
+            `(V,)` divisor of a per-channel table.
+        zero: The zero point, in the layout of `scale`, or `None` for a
+            per-channel table.
+        group_size: `G`, or `None` for a per-channel table. A K tile must
+            lie in one group, so `G` is a multiple of the K tile, or at
+            least `D`.
+        per_channel: Whether the table is per-channel.
+        orientation: `"tied"` or `"untied"`.
+        config: A `KernelConfig`, or `None` for the row of
+            `_LOGITS_CONFIGS`. Its K tile has at least 32 rows.
+        upcast_dot: For the interpreter tests only, as in `w4a16_matmul`.
+
+    Raises:
+        ValueError: If the K tile has fewer than 32 rows, or if it does
+            not divide a group size that is smaller than `D`.
+    """
+    if triton is None:
+        raise ImportError("`w4a16_logits` requires Triton.")
+    m, d = x.shape
+    v = codes.shape[0 if orientation == "tied" else 1]
+    config, input_precision = _launch_options(
+        x, group_size, config, _LOGITS_CONFIGS
+    )
+    if per_channel:
+        # The kernel reads no zero point.
+        zero, group_size = scale, d
+    # The dot of each plane contracts `block_k / 2` rows: at least 16.
+    block_k = config.block_k or max(32, _block_k(group_size, d))
+    if block_k < 32 or (group_size < d and group_size % block_k):
+        raise ValueError(
+            "The K tile of `w4a16_logits` must have at least 32 rows, and "
+            "each K tile must lie in one group: when the group size is "
+            "smaller than `D`, the K tile must divide it. Received: "
+            f"block_k={block_k}, group_size={group_size}, D={d}"
+        )
+    if m == 0:
+        return x.new_empty((0, v))
+    return torch.ops.keras.w4a16_logits(
+        x.contiguous(),
+        codes.contiguous(),
+        scale.contiguous(),
+        zero.contiguous(),
+        group_size,
+        per_channel,
+        orientation,
         config.block_m,
         config.block_nh,
         block_k,
@@ -354,8 +471,13 @@ if triton is not None:
         n_groups,
         group_size,
         NH,
+        stride_cb,
+        stride_cn,
+        stride_sg,
+        stride_sn,
         XOR: tl.constexpr,
         PER_CHANNEL: tl.constexpr,
+        PACK_K: tl.constexpr,
         UPCAST_DOT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         SPLIT_K: tl.constexpr,
@@ -371,24 +493,32 @@ if triton is not None:
         # per-channel int4 4.5% slower at decode.
         if PER_CHANNEL:
             NH = (N + 1) // 2
+        # With `PACK_K`, the codes pack along K (the logits): the strides
+        # give the codes along their bytes and along N (`stride_cb`,
+        # `stride_cn`), and the scale and zero point along their groups and
+        # along N (`stride_sg`, `stride_sn`). Without it, the operands are
+        # contiguous, and the kernel does not read the strides.
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_k = tl.program_id(2)
         rows = pid_m * BM + tl.arange(0, BM)
-        # Byte `j` holds the columns `2j` and `2j + 1`.
-        bytes_ = pid_n * BNH + tl.arange(0, BNH)
         columns = pid_n * 2 * BNH + tl.arange(0, 2 * BNH)
         row_mask = rows < M
         column_mask = columns < N
         dtype = x_ptr.dtype.element_ty
-        acc_even = tl.zeros((BM, BNH), dtype=tl.float32)
-        acc_odd = tl.zeros((BM, BNH), dtype=tl.float32)
+        if PACK_K:
+            acc = tl.zeros((BM, 2 * BNH), dtype=tl.float32)
+        else:
+            # Byte `j` holds the columns `2j` and `2j + 1`.
+            bytes_ = pid_n * BNH + tl.arange(0, BNH)
+            acc_even = tl.zeros((BM, BNH), dtype=tl.float32)
+            acc_odd = tl.zeros((BM, BNH), dtype=tl.float32)
         # The K tiles of this split.
         tiles = tl.cdiv(tl.cdiv(K, BK), SPLIT_K)
         first = pid_k * tiles
         last = tl.minimum((pid_k + 1) * tiles, tl.cdiv(K, BK))
         uniform = True
-        if not PER_CHANNEL:
+        if not (PER_CHANNEL or PACK_K):
             # One check per program, `CHECK` rows of `g_idx` per step: each
             # row of tile `t` is in the group `t * BK // G`, and the group
             # of the last tile exists.
@@ -410,21 +540,46 @@ if triton is not None:
         # (`triton_w4a16.py`). Triton makes a tensor of `uniform = True`,
         # so a constexpr in the condition keeps the general loop out of the
         # variants that never run it.
-        if PER_CHANNEL or uniform:
+        if PER_CHANNEL or PACK_K or uniform:
             for tile in tl.range(first, last):
                 k0 = tile * BK
-                ks = k0 + tl.arange(0, BK)
-                k_mask = ks < K
-                x = tl.load(
-                    x_ptr + rows[:, None] * K + ks[None, :],
-                    mask=row_mask[:, None] & k_mask[None, :],
-                    other=0.0,
-                )
-                b = tl.load(
-                    codes_ptr + ks[:, None] * NH + bytes_[None, :],
-                    mask=k_mask[:, None] & (bytes_ < NH)[None, :],
-                    other=0,
-                ).to(tl.int32)
+                if PACK_K:
+                    # Byte `j` of a column holds the rows `2j` and `2j + 1`,
+                    # so the even and the odd rows of the tile are two
+                    # planes. The even and the odd columns of the
+                    # activations, with one dot per plane, are an idea of
+                    # TritonBench (`int4_gemm/kernel.py`, `matmul_kernel`).
+                    js = k0 // 2 + tl.arange(0, BK // 2)
+                    x_even = tl.load(
+                        x_ptr + rows[:, None] * K + 2 * js[None, :],
+                        mask=row_mask[:, None] & (2 * js < K)[None, :],
+                        other=0.0,
+                    )
+                    x_odd = tl.load(
+                        x_ptr + rows[:, None] * K + 2 * js[None, :] + 1,
+                        mask=row_mask[:, None] & (2 * js + 1 < K)[None, :],
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        codes_ptr
+                        + js[:, None] * stride_cb
+                        + columns[None, :] * stride_cn,
+                        mask=(2 * js < K)[:, None] & column_mask[None, :],
+                        other=0,
+                    ).to(tl.int32)
+                else:
+                    ks = k0 + tl.arange(0, BK)
+                    k_mask = ks < K
+                    x = tl.load(
+                        x_ptr + rows[:, None] * K + ks[None, :],
+                        mask=row_mask[:, None] & k_mask[None, :],
+                        other=0.0,
+                    )
+                    b = tl.load(
+                        codes_ptr + ks[:, None] * NH + bytes_[None, :],
+                        mask=k_mask[:, None] & (bytes_ < NH)[None, :],
+                        other=0,
+                    ).to(tl.int32)
                 even = (b & 15) ^ XOR
                 odd = ((b >> 4) & 15) ^ XOR
                 # An integer goes to the dot dtype through float32, which
@@ -433,8 +588,25 @@ if triton is not None:
                 if PER_CHANNEL:
                     d_even = (even - XOR).to(tl.float32).to(dtype)
                     d_odd = (odd - XOR).to(tl.float32).to(dtype)
-                    acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
-                    acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
+                    if PACK_K:
+                        acc += _dot(x_even, d_even, UPCAST_DOT, INPUT_PRECISION)
+                        acc += _dot(x_odd, d_odd, UPCAST_DOT, INPUT_PRECISION)
+                    else:
+                        acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
+                        acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
+                elif PACK_K:
+                    # The scale and the zero row of the tile's group: a
+                    # lookup table has contiguous groups, so the logits run
+                    # the fast loop only.
+                    row = (k0 // group_size) * stride_sg + columns * stride_sn
+                    s_row = tl.load(scale_ptr + row, column_mask, other=0.0)
+                    z_row = tl.load(zero_ptr + row, column_mask, other=0)
+                    z_row = z_row.to(tl.int32) + XOR
+                    d_even = (even - z_row[None, :]).to(tl.float32).to(dtype)
+                    d_odd = (odd - z_row[None, :]).to(tl.float32).to(dtype)
+                    partial = _dot(x_even, d_even, UPCAST_DOT, INPUT_PRECISION)
+                    partial += _dot(x_odd, d_odd, UPCAST_DOT, INPUT_PRECISION)
+                    acc += partial * s_row.to(tl.float32)[None, :]
                 else:
                     # The scale and the zero row of the group of the tile.
                     row = k0 // group_size * N + columns
@@ -488,7 +660,8 @@ if triton is not None:
                 w_odd = ((odd - z_odd).to(tl.float32) * s_odd).to(dtype)
                 acc_even += _dot(x, w_even, UPCAST_DOT, INPUT_PRECISION)
                 acc_odd += _dot(x, w_odd, UPCAST_DOT, INPUT_PRECISION)
-        acc = tl.interleave(acc_even, acc_odd)
+        if not PACK_K:
+            acc = tl.interleave(acc_even, acc_odd)
         if PER_CHANNEL:
             s = tl.load(scale_ptr + columns, mask=column_mask, other=1.0)
             acc = acc / s.to(tl.float32)[None, :]
@@ -522,6 +695,74 @@ if triton is not None:
             acc += tl.load(ws_ptr + step + offsets, mask=mask, other=0.0)
         tl.store(y_ptr + offsets, acc.to(y_ptr.dtype.element_ty), mask=mask)
 
+    def _launch(
+        x,
+        codes,
+        scale,
+        zero,
+        g_idx,
+        n,
+        n_groups,
+        group_size,
+        nh,
+        strides,
+        *,
+        block_m,
+        block_nh,
+        block_k,
+        num_warps,
+        num_stages,
+        split_k,
+        **constants,
+    ):
+        """Launches `_w4a16_kernel` and returns its `(M, n)` result.
+
+        `nh` is the row stride of N-packed codes, `strides` holds the four
+        strides of the kernel, and `constants` its `XOR`, `PER_CHANNEL`,
+        `PACK_K`, `UPCAST_DOT` and `INPUT_PRECISION`. With split-K,
+        `_splitk_sum` adds the float32 partials of the splits.
+        """
+        m, k = x.shape
+        y = x.new_empty((m, n))
+        out = y
+        if split_k > 1:
+            # The float32 partials of the splits.
+            out = x.new_empty((split_k, m, n), dtype=torch.float32)
+        grid = (triton.cdiv(m, block_m), triton.cdiv(n, 2 * block_nh), split_k)
+        # The Triton interpreter runs on CPU tensors.
+        device = contextlib.nullcontext()
+        if x.device.type == "cuda":
+            device = torch.cuda.device(x.device)
+        with device:
+            torch.library.wrap_triton(_w4a16_kernel)[grid](
+                x,
+                codes,
+                scale,
+                zero,
+                g_idx,
+                out,
+                m,
+                n,
+                k,
+                n_groups,
+                group_size,
+                nh,
+                *strides,
+                SPLIT_K=split_k,
+                BM=block_m,
+                BNH=block_nh,
+                BK=block_k,
+                num_warps=num_warps,
+                num_stages=num_stages,
+                **constants,
+            )
+            if split_k > 1:
+                # A sum in a fixed order: the result is deterministic.
+                torch.library.wrap_triton(_splitk_sum)[
+                    (triton.cdiv(m * n, _SUM_BLOCK),)
+                ](out, y, m * n, SPLIT_K=split_k, BLOCK=_SUM_BLOCK)
+        return y
+
     @torch.library.triton_op("keras::w4a16_matmul", mutates_args=())
     def _w4a16_matmul(
         x: torch.Tensor,
@@ -541,57 +782,92 @@ if triton is not None:
         input_precision: str,
         upcast_dot: bool,
     ) -> torch.Tensor:
-        m, k = x.shape
-        n = scale.shape[-1]
-        y = x.new_empty((m, n))
-        out = y
-        if split_k > 1:
-            # The float32 partials of the splits.
-            out = x.new_empty((split_k, m, n), dtype=torch.float32)
-        grid = (
-            triton.cdiv(m, block_m),
-            triton.cdiv(codes.shape[1], block_nh),
-            split_k,
+        # The operands are contiguous, so the kernel reads no strides.
+        return _launch(
+            x,
+            codes,
+            scale,
+            zero,
+            g_idx,
+            scale.shape[-1],
+            scale.shape[0],
+            group_size,
+            codes.shape[1],
+            (0, 0, 0, 0),
+            block_m=block_m,
+            block_nh=block_nh,
+            block_k=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            split_k=split_k,
+            XOR=8 if signed else 0,
+            PER_CHANNEL=per_channel,
+            PACK_K=False,
+            UPCAST_DOT=upcast_dot,
+            INPUT_PRECISION=input_precision,
         )
-        # The Triton interpreter runs on CPU tensors.
-        device = contextlib.nullcontext()
-        if x.device.type == "cuda":
-            device = torch.cuda.device(x.device)
-        with device:
-            torch.library.wrap_triton(_w4a16_kernel)[grid](
-                x,
-                codes,
-                scale,
-                zero,
-                g_idx,
-                out,
-                m,
-                n,
-                k,
-                scale.shape[0],
-                group_size,
-                codes.shape[1],
-                XOR=8 if signed else 0,
-                PER_CHANNEL=per_channel,
-                UPCAST_DOT=upcast_dot,
-                INPUT_PRECISION=input_precision,
-                SPLIT_K=split_k,
-                BM=block_m,
-                BNH=block_nh,
-                BK=block_k,
-                num_warps=num_warps,
-                num_stages=num_stages,
-            )
-            if split_k > 1:
-                # A sum in a fixed order: the result is deterministic.
-                torch.library.wrap_triton(_splitk_sum)[
-                    (triton.cdiv(m * n, _SUM_BLOCK),)
-                ](out, y, m * n, SPLIT_K=split_k, BLOCK=_SUM_BLOCK)
-        return y
 
     @_w4a16_matmul.register_fake
     def _(x, codes, scale, *args):
         return x.new_empty((x.shape[0], scale.shape[-1]))
+
+    @torch.library.triton_op("keras::w4a16_logits", mutates_args=())
+    def _w4a16_logits(
+        x: torch.Tensor,
+        codes: torch.Tensor,
+        scale: torch.Tensor,
+        zero: torch.Tensor,
+        group_size: int,
+        per_channel: bool,
+        orientation: str,
+        block_m: int,
+        block_nh: int,
+        block_k: int,
+        num_warps: int,
+        num_stages: int,
+        split_k: int,
+        input_precision: str,
+        upcast_dot: bool,
+    ) -> torch.Tensor:
+        # The axis of `V` in the stored tensors. The other axis runs along
+        # `D`: its bytes in the codes, its groups in the scale.
+        v_axis = 0 if orientation == "tied" else 1
+        strides = (codes.stride(1 - v_axis), codes.stride(v_axis))
+        if per_channel:
+            # The `(V,)` scale, read in the epilogue only.
+            n_groups, strides = 1, strides + (0, 1)
+        else:
+            n_groups = scale.shape[1 - v_axis]
+            # The zero point has the layout and the strides of the scale.
+            strides += (scale.stride(1 - v_axis), scale.stride(v_axis))
+        return _launch(
+            x,
+            codes,
+            scale,
+            zero,
+            scale,  # No group index: the groups are contiguous.
+            codes.shape[v_axis],
+            n_groups,
+            group_size,
+            0,  # The strides give the codes: no row stride of N-packed codes.
+            strides,
+            block_m=block_m,
+            block_nh=block_nh,
+            block_k=block_k,
+            num_warps=num_warps,
+            num_stages=num_stages,
+            split_k=split_k,
+            XOR=8 if codes.dtype == torch.int8 else 0,
+            PER_CHANNEL=per_channel,
+            PACK_K=True,
+            UPCAST_DOT=upcast_dot,
+            INPUT_PRECISION=input_precision,
+        )
+
+    @_w4a16_logits.register_fake
+    def _(x, codes, scale, zero, group_size, per_channel, orientation, *args):
+        v = codes.shape[0 if orientation == "tied" else 1]
+        return x.new_empty((x.shape[0], v))
 
     # Whether `triton.jit` built the kernels for the Triton interpreter
     # (`TRITON_INTERPRET=1`), which runs them on CPU tensors.
