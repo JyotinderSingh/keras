@@ -1,4 +1,4 @@
-"""Registry of quantization strategies, one per mode.
+"""Registry of quantization strategies, one per mode, and how they work.
 
 A layer's dtype policy names its quantization mode: `"int4/128_from_float32"`
 is mode `"int4"` with a block size of 128. The registry maps each mode to one
@@ -19,10 +19,7 @@ and, for each mode, the variables it stores in checkpoint order.
 `keras.src.quantizers.geometry` ("Making a layer quantizable") lists what such
 a layer defines.
 
-This module is the single dispatch point for quantization behavior. Each
-quantization mode (`"int8"`, `"int4"`, `"float8"`, `"ternary"`,
-`"gptq"`, `"awq"`) is implemented by one `QuantizationStrategy` that
-owns:
+A strategy owns:
 
 - the mode's config class and default-config resolution,
 - the policy-string codec: routing a `"int4/128"`-style string to its
@@ -30,16 +27,98 @@ owns:
   class parses its own grammar),
 - the mode's math: the `build`/`call`/`quantize` methods create the mode's
   variables, run its forward pass, and compute its quantized values against
-  the layer's quantization geometry (`keras.src.quantizers.geometry`);
-  `encode` turns a float weight into the stored form, and
+  the layer's quantization geometry (`keras.src.quantizers.geometry`; the
+  calibrators of `keras.src.quantizers.calibrator` compute the values of
+  GPTQ and AWQ); `encode` turns a float weight into the stored form, and
   `quantized_weight` reads the stored variables back through a
   `QuantizedWeight` (`keras.src.quantizers.quantized_weight`),
 - per-layer hyperparameter resolution (block size, weight bits, group size),
 - the model-level run (`model_run`: the calibration run of GPTQ and AWQ).
 
-This module must stay import-light: it is consulted lazily from
-`keras.src.dtype_policies` and `keras.src.layers.layer`, so importing it must
-not pull in layers or policies at module level.
+The built-in modes, the geometry families they handle and the built-in
+layers whose spec lists them:
+
+    mode     families            layers
+    int8     projection, lookup  Dense, EinsumDense, Embedding,
+                                 ReversibleEmbedding
+    int4     projection, lookup  Dense, EinsumDense, Embedding,
+                                 ReversibleEmbedding
+    float8   projection          Dense, EinsumDense
+    ternary  projection (2-D)    Dense, TernaryDense
+    gptq     projection          Dense, EinsumDense
+    awq      projection          Dense, EinsumDense
+
+The variables each mode stores, by the names of the `Dense` and `Embedding`
+specs. `K`, `N` and `B` are the sizes of a kernel's contracted, free and
+batch axes (`KernelAxes`). A projection also stores its `bias` in every
+mode.
+
+    int8     projection: kernel (int8 codes in the kernel's shape) and
+             kernel_scale (per output channel, in the outputs' layout).
+             lookup: embeddings (int8 codes) and embeddings_scale (per
+             row).
+    int4     projection: kernel (the `(K, B * N)` matrix, two codes per
+             byte) and kernel_scale (per column; grouped: per group of
+             rows and column, with kernel_zero and g_idx).
+             lookup: embeddings (two codes per byte) and embeddings_scale
+             (per row; grouped: per row and group of columns, with
+             embeddings_zero and g_idx).
+    float8   projection: kernel (the float kernel stays), and a scale and
+             an amax history each for the inputs, the kernel and the
+             output gradient.
+    ternary  projection: kernel (five codes per byte) and kernel_scale
+             (one scalar).
+    gptq     projection: quantized_kernel (the `(B * K, N)` matrix, packed
+             by bit width), and kernel_scale, kernel_zero (per group of
+             rows and column) and g_idx. No float kernel.
+    awq      projection: as gptq, and awq_scales (one per row).
+
+An untied `ReversibleEmbedding` also stores its reverse table:
+`reverse_embeddings`, `reverse_embeddings_scale` and, for grouped int4,
+`reverse_embeddings_zero`. int8, int4, gptq and awq add a LoRA update as a
+separate term of the forward pass and merge it into the stored weight on
+save; float8 and ternary refuse LoRA (`supports_lora`).
+
+A layer is unbuilt, float, or quantized in one mode:
+
+    unbuilt  --build()--------------->  float, or quantized when its
+                                        policy names a mode
+    float    --Layer.quantize(mode)-->  quantized (int8, int4, float8,
+                                        ternary)
+    float    --Model.quantize(mode)-->  quantized (every mode)
+
+- `Layer.quantize` checks the layer before it changes it: built, not
+  quantized, a compute dtype the mode accepts, a geometry, the type check,
+  the spec, the geometry's `build_attributes`, the strategy's
+  `check_quantizable` and LoRA support. Then `strategy.quantize` replaces
+  the float weight with the mode's variables through `quantized_build`,
+  which sets `_is_quantized`, and the policy becomes
+  `<mode...>_from_<source>`. A quantization that raises leaves the layer
+  as it was. `Operation._dispatch_call` runs `quantized_call` for a layer
+  whose policy names a mode.
+- A quantized policy set on a built float layer runs the same `quantize()`
+  with the config that the strategy derives from the policy. On a
+  quantized layer the setter accepts only a new source dtype: no
+  transition leads to another mode or back to float.
+- GPTQ and AWQ quantize only through `Model.quantize`, in one step;
+  `Layer.quantize` and the policy setter refuse them. `model_run` creates
+  a `CalibrationRun` before any layer changes. Each layer that the run
+  covers stays float until its calibrator has observed the layer's
+  inputs, and the calibrator's `write_back` then swaps the float kernel
+  for the calibrated variables. No layer stays between float and
+  quantized. A calibrated layer holds `quantization_config = None`: its
+  policy name gives the bit width and the group size.
+- A layer built under a quantized policy (a saved model that loads)
+  creates the mode's variables in `quantized_build`, and no float weight
+  when the strategy owns the weight storage (every mode but float8). The
+  variables keep their initial values (zero codes) until the saved weights
+  load: a quantized `dtype` does not quantize. float8 keeps the float
+  kernel, so a float8 layer built from its policy computes in float8 from
+  the start.
+
+`keras.src.dtype_policies.dtype_policy` imports this module on first use: the
+mode modules import the policy classes, so a module-level import there is a
+cycle.
 """
 
 from keras.src import ops

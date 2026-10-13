@@ -132,9 +132,15 @@ class GPTQConfig(QuantizationConfig):
             calibration sample. Defaults to 512.
         hessian_damping: (float, optional) The % of Hessian damping to use for
             stabilization during inverse calculation. Defaults to 0.01.
-        group_size: (int, optional) The size of weight groups to quantize
-            together. A `group_size` of -1 indicates per-channel quantization.
-            Defaults to 128.
+        group_size: (int, optional) The number of input rows of the kernel
+            that share a scale and a zero point. `-1` puts all the input
+            rows in one group (one group per batch index of a kernel with
+            a batch axis): one scale and zero point per output channel when
+            `per_channel` is `True`. Defaults to 128.
+        per_channel: (bool, optional) Whether each output channel of a group
+            has its own scale and zero point. If `False`, the output
+            channels of a group share one, and `group_size=-1` gives one
+            scale and zero point for the whole kernel. Defaults to `True`.
         symmetric: (bool, optional) If `True`, uses symmetric quantization.
             If `False`, uses asymmetric quantization. Defaults to `False`.
         activation_order: (bool, optional) If `True`, reorders weight columns
@@ -185,8 +191,8 @@ class GPTQConfig(QuantizationConfig):
             raise ValueError("hessian_damping must be between 0 and 1.")
         if group_size < -1 or group_size == 0:
             raise ValueError(
-                "Invalid group_size. Supported values are -1 (whole-tensor) "
-                "or a positive integer, "
+                "Invalid group_size. Supported values are -1 (one group of "
+                "all input rows) or a positive integer, "
                 f"but got {group_size}."
             )
         self.dataset = dataset

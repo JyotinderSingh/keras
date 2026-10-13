@@ -1,3 +1,23 @@
+"""Quantizers, and the functions that compute codes, scales and zero points.
+
+The functions use these scale conventions (`WeightScheme.scale_form` in
+`keras.src.quantizers.quantized_weight` names the first two forms):
+
+    function                         real value              codes
+    abs_max_quantize,                codes / scale           signed, no zero
+      AbsMaxQuantizer                (divisor)               point
+    abs_max_quantize_grouped_with_   (codes - zero) * scale  signed, a zero
+      zero_point                     (multiplier)            point per group
+    compute_quantization_parameters  (codes - zero) * scale  unsigned
+      and the `*_with_zero_point`    (multiplier)            `[0, 2**bits - 1]`,
+      and `*_with_sz_map` functions                          a zero point
+    ternarize                        codes * scale           `{-1, 0, 1}`, no
+                                     (multiplier)            zero point
+
+With a symmetric range, `compute_quantization_parameters` puts the zero
+point at the middle code.
+"""
+
 import math
 
 import ml_dtypes
@@ -11,6 +31,23 @@ from keras.src.backend.common.backend_utils import standardize_axis_for_numpy
 
 @keras_export(["keras.Quantizer", "keras.quantizers.Quantizer"])
 class Quantizer:
+    """Base class of the weight and activation quantizers.
+
+    The quantization modes call a quantizer as
+    `quantizer(x, axis=None, to_numpy=False)` and read `(codes, scale)`
+    from it: the codes in `output_dtype`, and a divisor scale (`x` is
+    about `codes / scale`) that keeps the reduced axes with size one, so
+    that it broadcasts against `x`. A weight quantizer is called with
+    `to_numpy=True` and without `axis`: it reduces over the axes that its
+    constructor holds. The activation quantizer of a projection is called
+    with `axis` set to the geometry's `inputs_quantization_axis`; that of
+    a reverse projection is called without `axis`. `AbsMaxQuantizer`
+    follows this protocol. The base `__call__` returns `x` unchanged.
+
+    Args:
+        output_dtype: The dtype of the codes.
+    """
+
     def __init__(self, output_dtype="int8"):
         self.output_dtype = output_dtype
 
@@ -292,9 +329,21 @@ def _abs_max_quantize_grouped_with_zero_point_tensor(
 
 @keras_export("keras.quantizers.AbsMaxQuantizer")
 class AbsMaxQuantizer(Quantizer):
+    """Symmetric abs-max quantizer (`abs_max_quantize`).
+
+    Args:
+        axis: The axis or axes that a call without `axis` reduces over.
+            `None` reduces over the last axis. The default weight
+            quantizers of the modes set it; a call with `axis` overrides
+            it.
+        value_range: `(min, max)` of the codes.
+        epsilon: Small value added to the absolute maximum.
+        output_dtype: The dtype of the codes.
+    """
+
     def __init__(
         self,
-        axis=None,  # Deprecated, provide axis in __call__ instead.
+        axis=None,
         value_range=(-127, 127),
         epsilon=backend.epsilon(),
         output_dtype="int8",
@@ -331,7 +380,8 @@ class AbsMaxQuantizer(Quantizer):
                 performed on the device.
 
         Returns:
-            A tuple of the quantized tensor and the scale.
+            A tuple `(codes, scale)`. `scale` keeps the reduced axes with
+            size one, and `x` is about `codes / scale`.
         """
         if axis is None:
             axis = self.axis
