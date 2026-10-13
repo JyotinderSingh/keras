@@ -415,11 +415,14 @@ class CalibrationRunTest(testing.TestCase):
             "pre_block_layers": [embedding],
             "sequential_blocks": blocks,
         }
-        kwargs = dict(num_samples=3, sequence_length=seq_len, group_size=-1)
+        kwargs = dict(
+            num_samples=3,
+            sequence_length=seq_len,
+            group_size=-1,
+            calibration_batch_size=2,
+        )
         if mode == "awq":
             kwargs["num_grid_points"] = 3
-        else:
-            kwargs["calibration_batch_size"] = 2
         config = calibration_config(mode, **kwargs)
         config.quantization_layer_structure = structure
         rng = np.random.default_rng(0)
@@ -434,7 +437,7 @@ class CalibrationRunTest(testing.TestCase):
 
         strategy = strategy_registry.get_strategy(mode)
         run = CalibrationRun(strategy, config, structure)
-        self.assertEqual(run.batch_size, 2 if mode == "gptq" else 1)
+        self.assertEqual(run.batch_size, 2)
         run.run(dataset)
         self.assertEqual(run.num_samples, 3)
         for block in blocks:
@@ -530,14 +533,14 @@ class CalibrationRunModelTest(testing.TestCase):
         """The chained Dense layers form two stages. Each stage observes
         one sweep over the batches, the second after the first is
         quantized."""
-        batch_size = 3 if mode == "gptq" else 1
-        kwargs = {"calibration_batch_size": 3} if mode == "gptq" else {}
-        model, config = _tiny_model(mode, num_samples=4, **kwargs)
+        model, config = _tiny_model(
+            mode, num_samples=4, calibration_batch_size=3
+        )
         block = config.quantization_layer_structure["sequential_blocks"][0]
         with _spy_on_observe(mode) as observe:
             model.quantize(mode, config=config)
         observed = [call.args[0].layer for call in observe.call_args_list]
-        sweep = math.ceil(4 / batch_size)
+        sweep = math.ceil(4 / 3)
         self.assertEqual(
             observed, [block.layers[0]] * sweep + [block.layers[1]] * sweep
         )
@@ -587,13 +590,11 @@ class CalibrationRunModelTest(testing.TestCase):
             [layers.Reshape((seq_len, embed_dim)), layers.Dense(embed_dim)]
         )
         model = models.Model(inputs, second(first(embedding(inputs))))
-        if mode == "awq":
-            kwargs = {"num_grid_points": 3}
-        else:
-            kwargs = {"calibration_batch_size": 4}
+        kwargs = {"num_grid_points": 3} if mode == "awq" else {}
         config = calibration_config(
             mode,
             num_samples=6,
+            calibration_batch_size=4,
             sequence_length=seq_len,
             group_size=-1,
             **kwargs,

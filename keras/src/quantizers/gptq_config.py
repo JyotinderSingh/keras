@@ -1,3 +1,5 @@
+import numbers
+
 from keras.src.api_export import keras_export
 from keras.src.quantizers.quantization_config import QuantizationConfig
 
@@ -170,7 +172,10 @@ class GPTQConfig(QuantizationConfig):
             )
         if num_samples <= 0:
             raise ValueError("num_samples must be a positive integer.")
-        if calibration_batch_size <= 0:
+        if (
+            not isinstance(calibration_batch_size, numbers.Integral)
+            or calibration_batch_size <= 0
+        ):
             raise ValueError(
                 "calibration_batch_size must be a positive integer."
             )
