@@ -611,4 +611,4 @@ def makedirs(path):
             return gfile.makedirs(path)
         else:
             _raise_if_no_gfile(path)
-    return os.makedirs(path)
+    return os.makedirs(path, exist_ok=True)
