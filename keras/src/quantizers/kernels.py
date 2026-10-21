@@ -55,6 +55,7 @@ from keras.src.distribution import distribution_lib
 from keras.src.quantizers.geometry import EinsumProjectionGeometry
 from keras.src.quantizers.geometry import ProjectionGeometry
 from keras.src.quantizers.quantized_weight import Int4Pairs
+from keras.src.quantizers.quantized_weight import QuantizedWeight
 from keras.src.utils.module_utils import tensorflow as tf
 
 if backend.backend() == "torch":
@@ -404,3 +405,114 @@ def contract_quantized(layer, geometry, quantized_weight, inputs):
     if route is None:
         return _reference(layer, geometry, quantized_weight, inputs)
     return run_route(route, layer, geometry, quantized_weight, inputs)
+
+
+def reverse_lookup_view(table, orientation):
+    """The `(D, V)` view of a stored int4 lookup table.
+
+    An untied table is stored `(D, V)`. A tied table is the forward table
+    `(V, D)`, so the view transposes its codes, and its scale and zero
+    point when they are grouped.
+    """
+    if orientation == "untied":
+        return table
+    grouped = table.zero_point is not None
+    return QuantizedWeight(
+        codes=ops.transpose(table.codes),
+        scale=ops.transpose(table.scale) if grouped else table.scale,
+        zero_point=ops.transpose(table.zero_point) if grouped else None,
+        g_idx=table.g_idx,
+        layout=Int4Pairs(axis=0, orig_len=table.layout.orig_len),
+        scheme=table.scheme,
+        shape=table.shape[::-1],
+        axis=0 if grouped else None,
+        scale_axes=None if grouped else (1,),
+    )
+
+
+def _reference_lookup(layer, table, orientation, inputs, config=None):
+    """The reference reverse contraction, with no activation quantizer.
+
+    A grouped table is dequantized in the precision of its scale. A
+    per-channel table contracts its codes, then divides by its scale.
+    """
+    dtype = layer.reverse_dtype or layer.compute_dtype
+    view = reverse_lookup_view(table, orientation)
+    if view.zero_point is not None:
+        precision = backend.result_type(dtype, view.scale.dtype)
+        return ops.matmul(inputs, view.dequantize(precision))
+    return view.apply_scale(ops.cast(ops.matmul(inputs, view.unpack()), dtype))
+
+
+# Route name -> the `RouteSource` of its reverse lookup. Its `fn(layer,
+# table, orientation, inputs, config)` takes the stored table. A `matrix`
+# source takes the inputs as `(M, D)` and returns `(M, V)`.
+_LOOKUP_ROUTES = {
+    "reference_wrapped": RouteSource(_reference_lookup, matrix=False)
+}
+# (backend, device class, compute dtype, M bucket) -> ((route, config), ...)
+_LOOKUP_ALLOW_LIST = {}
+
+
+def select_lookup_route(layer, table, orientation, inputs):
+    """Returns the route of a reverse lookup that the gates select, or `None`.
+
+    The caller, the reverse lookup of `ReversibleEmbedding` with no
+    activation quantizer, takes the place of gate 3. `table` is the
+    stored table: `(V, D)` for a `"tied"` orientation, `(D, V)` for an
+    `"untied"` one. `inputs` are `(..., D)`, in the reverse dtype. Gate 4
+    asks for two 4-bit codes per byte along `D`; `LookupHandlers` stores
+    a grouped scheme or a per-channel divisor. The routes are those of
+    `_LOOKUP_ROUTES`, and gate 8 reads `_LOOKUP_ALLOW_LIST`.
+    """
+    route = _select_lookup(layer, table, orientation, inputs)
+    if not (backend.backend() == "torch" and torch.compiler.is_compiling()):
+        route_counts["reference" if route is None else route.name] += 1
+    return route
+
+
+def _select_lookup(layer, table, orientation, inputs):
+    """`select_lookup_route` without the count."""
+    forced = _state.route
+    if _state.policy == "off" or not (  # Gates 1 and 8, as in `_select`.
+        forced or _state.policy == "require" or _LOOKUP_ALLOW_LIST
+    ):
+        return None
+    d_axis = 1 if orientation == "tied" else 0
+    if not (  # Gate 4.
+        isinstance(table.layout, Int4Pairs) and table.layout.axis % 2 == d_axis
+    ):
+        return None
+    free = tuple(inputs.shape)[:-1]
+    if any(dim is None for dim in free) or math.prod(free) < 1:  # Gate 2.
+        return None
+    m, dtype = math.prod(free), layer.reverse_dtype or layer.compute_dtype
+    d, v = table.layout.orig_len, table.shape[1 - d_axis]
+    if forced:
+        candidates = ((forced, None),)
+    # Gate 6, on the tensors that the stored variables hold.
+    elif _distributed(inputs, table.with_tensors(table.read_tensors())):
+        return None
+    elif _state.policy == "require":
+        candidates = ((_required_route(), None),)
+    else:
+        device = str(inputs.device) if backend.backend() == "torch" else None
+        key = (backend.backend(), _device_class(device), dtype, _m_bucket(m))
+        candidates = _LOOKUP_ALLOW_LIST.get(key, ())
+    for name, config in candidates:
+        source = _LOOKUP_ROUTES.get(name)
+        if source is None or (source.dtypes and dtype not in source.dtypes):
+            continue  # No reverse lookup in the route, or gate 7.
+        if forced or _available(source, m, d, v, table):
+            return Route(name, source, config, d, 1, (v,))
+    return None
+
+
+def run_lookup_route(route, layer, table, orientation, inputs):
+    """Runs the reverse lookup `route` forward only."""
+    source = route.source
+    if not source.matrix:
+        return source.fn(layer, table, orientation, inputs, route.config)
+    x = ops.reshape(inputs, (-1, route.rows))
+    y = source.fn(layer, table, orientation, x, route.config)
+    return ops.reshape(y, tuple(ops.shape(inputs)[:-1]) + route.columns)
