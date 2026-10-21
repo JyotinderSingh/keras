@@ -1,8 +1,9 @@
 """Route selection for a 4-bit weight-only contraction (`kernels.py`).
 
-The library has no kernel route yet. The tests run the reference path as
-a route (`force_route("reference_wrapped")`), and `matrix`, a route of
-this file that contracts the `(M, K)` inputs with the stored matrix.
+The library has one route, N5 (`"n5"`, sum-then-scale in `keras.ops`).
+The tests also run the reference path as a route
+(`force_route("reference_wrapped")`), and `matrix`, a route of this file
+that contracts the `(M, K)` inputs with the stored matrix.
 """
 
 import contextlib
@@ -31,6 +32,8 @@ from keras.src.quantizers.quantization_config import Int4QuantizationConfig
 from keras.src.quantizers.quantization_test_utils import PermutedDense
 from keras.src.quantizers.quantization_test_utils import Pointwise1D
 from keras.src.quantizers.quantization_test_utils import ThirdPartyProjection
+from keras.src.quantizers.quantization_test_utils import calibrate_layer
+from keras.src.quantizers.quantization_test_utils import calibration_config
 from keras.src.quantizers.quantization_test_utils import input_gradient
 from keras.src.quantizers.quantization_test_utils import oracle_contract
 from keras.src.quantizers.quantizers import AbsMaxQuantizer
@@ -38,6 +41,8 @@ from keras.src.testing.test_utils import named_product
 
 if backend.backend() == "jax":
     import jax
+elif backend.backend() == "tensorflow":
+    import tensorflow as tf
 elif backend.backend() == "torch":
     import torch
 
@@ -60,6 +65,15 @@ REFUSED = {
     "summed_input_axis": ("abc,cd->ad", (16,), (2, 3, 128)),
     "contracted_out_of_order": ("abcd,edc->abe", (None, 32), (2, 4, 8, 16)),
 }
+# name -> (mode, group size, activation order).
+CALIBRATED = {
+    "gptq": ("gptq", 128, False),
+    "gptq_per_channel": ("gptq", -1, False),
+    "gptq_act_order": ("gptq", 128, True),
+    "awq": ("awq", 128, False),
+}
+# An `M` in each bucket.
+BUCKET_ROWS = {"1-16": 4, "17-64": 33, "65-256": 130, "257+": 300}
 
 
 class StandardProjection(ThirdPartyProjection):
@@ -89,12 +103,13 @@ def _untested():
 
 @contextlib.contextmanager
 def _routes(rows=None, required=None, **sources):
-    """Adds `matrix` and `sources` to the route table, `rows` to the
-    allow-list, and `required` as this backend's `"require"` kernels."""
+    """Adds `matrix` and `sources` to the route table, sets the allow-list
+    to `rows`, and sets `required` as this backend's `"require"` kernels."""
     sources = {"matrix": kernels.RouteSource(_matrix), **sources}
-    rows = rows or {}
+    allow_list = dict(kernels._ALLOW_LIST)
     kernels._ROUTES.update(sources)
-    kernels._ALLOW_LIST.update(rows)
+    kernels._ALLOW_LIST.clear()
+    kernels._ALLOW_LIST.update(rows or {})
     if required:
         kernels._REQUIRED[backend.backend()] = required
     try:
@@ -102,8 +117,8 @@ def _routes(rows=None, required=None, **sources):
     finally:
         for name in sources:
             del kernels._ROUTES[name]
-        for key in rows:
-            del kernels._ALLOW_LIST[key]
+        kernels._ALLOW_LIST.clear()
+        kernels._ALLOW_LIST.update(allow_list)
         kernels._REQUIRED.pop(backend.backend(), None)
 
 
@@ -118,12 +133,12 @@ def _row_key(dtype, bucket):
     """The allow-list key of this backend and device."""
     device = None
     if backend.backend() == "torch":
-        device = str(ops.convert_to_tensor(np.ones(1)).device)
+        device = str(ops.convert_to_tensor(np.ones(1, "float32")).device)
     return (backend.backend(), kernels._device_class(device), dtype, bucket)
 
 
-def _layer(case, block_size=32, dtype="float32", bias=False):
-    """A layer of `case`, quantized to int4 from a random float kernel."""
+def _float_layer(case, dtype="float32", bias=False):
+    """A built float layer of `case` with a random kernel."""
     equation, output, input_shape = case
     if equation is None:
         layer = layers.Dense(output, use_bias=bias, dtype=dtype)
@@ -135,8 +150,24 @@ def _layer(case, block_size=32, dtype="float32", bias=False):
     layer.build(input_shape)
     rng = np.random.default_rng(0)
     layer._kernel.assign(rng.standard_normal(layer._kernel.shape))
+    return layer
+
+
+def _layer(case, block_size=32, dtype="float32", bias=False):
+    """A layer of `case`, quantized to int4 from a random float kernel."""
+    layer = _float_layer(case, dtype, bias)
     config = Int4QuantizationConfig(block_size=block_size)
     layer.quantize("int4", config=config)
+    return layer
+
+
+def _calibrated(case, mode, dtype="float32"):
+    """A layer of `case`, calibrated in the `CALIBRATED` mode `mode`."""
+    layer = _float_layer(case, dtype)
+    mode, group_size, activation_order = CALIBRATED[mode]
+    kwargs = {"activation_order": True} if activation_order else {}
+    config = calibration_config(mode, group_size=group_size, **kwargs)
+    calibrate_layer(layer, config, _random((16,) + case[2][1:], seed=4))
     return layer
 
 
@@ -150,20 +181,26 @@ def _numpy(x):
 
 def _oracle(layer, x):
     view = layer._quantized_weight()
-    scale = ops.convert_to_numpy(layer.kernel_scale)
-    if layer.compute_dtype == "bfloat16":
-        # The layer reads its scale in the compute dtype.
-        scale = scale.astype(ml_dtypes.bfloat16)
-    grouped = layer.g_idx is not None
+
+    def read(tensor, scale=False):
+        if tensor is None:
+            return None
+        value = ops.convert_to_numpy(tensor)
+        if scale and layer.compute_dtype != "float32":
+            # The layer reads its scales in the compute dtype.
+            value = value.astype(ml_dtypes.finfo(layer.compute_dtype).dtype)
+        return value
+
     return oracle_contract(
         x,
-        ops.convert_to_numpy(layer._kernel),
-        scale,
+        read(view.codes),
+        read(view.scale, scale=True),
         columns=view.layout.orig_len,
         kernel_shape=view.shape,
         permutation=view.permutation,
-        zero_point=ops.convert_to_numpy(layer.kernel_zero) if grouped else None,
-        g_idx=ops.convert_to_numpy(layer.g_idx) if grouped else None,
+        zero_point=read(view.zero_point),
+        g_idx=read(view.g_idx),
+        input_scales=read(view.input_scales, scale=True),
         equation=getattr(layer, "equation", None),
         dtype=layer.compute_dtype,
     )
@@ -189,6 +226,57 @@ def _counts(layer, x):
     kernels.route_counts.clear()
     layer(x)
     return dict(kernels.route_counts)
+
+
+def _floor_and_bound(layer):
+    """The G1 floor and the G2 bound of the layer's compute dtype."""
+    if layer.compute_dtype == "float32":
+        return 1e-6, 1e-5
+    if layer.compute_dtype == "float16":
+        return 2e-4, 2**-9
+    return 1e-3, 2**-7
+
+
+def _check_route(test, layer, x, name):
+    """Runs the forced route `name` against the oracle and the reference.
+
+    The error is at most 1.25 times the reference's plus a floor, and at
+    most an absolute bound (G1, G2). The outputs are finite (G4) and
+    deterministic (G5), and equal a direct call of the route (G8).
+    Returns the outputs of the route and of the reference path.
+    """
+    oracle = _oracle(layer, x)
+    with kernels.policy("off"):
+        reference = _numpy(layer(x))
+    floor, bound = _floor_and_bound(layer)
+    kernels.route_counts.clear()
+    with kernels.force_route(name):
+        y, again, direct = layer(x), layer(x), _direct(layer, x)
+    test.assertEqual(dict(kernels.route_counts), {name: 3})
+    y = _numpy(y)
+    test.assertTrue(np.all(np.isfinite(y)))
+    test.assertAllEqual(_numpy(again), y)
+    test.assertAllEqual(_numpy(direct), y)
+    err = _err(y, oracle)
+    test.assertLessEqual(err, 1.25 * _err(reference, oracle) + floor)
+    test.assertLessEqual(err, bound)
+    return y, reference
+
+
+def _contiguous(layer):
+    """Whether `g_idx[k] == k // G` for every stored row `k`."""
+    view = layer._quantized_weight()
+    rows = view.codes.shape[0]
+    groups = np.arange(rows) // min(view.scheme.group_size, rows)
+    return np.array_equal(_numpy(view.g_idx), groups)
+
+
+def _exact_inputs(input_shape, rows, rng):
+    """Inputs with eight nonzero entries of 1 or -1 per contracted row."""
+    x = np.zeros((math.prod(input_shape) // rows, rows), "float32")
+    for row in x:
+        row[rng.choice(rows, 8, replace=False)] = rng.choice([-1, 1], 8)
+    return x.reshape(input_shape)
 
 
 class ReshapeCompatibleTest(testing.TestCase):
@@ -226,26 +314,15 @@ class RouteSuiteTest(testing.TestCase):
     def test_routes(self, case, block_size, dtype):
         layer = _layer(ROUTABLE[case], block_size, dtype)
         x = _random(ROUTABLE[case][2])
-        oracle = _oracle(layer, x)
         with kernels.policy("off"):
-            reference = _numpy(layer(x))
-        floor, bound = (1e-3, 2**-7) if dtype != "float32" else (1e-6, 1e-5)
-        self.assertLessEqual(_err(reference, oracle), bound)
+            err = _err(_numpy(layer(x)), _oracle(layer, x))
+        self.assertLessEqual(err, _floor_and_bound(layer)[1])
+        names = ["reference_wrapped", "matrix", "n5"]
+        if case == "dense_ragged" and block_size != -1:
+            names.remove("n5")  # A partial group; `N5Test` runs the refusal.
         with _routes():
-            for name in ("reference_wrapped", "matrix"):
-                kernels.route_counts.clear()
-                with kernels.force_route(name):
-                    y, again, direct = layer(x), layer(x), _direct(layer, x)
-                self.assertEqual(dict(kernels.route_counts), {name: 3})
-                y = _numpy(y)
-                self.assertTrue(np.all(np.isfinite(y)))
-                self.assertAllEqual(_numpy(again), y)
-                self.assertAllEqual(_numpy(direct), y)
-                err = _err(y, oracle)
-                self.assertLessEqual(
-                    err, 1.25 * _err(reference, oracle) + floor
-                )
-                self.assertLessEqual(err, bound)
+            for name in names:
+                y, reference = _check_route(self, layer, x, name)
                 if name == "reference_wrapped":
                     self.assertAllEqual(y, reference)
 
@@ -272,17 +349,14 @@ class RouteSuiteTest(testing.TestCase):
             zero = rng.integers(-1, 2, layer.kernel_zero.shape)
             layer.kernel_zero.assign(zero.astype("int8"))
         # Eight nonzero inputs per row keep every sum exact in bfloat16.
-        input_shape = ROUTABLE[case][2]
-        x = np.zeros((math.prod(input_shape) // rows, rows), "float32")
-        for row in x:
-            row[rng.choice(rows, 8, replace=False)] = rng.choice([-1, 1], 8)
-        x = x.reshape(input_shape)
+        x = _exact_inputs(ROUTABLE[case][2], rows, rng)
         oracle = _oracle(layer, x).astype("float32")
         with kernels.policy("off"):
             self.assertAllEqual(_numpy(layer(x)), oracle)
         with _routes():
-            for name in ("reference_wrapped", "matrix"):
+            for name in ("reference_wrapped", "matrix", "n5"):
                 with kernels.force_route(name):
+                    self.assertEqual(_counts(layer, x), {name: 1})
                     self.assertAllEqual(_numpy(layer(x)), oracle)
 
     @parameterized.named_parameters(
@@ -307,9 +381,243 @@ class RouteSuiteTest(testing.TestCase):
         with kernels.policy("off"):
             expected = input_gradient(layer, x)
         with _routes():
-            for name in ("reference_wrapped", "matrix"):
+            for name in ("reference_wrapped", "matrix", "n5"):
                 with kernels.force_route(name):
                     self.assertAllEqual(input_gradient(layer, x), expected)
+
+
+class N5Test(testing.TestCase):
+    """N5 through `force_route("n5")`, and under `"auto"` with a row."""
+
+    @parameterized.named_parameters(
+        named_product(
+            block_size=[32, 64, 128, 256],
+            groups=[1, 2, 8],
+            dtype=["float32", "mixed_bfloat16"],
+        )
+    )
+    def test_grouped_shapes(self, block_size, groups, dtype):
+        """int4 codes (int8 storage) with `K` of 1, 2 and 8 groups."""
+        rows = groups * block_size
+        layer = _layer((None, 10, (1, rows)), block_size, dtype)
+        for m in (1, 3, 16, 17, 33, 130):
+            _check_route(self, layer, _random((m, rows), seed=m), "n5")
+
+    @parameterized.named_parameters(
+        named_product(
+            case=[("per_channel", -1, 200), ("short_group", 128, 48)],
+            dtype=["float32", "mixed_bfloat16", "mixed_float16"],
+        )
+    )
+    def test_rows_without_whole_groups(self, case, dtype):
+        """Per-channel int4 has no groups, and a block longer than `K` is
+        one group."""
+        _, block_size, rows = case
+        layer = _layer((None, 10, (1, rows)), block_size, dtype)
+        _check_route(self, layer, _random((5, rows)), "n5")
+
+    @parameterized.named_parameters(
+        named_product(
+            case=["dense", "query_ndh", "output_nhd"],
+            mode=sorted(CALIBRATED),
+            dtype=["float32", "mixed_bfloat16", "mixed_float16"],
+        )
+    )
+    def test_calibrated(self, case, mode, dtype):
+        """GPTQ and AWQ codes (uint8 storage). With groups that are not
+        contiguous, the guard gives the reference path's output."""
+        layer = _calibrated(ROUTABLE[case], mode, dtype)
+        x = _random(ROUTABLE[case][2])
+        y, reference = _check_route(self, layer, x, "n5")
+        if not _contiguous(layer):
+            self.assertAllEqual(y, reference)
+
+    @parameterized.named_parameters(
+        named_product(dtype=["float32", "mixed_bfloat16"])
+    )
+    def test_guard_runs_the_reference_path(self, dtype):
+        """GPTQ with activation order scatters the groups."""
+        layer = _calibrated(ROUTABLE["dense"], "gptq_act_order", dtype)
+        x = _random(ROUTABLE["dense"][2])
+        self.assertFalse(_contiguous(layer))
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        with kernels.force_route("n5"):
+            self.assertEqual(_counts(layer, x), {"n5": 1})
+            self.assertAllEqual(_numpy(layer(x)), expected)
+            if backend.backend() == "jax":
+                # `ops.cond` traces both branches.
+                y = jax.jit(lambda v: layer(v))(x)
+                self.assertAllEqual(_numpy(y), expected)
+
+    @parameterized.named_parameters(
+        named_product(
+            mode=["gptq", "gptq_per_channel", "awq"],
+            dtype=["float32", "mixed_bfloat16"],
+        )
+    )
+    def test_exact_data(self, mode, dtype):
+        """uint8 storage: small integers and power-of-two scales give the
+        oracle exactly."""
+        layer = _calibrated(ROUTABLE["dense"], mode, dtype)
+        view = layer._quantized_weight()
+        rng = np.random.default_rng(2)
+        rows, columns = view.codes.shape[0], view.layout.orig_len
+        codes = rng.integers(7, 10, (rows, columns)).astype("uint8")
+        layer.quantized_kernel.assign(pack_int4(codes, -1, "uint8")[0])
+        zero = rng.integers(7, 10, layer.kernel_zero.shape)
+        layer.kernel_zero.assign(zero.astype("uint8"))
+        powers = rng.integers(1, 4, layer.kernel_scale.shape)
+        layer.kernel_scale.assign(2.0**-powers)
+        if mode == "awq":
+            layer.awq_scales.assign(2.0 ** rng.integers(0, 2, rows))
+        x = _exact_inputs(ROUTABLE["dense"][2], rows, rng)
+        oracle = _oracle(layer, x).astype("float32")
+        with kernels.policy("off"):
+            self.assertAllEqual(_numpy(layer(x)), oracle)
+        with kernels.force_route("n5"):
+            self.assertEqual(_counts(layer, x), {"n5": 1})
+            self.assertAllEqual(_numpy(layer(x)), oracle)
+
+    @parameterized.named_parameters(
+        named_product(case=["dense", "query_ndh"], mode=["gptq", "awq"])
+    )
+    @pytest.mark.skipif(
+        backend.backend() == "numpy", reason="NumPy has no gradients."
+    )
+    def test_calibrated_input_gradient(self, case, mode):
+        """N5 runs inside the custom gradient of a routed GPTQ or AWQ call,
+        so its input gradient is the wrapped reference's. For `Dense` that
+        is the reference path's."""
+        layer = _calibrated(ROUTABLE[case], mode)
+        x = _random(ROUTABLE[case][2])
+        with kernels.force_route("reference_wrapped"):
+            expected = input_gradient(layer, x)
+        with kernels.force_route("n5"):
+            self.assertAllEqual(input_gradient(layer, x), expected)
+        if case == "dense":
+            with kernels.policy("off"):
+                self.assertAllEqual(input_gradient(layer, x), expected)
+
+    @parameterized.named_parameters(
+        ("odd_columns", (None, 7, (2, 64)), 32),
+        ("partial_group", (None, 10, (2, 200)), 32),
+        ("no_rows", (None, 10, (0, 64)), 32),
+    )
+    def test_refusals(self, case, block_size):
+        """Odd `N` and a partial last group fail gate 5, and `M = 0` gate
+        2, so the reference path runs."""
+        layer = _layer(case, block_size)
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(layer(x))
+        with kernels.force_route("n5"):
+            self.assertEqual(_counts(layer, x), {"reference": 1})
+            self.assertAllEqual(_numpy(layer(x)), expected)
+
+    @parameterized.named_parameters(
+        ("int4", None), ("gptq", "gptq"), ("awq", "awq")
+    )
+    def test_auto_row(self, mode):
+        """Under `"auto"`, an N5 row runs N5 in its M bucket, and the
+        layer output equals a direct call of the route (G8)."""
+        case = ROUTABLE["dense"]
+        layer = _layer(case) if mode is None else _calibrated(case, mode)
+        with _routes({_row_key("float32", "1-16"): (("n5", None),)}):
+            x = _random((4, 256))
+            self.assertEqual(_counts(layer, x), {"n5": 1})
+            self.assertAllEqual(_numpy(layer(x)), _numpy(_direct(layer, x)))
+            self.assertEqual(
+                _counts(layer, _random((17, 256))), {"reference": 1}
+            )
+
+    def test_rows_of_this_platform(self):
+        """Each allow-list row of this backend and device runs N5 (G8)."""
+        platform_key = _row_key("float32", "1-16")[:2]
+        rows = [key for key in kernels._ALLOW_LIST if key[:2] == platform_key]
+        if not rows:
+            self.skipTest("The allow-list has no row for this platform.")
+        for _, _, dtype, bucket in rows:
+            self.assertEqual(
+                kernels._ALLOW_LIST[(*platform_key, dtype, bucket)],
+                (("n5", None),),
+            )
+            policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
+            layer = _layer(ROUTABLE["dense"], 128, policy.get(dtype, dtype))
+            x = _random((BUCKET_ROWS[bucket], 256))
+            self.assertEqual(_counts(layer, x), {"n5": 1})
+            self.assertAllEqual(_numpy(layer(x)), _numpy(_direct(layer, x)))
+
+    @parameterized.named_parameters(("grouped", 32), ("per_channel", -1))
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Compiles with `jax.jit`."
+    )
+    def test_jax_jit_runs_n5(self, block_size):
+        layer = _layer(ROUTABLE["dense"], block_size)
+        x = _random(ROUTABLE["dense"][2])
+        oracle = _oracle(layer, x)
+        with kernels.policy("off"):
+            reference = _numpy(layer(x))
+        kernels.route_counts.clear()
+        with kernels.force_route("n5"):
+            y = _numpy(jax.jit(lambda v: layer(v))(x))
+        self.assertEqual(dict(kernels.route_counts), {"n5": 1})
+        err = _err(y, oracle)
+        self.assertLessEqual(err, 1.25 * _err(reference, oracle) + 1e-6)
+        self.assertLessEqual(err, 1e-5)
+
+    @pytest.mark.skipif(
+        backend.backend() != "tensorflow", reason="Traces a `tf.function`."
+    )
+    def test_tensorflow_graphs_run_the_reference_path(self):
+        """N5 runs eagerly only on TensorFlow."""
+        layer = _layer(ROUTABLE["dense"])
+        x = _random(ROUTABLE["dense"][2])
+        for jit_compile in (False, True):
+            call = tf.function(lambda v: layer(v), jit_compile=jit_compile)
+            kernels.route_counts.clear()
+            with kernels.force_route("n5"):
+                call(x)
+            self.assertEqual(dict(kernels.route_counts), {"reference": 1})
+
+    @pytest.mark.skipif(
+        backend.backend() != "torch", reason="Builds a DTensor variable."
+    )
+    def test_dtensor_codes_run_the_reference_path(self):
+        """Gate 6 reads the value of a variable that the view of a GPTQ
+        call holds."""
+        layer = _calibrated(ROUTABLE["dense"], "gptq")
+        geometry = layer._quantization_geometry()
+        view = layer._quantized_weight()
+        x = ops.convert_to_tensor(_random((4, 256)))
+        if torch.distributed.is_initialized():
+            self.skipTest("Another test holds the default process group.")
+        store = os.path.join(self.get_temp_dir(), "store")
+        torch.distributed.init_process_group(
+            "gloo", init_method=f"file://{store}", rank=0, world_size=1
+        )
+        try:
+            mesh = distribution.DeviceMesh((1,), ["x"], ["cpu:0"])
+            layout = distribution.TensorLayout(("x", None), mesh)
+            with distribution.ModelParallel(
+                layout_map=distribution.LayoutMap(mesh)
+            ).scope():
+                codes = backend.Variable(
+                    ops.convert_to_numpy(view.codes),
+                    dtype="uint8",
+                    trainable=False,
+                    layout=layout,
+                )
+            tensors = (codes,) + view.read_tensors()[1:]
+            with _routes({_row_key("float32", "1-16"): (("n5", None),)}):
+                route = kernels.select_route(layer, geometry, view, x)
+                self.assertEqual(route.name, "n5")
+                sharded = view.with_tensors(tensors)
+                self.assertIsNone(
+                    kernels.select_route(layer, geometry, sharded, x)
+                )
+        finally:
+            torch.distributed.destroy_process_group()
 
 
 class FallbackTest(testing.TestCase):
@@ -361,8 +669,9 @@ class FallbackTest(testing.TestCase):
         x = _random(ROUTABLE["query_ndh"][2])
         with kernels.policy("off"):
             expected = _numpy(layer(x))
-        self.assertEqual(_counts(layer, x), {"reference": 1})
-        self.assertAllEqual(_numpy(layer(x)), expected)
+        with _routes():
+            self.assertEqual(_counts(layer, x), {"reference": 1})
+            self.assertAllEqual(_numpy(layer(x)), expected)
 
     def test_calibration_capture_runs_once_per_call(self):
         layer = _layer(ROUTABLE["dense"])
@@ -398,19 +707,25 @@ class FallbackTest(testing.TestCase):
         backend.backend() != "torch", reason="Compiles with `torch.compile`."
     )
     def test_torch_compile_does_not_recompile(self):
+        """N5 runs eagerly only, so a compiled call with an N5 row runs
+        the reference path."""
         layer = _layer(ROUTABLE["dense"])
         x = _random(ROUTABLE["dense"][2])
         torch._dynamo.reset()
         call = torch.compile(lambda v: layer(v), backend="eager")
         kernels.route_counts.clear()
-        # The first call compiles. The calls with new values reuse its code.
-        outputs = [_numpy(call(ops.convert_to_tensor(x)))]
-        with torch._dynamo.config.patch(error_on_recompile=True):
-            for i in (1, 2):
-                outputs.append(_numpy(call(ops.convert_to_tensor(x + i))))
-        self.assertEqual(dict(kernels.route_counts), {})
+        with _routes({_row_key("float32", "1-16"): (("n5", None),)}):
+            # The first call compiles. The calls with new values reuse its
+            # code.
+            outputs = [_numpy(call(ops.convert_to_tensor(x)))]
+            with torch._dynamo.config.patch(error_on_recompile=True):
+                for i in (1, 2):
+                    outputs.append(_numpy(call(ops.convert_to_tensor(x + i))))
+            self.assertEqual(dict(kernels.route_counts), {})
+            self.assertEqual(_counts(layer, x), {"n5": 1})
         for i, y in enumerate(outputs):
-            self.assertAllEqual(y, _numpy(layer(x + i)))
+            with kernels.policy("off"):
+                self.assertAllEqual(y, _numpy(layer(x + i)))
 
     @pytest.mark.skipif(
         backend.backend() not in ("tensorflow", "jax"),
