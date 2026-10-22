@@ -2,13 +2,25 @@
 
 `GeometryDispatchStrategy` is the base class of the modes that write one
 handler per geometry family (int8, int4). The functions below are steps
-that several modes share: the group index variable, the bias and
-activation, and the custom input gradient of a projection, which int8
-and int4 take against the dequantized kernel.
+that several modes share: the group index variable and its write check,
+the bias and activation, and the custom input gradient of a projection,
+which int8 and int4 take against the dequantized kernel.
 """
 
+import dataclasses
+
+import numpy as np
+
+from keras.src import backend
 from keras.src import ops
 from keras.src.quantizers.strategy_registry import QuantizationStrategy
+from keras.src.utils.module_utils import tensorflow as tf
+
+if backend.backend() == "jax":
+    import jax
+elif backend.backend() == "torch":
+    import torch
+    from torch.distributed.tensor import DTensor
 
 
 class GeometryDispatchStrategy(QuantizationStrategy):
@@ -129,7 +141,9 @@ class GeometryDispatchStrategy(QuantizationStrategy):
 def add_group_index(layer, length, group_size=None):
     """Adds `g_idx`, the group of each of `length` positions along an axis.
 
-    With `group_size`, position `i` is in group `i // group_size`. Without
+    With `group_size`, position `i` is in group `i // group_size`, and the
+    mode fixes these groups: the variable holds `ContiguousGroups` as its
+    write check (`_assign_check`), which refuses other groups. Without
     it, the index starts as zeros and a calibration writes it.
 
     Stored as `float32` because TF has no GPU kernel for int32 resource
@@ -141,7 +155,7 @@ def add_group_index(layer, length, group_size=None):
     def contiguous_groups(shape, dtype):
         return ops.floor_divide(ops.arange(length, dtype=dtype), group_size)
 
-    return layer.add_weight(
+    variable = layer.add_weight(
         name="g_idx",
         shape=(length,),
         initializer="zeros" if group_size is None else contiguous_groups,
@@ -149,6 +163,69 @@ def add_group_index(layer, length, group_size=None):
         trainable=False,
         autocast=False,
     )
+    if group_size is not None:
+        variable._assign_check = ContiguousGroups(length, group_size)
+    return variable
+
+
+@dataclasses.dataclass(frozen=True)
+class ContiguousGroups:
+    """Refuses a group index other than `arange(length) // group_size`.
+
+    The write check of a `g_idx` whose groups the mode fixes, stored on the
+    variable as `_assign_check`. `Layer.set_weights` and
+    `Model.set_state_tree` call it with the value of each write, before the
+    write. The Keras-format and the legacy h5 loads call the check of each
+    variable of a layer before its first write. It raises `ValueError` to
+    refuse the value. A value that the host cannot read now (a tracer, a
+    symbolic tensor, a JAX array on other processes) passes unchecked. The
+    check reads a torch `DTensor` whole (`_host_value`). A value of another
+    shape passes too, and the write raises its shape error. The check is a
+    frozen dataclass, so it compares and hashes by value and copies with
+    its variable.
+    """
+
+    length: int
+    group_size: int
+
+    def __call__(self, value):
+        stored = _host_value(value)
+        if stored is None or stored.shape != (self.length,):
+            return
+        groups = np.arange(self.length) // self.group_size
+        if not np.array_equal(stored, groups):
+            raise ValueError(
+                "This `g_idx` must put position `k` in group "
+                f"`k // {self.group_size}`, the groups that its quantization "
+                "mode fixes. Received: g_idx starting "
+                f"{stored[:8].tolist()} for {self.length} positions"
+            )
+
+
+def _host_value(value):
+    """`value` as a NumPy array, or `None` if the host cannot read it now.
+
+    The host cannot read a JAX tracer, a JAX array on other processes, a
+    symbolic TensorFlow tensor, or a value under `torch.compile`. A torch
+    `DTensor` holds only the shard of this process, so the check gathers
+    the whole value (`full_tensor()`). Every process runs the same write,
+    so each process joins the gather. A replicated `DTensor` needs no
+    communication.
+    """
+    if backend.backend() == "jax":
+        if isinstance(value, jax.core.Tracer) or not getattr(
+            value, "is_fully_addressable", True
+        ):
+            return None
+    elif backend.backend() == "torch":
+        if torch.compiler.is_compiling():
+            return None
+        if isinstance(value, DTensor):
+            value = value.full_tensor()
+    elif backend.backend() == "tensorflow":
+        if not tf.executing_eagerly():
+            return None
+    return np.asarray(ops.convert_to_numpy(value))
 
 
 def apply_bias_activation(layer, x):

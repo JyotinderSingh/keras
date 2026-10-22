@@ -1065,7 +1065,8 @@ class DenseTest(testing.TestCase):
             "3": np.random.random((1, 16)).astype("uint8"),
             # g_idx: legacy checkpoints stored the integer group indices as
             # float32; they load into the float32 g_idx variable unchanged.
-            "4": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="float32"),
+            # One group of 8 rows.
+            "4": np.zeros((8,), dtype="float32"),
         }
         awq_store = {
             "0": np.random.random((16,)).astype("float32"),  # bias
@@ -1074,8 +1075,9 @@ class DenseTest(testing.TestCase):
             "3": np.random.random((1, 16)).astype("uint8"),  # zero
             "4": np.random.random((8,)).astype("float32"),  # awq_scales
             # g_idx saved as int32 by a newer checkpoint; the cast on load
-            # brings it into the float32 storage variable (see above).
-            "5": np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype="int32"),
+            # brings it into the float32 storage variable (see above). One
+            # group of 8 rows.
+            "5": np.zeros((8,), dtype="int32"),
         }
 
         # Test float32 layer.
