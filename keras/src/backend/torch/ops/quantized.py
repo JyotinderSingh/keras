@@ -83,6 +83,24 @@ _CONFIGS = {
     # sm_86 and sm_89.
     (None, "float32", "65-256", None): KernelConfig(64, 32, num_stages=2),
     (None, "float32", "257+", None): KernelConfig(64, 32, num_stages=2),
+    # sm_89 rows from the sweeps on an RTX 4090: t1a-20261022-2 (bfloat16)
+    # and t1b-20261022-2 (float16, decode). The float16 prefill rows take
+    # the bfloat16 values: the tiles have the same bytes. Split-K is on at
+    # decode only. A row with `None` in place of `G` also serves per-channel
+    # int4 and each `G` with no row of its own, so its K tile is `None` (the
+    # tile of `_block_k`) or 32, which divides each `G` of 32 or more.
+    ((8, 9), "bfloat16", "1-16", 128): KernelConfig(16, 32, 64, 4, 3, 8),
+    ((8, 9), "bfloat16", "1-16", None): KernelConfig(16, 32, None, 4, 2, 8),
+    ((8, 9), "float16", "1-16", 128): KernelConfig(16, 32, 64, 4, 3, 8),
+    ((8, 9), "float16", "1-16", None): KernelConfig(16, 32, None, 4, 2, 8),
+    ((8, 9), "bfloat16", "65-256", 128): KernelConfig(128, 32, 32, 4, 4, 1),
+    ((8, 9), "bfloat16", "65-256", None): KernelConfig(64, 32, None, 4, 3, 1),
+    ((8, 9), "bfloat16", "257+", 128): KernelConfig(256, 32, 32, 4, 3, 1),
+    ((8, 9), "bfloat16", "257+", None): KernelConfig(256, 32, 32, 4, 4, 1),
+    ((8, 9), "float16", "65-256", 128): KernelConfig(128, 32, 32, 4, 4, 1),
+    ((8, 9), "float16", "65-256", None): KernelConfig(64, 32, None, 4, 3, 1),
+    ((8, 9), "float16", "257+", 128): KernelConfig(256, 32, 32, 4, 3, 1),
+    ((8, 9), "float16", "257+", None): KernelConfig(256, 32, 32, 4, 4, 1),
 }
 
 

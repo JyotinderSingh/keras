@@ -210,14 +210,20 @@ GRIDS = {
             "small": ([16], [32, 64], [64, 128], [4], [3, 4], [1, 2, 4]),
             "full": ([16], [16, 32, 64, 128], [32, 64, 128], [2, 4, 8],
                      [2, 3, 4, 5], [1, 2, 4, 8]),
+            # The loop jobs of O1 (opt/triton-k1/PLAN.md): 48 rows around
+            # the T1a best rows, with the stage axis and split 16.
+            "k1": ([16], [32, 64], [64, 128], [4], [2, 3, 4], [2, 4, 8, 16]),
         },
         "mid": {
             "small": ([32, 64], [32, 64], [64, 128], [4], [3], [1, 2]),
+            "k1": ([32, 64], [32, 64], [64, 128], [4], [3], [1, 2]),
             "full": ([16, 32, 64], [16, 32, 64, 128], [32, 64, 128],
                      [4, 8], [2, 3, 4], [1, 2, 4]),
         },
         "prefill": {
             "small": ([64, 128], [32, 64], [64, 128], [4, 8], [2, 3], [1]),
+            "k1": ([32, 64, 128, 256], [32, 64], [32, 64, 128], [4], [3, 4],
+                   [1, 2]),
             "full": ([32, 64, 128, 256], [32, 64, 128], [32, 64, 128],
                      [4, 8], [2, 3, 4], [1, 2]),
         },
@@ -1567,7 +1573,8 @@ def parse():
     parser.add_argument("--shapes", type=csv,
                         default=["4096x4096", "4096x14336", "14336x4096", "2304x9216"])
     parser.add_argument("--m", type=csv, default=["1", "4", "16"])
-    parser.add_argument("--grid", choices=["small", "full"], default="small")
+    parser.add_argument("--grid", choices=["small", "full", "k1"],
+                        default="small")
     parser.add_argument("--max_configs", type=int)
     parser.add_argument("--compile_workers", type=int)
     parser.add_argument("--l2_mb", type=float, default=-1)

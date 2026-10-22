@@ -489,24 +489,37 @@ class W4A16MatmulTest(testing.TestCase):
         """The most specific row: device, dtype, M bucket and `G`."""
         row = quantized.KernelConfig(16, 16, block_k=32, split_k=2)
         default = quantized._CONFIGS[(None, None, "1-16", None)]
-        key = ((8, 9), "bfloat16", "1-16", 128)
+        # A capability with no rows of its own.
+        key = ((1, 0), "bfloat16", "1-16", 128)
         quantized._CONFIGS[key] = row
         try:
-            config = quantized.kernel_config((8, 9), "bfloat16", 16, 128)
+            config = quantized.kernel_config((1, 0), "bfloat16", 16, 128)
             self.assertIs(config, row)
-            config = quantized.kernel_config((8, 9), "bfloat16", 16, 64)
+            config = quantized.kernel_config((1, 0), "bfloat16", 16, 64)
             self.assertIs(config, default)
-            config = quantized.kernel_config((8, 9), "bfloat16", 17, 128)
+            config = quantized.kernel_config((1, 0), "bfloat16", 17, 128)
             self.assertIs(
                 config, quantized._CONFIGS[(None, None, "17-64", None)]
             )
             # A float32 tile needs more shared memory: its own default row.
-            config = quantized.kernel_config((8, 9), "float32", 65, 128)
+            config = quantized.kernel_config((1, 0), "float32", 65, 128)
             self.assertIs(
                 config, quantized._CONFIGS[(None, "float32", "65-256", None)]
             )
         finally:
             del quantized._CONFIGS[key]
+        # The sm_89 rows: `G` 128 has its own row, and per-channel int4
+        # (`G` None) and any other `G` take the row with `None`.
+        rows = quantized._CONFIGS
+        grouped = rows[((8, 9), "bfloat16", "1-16", 128)]
+        other = rows[((8, 9), "bfloat16", "1-16", None)]
+        for group, want in ((128, grouped), (None, other), (64, other)):
+            config = quantized.kernel_config((8, 9), "bfloat16", 1, group)
+            self.assertIs(config, want)
+        # A row that serves every `G` has a K tile that divides each `G`.
+        for (_, _, _, group), config in rows.items():
+            if group is None and config.block_k is not None:
+                self.assertEqual(32 % config.block_k, 0)
 
     def test_gate(self):
         """Gate 5 passes for this device and refuses int32 overflows."""
