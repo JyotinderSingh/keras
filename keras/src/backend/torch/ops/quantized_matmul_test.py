@@ -61,11 +61,14 @@ pytestmark = pytest.mark.skipif(SKIP is not None, reason=str(SKIP))
 
 # name -> (mode, group size, order of the groups). A group size of -1 is
 # per-channel int4, and one group for GPTQ. The groups are contiguous, in
-# GPTQ's activation order, or contiguous groups in a random row order.
+# GPTQ's activation order, or contiguous groups in a random row order. Only
+# GPTQ with several groups reads `g_idx`, so only it can hold groups that
+# are not contiguous. The other grouped modes pass no `g_idx`, and the
+# kernel runs its `CONTIGUOUS` variant.
 MODES = {
     "int4_g32": ("int4", 32, None),
     "int4_g128": ("int4", 128, None),
-    "int4_g32_shuffled": ("int4", 32, "shuffled"),
+    "gptq_g32_shuffled": ("gptq", 32, "shuffled"),
     "int4_per_channel": ("int4", -1, None),
     "gptq_g64": ("gptq", 64, None),
     "gptq_one_group": ("gptq", -1, None),
@@ -167,7 +170,7 @@ def _call(layer, x, form=None, **kwargs):
         operand(view.g_idx),
         group_size=view.scheme.group_size,
         signed=view.codes.dtype == torch.int8,
-        per_channel=view.g_idx is None,
+        per_channel=view.scheme.group_size is None,
         awq_scales=operand(view.input_scales),
         **kwargs,
     )
@@ -199,6 +202,7 @@ def _oracle(layer, x):
         permutation=view.permutation,
         zero_point=read(view.zero_point),
         g_idx=read(view.g_idx),
+        group_size=view.scheme.group_size,
         input_scales=read(view.input_scales),
         equation=getattr(layer, "equation", None),
         dtype=layer.compute_dtype,
@@ -237,7 +241,7 @@ def _exact_data(layer, m, extreme=None, seed=2):
     view.codes.assign(pack_int4(codes.astype(dtype), axis=-1, dtype=dtype)[0])
     powers = rng.integers(1, 4, view.scale.shape)
     # A grouped scale multiplies and a per-channel scale divides.
-    sign = -1 if view.g_idx is not None else 1
+    sign = -1 if view.zero_point is not None else 1
     view.scale.assign(2.0 ** (sign * powers))
     if view.zero_point is not None:
         if extreme is None:
@@ -266,9 +270,11 @@ def _compile_jobs(capability):
     with `None` in place of `G` per channel and grouped. A grouped
     16-bit row also compiles with a float32 scale, which needs the most
     shared memory. Each row is the one that the frontend fits to the
-    device (`fit_config`). The split-K sum compiles for each output dtype
-    with 4 splits, and with the splits of each row of the device. sm_75
-    compiles the float16 jobs only.
+    device (`fit_config`). Each grouped job compiles twice: with a `g_idx`
+    (the check and both loops) and as the `CONTIGUOUS` variant (the fast
+    loop only), with the same estimate. The split-K sum compiles for each
+    output dtype with 4 splits, and with the splits of each row of the
+    device. sm_75 compiles the float16 jobs only.
     """
     jobs = []
 
@@ -295,17 +301,19 @@ def _compile_jobs(capability):
                 capability,
                 SHARED_MEMORY[capability],
             )
-        job = {
-            "dtype": dtype,
-            "scale": scale,
-            "per_channel": per_channel,
-            "signed": signed,
-            "precision": precision,
-            "config": dataclasses.asdict(config),
-            "estimate": estimate(config),
-        }
-        if job not in jobs and (capability >= (8, 0) or dtype == "float16"):
-            jobs.append(job)
+        for contiguous in (False,) if per_channel else (False, True):
+            job = {
+                "dtype": dtype,
+                "scale": scale,
+                "per_channel": per_channel,
+                "signed": signed,
+                "contiguous": contiguous,
+                "precision": precision,
+                "config": dataclasses.asdict(config),
+                "estimate": estimate(config),
+            }
+            if job not in jobs and (capability >= (8, 0) or dtype == "float16"):
+                jobs.append(job)
 
     def add_sum(dtype, split_k):
         job = {"kernel": "splitk_sum", "dtype": dtype, "split_k": split_k}
@@ -388,13 +396,15 @@ def _compile_for_cuda(capability, jobs):
         codes = "*i8" if job["signed"] else "*u8"
         per_channel = job["per_channel"]
         # Per-channel int4 passes its scale as the zero point and as the
-        # group index.
+        # group index, and a contiguous call as the group index.
         signature = {
             "x_ptr": x,
             "codes_ptr": codes,
             "scale_ptr": scale,
             "zero_ptr": scale if per_channel else codes,
-            "g_idx_ptr": scale if per_channel else "*fp32",
+            "g_idx_ptr": (
+                scale if per_channel or job["contiguous"] else "*fp32"
+            ),
             "y_ptr": "*fp32" if config.split_k > 1 else x,
             "M": "i32",
             "N": "i32",
@@ -416,6 +426,7 @@ def _compile_for_cuda(capability, jobs):
             "XOR": 8 if job["signed"] else 0,
             "PER_CHANNEL": per_channel,
             "PACK_K": False,
+            "CONTIGUOUS": job["contiguous"],
             "UPCAST_DOT": False,
             "INPUT_PRECISION": job["precision"],
             "SPLIT_K": config.split_k,
@@ -495,7 +506,7 @@ class W4A16MatmulTest(testing.TestCase):
         self.assertAllEqual(_numpy(_direct(layer, x)), oracle)
 
     @parameterized.named_parameters(
-        named_product(mode=["int4_g32", "gptq_act_order"])
+        named_product(mode=["gptq_g64", "gptq_act_order"])
     )
     def test_out_of_range_groups(self, mode):
         """The general path clamps each group to `[0, n_groups - 1]`."""
@@ -508,6 +519,54 @@ class W4A16MatmulTest(testing.TestCase):
         oracle = _oracle(layer, x).astype("float32")
         layer.g_idx.assign(g_idx)
         self.assertAllEqual(_numpy(_direct(layer, x)), oracle)
+
+    @parameterized.named_parameters(
+        ("group_16_tile_32", 16, 32), ("group_48_tile_32", 48, 32)
+    )
+    def test_groups_that_a_k_tile_spans(self, group_size, block_k):
+        """Without `g_idx`, a K tile that spans two groups takes the
+        general loop on the groups `k // G`: G3 holds."""
+        _, output, input_shape = LAYERS["dense_ragged"]
+        layer = layers.Dense(output, use_bias=False)
+        layer.build(input_shape)
+        config = Int4QuantizationConfig(block_size=group_size)
+        layer.quantize("int4", config=config)
+        self.assertIsNone(layer._quantized_weight().g_idx)
+        x = _exact_data(layer, 33)
+        oracle = _oracle(layer, x).astype("float32")
+        config = quantized.KernelConfig(32, 32, block_k=block_k)
+        self.assertAllEqual(_numpy(_direct(layer, x, config=config)), oracle)
+
+    def test_contiguous_follows_the_k_tile(self):
+        """`CONTIGUOUS` holds for a call with no `g_idx` when each K tile
+        lies in one group: `G >= K`, or a K tile that divides `G`. A call
+        with a `g_idx` (GPTQ with several groups) never takes it. The
+        default K tile gives it for groups of 32, 64 and 128."""
+        g_idx = torch.zeros((256,))
+        cases = (
+            # g_idx, group size, K, K tile, CONTIGUOUS
+            (None, 16, 256, 16, True),
+            (None, 16, 256, 32, False),
+            (None, 48, 256, 16, True),
+            (None, 48, 256, 32, False),
+            (None, 24, 256, 16, False),
+            (None, 96, 200, 32, True),
+            (None, 256, 200, 128, True),
+            (None, 64, 256, 128, False),
+            (g_idx, 64, 256, 64, False),
+            (g_idx, 256, 256, 128, False),
+        )
+        for g, group_size, k, block_k, expected in cases:
+            self.assertEqual(
+                quantized._contiguous(g, group_size, k, block_k),
+                expected,
+                (group_size, k, block_k, g is None),
+            )
+        for group_size in (32, 64, 128):
+            block_k = quantized._block_k(group_size, 4096)
+            self.assertTrue(
+                quantized._contiguous(None, group_size, 4096, block_k)
+            )
 
     def test_split_k_is_deterministic(self):
         layer = _layer("dense_decode", "gptq_g64")
@@ -554,20 +613,26 @@ class W4A16MatmulTest(testing.TestCase):
         self.assertEqual(empty.dtype, torch.float32)
 
     @parameterized.named_parameters(
-        ("float32", "float32", 1),
-        ("float16", "float16", 1),
-        ("bfloat16", "bfloat16", 1),
-        ("float16_split_k", "float16", 4),
+        ("float32", "float32", 1, "int4_g32"),
+        ("float16", "float16", 1, "int4_g32"),
+        ("bfloat16", "bfloat16", 1, "int4_g32"),
+        ("float16_split_k", "float16", 4, "int4_g32"),
+        ("float32_g_idx", "float32", 1, "gptq_g32_shuffled"),
     )
-    def test_op_registration(self, dtype, split_k):
-        """The schema and the fake implementation of the custom op."""
-        layer = _layer("dense_decode", "int4_g32", dtype)
+    def test_op_registration(self, dtype, split_k, mode):
+        """The schema and the fake implementation of the custom op, with
+        contiguous groups (int4) and with a `g_idx` (GPTQ)."""
+        layer = _layer("dense_decode", mode, dtype)
         view = _view(layer)
         x = ops.convert_to_tensor(_inputs("dense_decode"), layer.compute_dtype)
-        tensors = (x, view.codes, view.scale, view.zero_point, view.g_idx)
+        contiguous = view.g_idx is None
+        # With contiguous groups, the scale stands in for `g_idx`.
+        g_idx = view.scale if contiguous else view.g_idx
+        tensors = (x, view.codes, view.scale, view.zero_point, g_idx)
         # group size, signed, per-channel, the blocks, warps, stages,
-        # split-K, input precision, upcast.
-        options = (32, True, False, 16, 32, 32, 4, 3, split_k, "ieee", False)
+        # split-K, input precision, upcast, contiguous groups.
+        options = (32, mode.startswith("int4"), False, 16, 32, 32, 4, 3)
+        options += (split_k, "ieee", False, contiguous)
         torch.library.opcheck(
             torch.ops.keras.w4a16_matmul.default,
             tensors + options,

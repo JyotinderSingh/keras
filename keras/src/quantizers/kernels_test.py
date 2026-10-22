@@ -25,8 +25,10 @@ from keras.src import distribution
 from keras.src import layers
 from keras.src import models
 from keras.src import ops
+from keras.src import saving
 from keras.src import testing
 from keras.src.backend.common import AutocastScope
+from keras.src.backend.config import is_nnx_enabled
 from keras.src.layers.core.einsum_dense import EinsumAxes
 from keras.src.quantizers import kernels
 from keras.src.quantizers.capture import calibration_scope
@@ -46,6 +48,9 @@ from keras.src.testing.test_utils import named_product
 if backend.backend() == "jax":
     import jax
     import jaxlib
+
+    if is_nnx_enabled():
+        from flax import nnx
 elif backend.backend() == "tensorflow":
     import tensorflow as tf
 elif backend.backend() == "torch":
@@ -213,6 +218,7 @@ def _oracle(layer, x):
         permutation=view.permutation,
         zero_point=read(view.zero_point),
         g_idx=read(view.g_idx),
+        group_size=view.scheme.group_size,
         input_scales=read(view.input_scales, scale=True),
         equation=getattr(layer, "equation", None),
         dtype=layer.compute_dtype,
@@ -277,8 +283,11 @@ def _check_route(test, layer, x, name):
 
 
 def _contiguous(layer):
-    """Whether `g_idx[k] == k // G` for every stored row `k`."""
+    """Whether `g_idx[k] == k // G` for every stored row `k`. A view with
+    no `g_idx` has these groups."""
     view = layer._quantized_weight()
+    if view.g_idx is None:
+        return True
     rows = view.codes.shape[0]
     groups = np.arange(rows) // min(view.scheme.group_size, rows)
     return np.array_equal(_numpy(view.g_idx), groups)
@@ -613,7 +622,12 @@ class N5Test(testing.TestCase):
         self.assertEqual(compiles, [])
         self.assertAllEqual(second, first)
 
-    @parameterized.named_parameters(("per_channel", None, -1))
+    @parameterized.named_parameters(
+        ("per_channel", None, -1),
+        ("int4_g128", None, 128),
+        ("awq", "awq", 128),
+        ("gptq_one_group", "gptq", -1),
+    )
     @pytest.mark.skipif(
         backend.backend() != "jax"
         or Version(jaxlib.__version__) < Version("0.11.2"),
@@ -628,7 +642,9 @@ class N5Test(testing.TestCase):
         variables passed as arguments as `predict` passes them, reserves
         less temp memory than two layers of float32 weights. Without the
         barrier of `_wait_for_inputs`, XLA unpacks the codes of every
-        layer at the start of the program and keeps them live: 32 MiB."""
+        layer at the start of the program and keeps them live: 32 MiB.
+        The grouped layers have no guard, whose `cond` also kept the work
+        of each layer in its place."""
         k = n = 1024
         chain, state = [], []
         for seed in range(8):
@@ -717,6 +733,261 @@ class N5Test(testing.TestCase):
                 )
         finally:
             torch.distributed.destroy_process_group()
+
+
+# Modes whose mode fixes the groups, so that their view has no `g_idx`:
+# `None` is int4.
+FIXED = (None, "awq", "gptq_per_channel")
+
+
+def _quantized(case, mode):
+    return _layer(case) if mode is None else _calibrated(case, mode)
+
+
+def _other_groups(layer):
+    """The groups of the layer's `g_idx` in another order."""
+    groups = np.asarray(_numpy(layer.g_idx))
+    if not groups.any():
+        groups[:3] = [1.0, 2.0, 3.0]
+        return groups
+    return np.random.default_rng(3).permutation(groups)
+
+
+def _set_g_idx(layer, g_idx):
+    weights = layer.get_weights()
+    weights[[v.name for v in layer.weights].index("g_idx")] = g_idx
+    layer.set_weights(weights)
+
+
+def _model(layer, case):
+    return models.Sequential([layers.Input(case[2][1:]), layer])
+
+
+class GroupIndexTest(testing.TestCase):
+    """int4, AWQ and GPTQ with one group fix their groups, so their view
+    has no `g_idx`, no path reads the stored one, and no route needs the
+    guard. GPTQ with several groups reads `g_idx` and keeps the guard on
+    the value of each call."""
+
+    @parameterized.named_parameters(
+        ("int4", None), ("awq", "awq"), ("gptq_one_group", "gptq_per_channel")
+    )
+    def test_no_path_reads_the_stored_g_idx(self, mode):
+        """A write that skips `assign` (a torch `load_state_dict`, a TF
+        checkpoint restore, an NNX update) can put other groups into the
+        stored `g_idx`. It changes neither the reference path nor N5, bit
+        for bit."""
+        case = ROUTABLE["dense"]
+        layer = _quantized(case, mode)
+        x = _random(case[2])
+        self.assertIsNone(layer._quantized_weight().g_idx)
+        outputs = []
+        for g_idx in (None, _other_groups(layer)):
+            if g_idx is not None:
+                layer.g_idx._direct_assign(
+                    ops.convert_to_tensor(g_idx, "float32")
+                )
+            with kernels.policy("off"):
+                reference = _numpy(layer(x))
+            with kernels.force_route("n5"):
+                self.assertEqual(_counts(layer, x), {"n5": 1})
+                outputs.append((reference, _numpy(layer(x))))
+        self.assertAllEqual(outputs[1][0], outputs[0][0])
+        self.assertAllEqual(outputs[1][1], outputs[0][1])
+
+    @pytest.mark.skipif(backend.backend() != "jax", reason="Reads a jaxpr.")
+    def test_jit_traces_the_guard_only_where_g_idx_is_read(self):
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        for mode in FIXED + ("gptq", "gptq_act_order"):
+            layer = _quantized(case, mode)
+            with kernels.force_route("n5"):
+                jaxpr = str(jax.make_jaxpr(lambda v: layer(v))(x))
+            guarded = mode in ("gptq", "gptq_act_order")
+            self.assertEqual(
+                layer._quantized_weight().g_idx is not None, guarded
+            )
+            self.assertEqual("cond[" in jaxpr, guarded, msg=mode)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Runs `stateless_call` in `jit`."
+    )
+    def test_stateless_call_reads_the_g_idx_it_is_given(self):
+        """GPTQ: the guard reads the `g_idx` of the call on the device.
+        The state of an activation-order model, given to a layer whose own
+        groups are contiguous, gives the output of the reference path, in
+        an eager call and under `jax.jit`."""
+        case = ROUTABLE["dense"]
+        source = _calibrated(case, "gptq_act_order")
+        layer = _calibrated(case, "gptq")
+        self.assertTrue(_contiguous(layer))
+        self.assertFalse(_contiguous(source))
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+        state = [v.value for v in source.non_trainable_variables]
+
+        def call(state, v):
+            return layer.stateless_call([], state, v)[0]
+
+        with kernels.force_route("n5"):
+            eager = _numpy(call(state, x))
+            jitted = _numpy(jax.jit(call)(state, x))
+        for y in (eager, jitted):
+            self.assertTrue(np.all(np.isfinite(y)))
+            self.assertAllEqual(y, expected)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Compiles a JAX executable."
+    )
+    def test_compiled_executable_after_a_write(self):
+        """An executable compiled before a write. For GPTQ, after a
+        `set_weights` from an activation-order model, it gives the output
+        of the reference path. For int4, AWQ and GPTQ with one group, the
+        write of other groups raises and the output does not change."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        source = _calibrated(case, "gptq_act_order")
+        for mode in FIXED + ("gptq",):
+            layer = _quantized(case, mode)
+
+            def call(state, v):
+                return layer.stateless_call([], state, v)[0]
+
+            def state():
+                return [v.value for v in layer.non_trainable_variables]
+
+            with kernels.force_route("n5"):
+                compiled = jax.jit(call).lower(state(), x).compile()
+            with kernels.policy("off"):
+                reference = jax.jit(call).lower(state(), x).compile()
+            before = _numpy(compiled(state(), x))
+            if mode == "gptq":
+                layer.set_weights(source.get_weights())
+                y = _numpy(compiled(state(), x))
+                self.assertTrue(np.all(np.isfinite(y)))
+                self.assertAllClose(y, _numpy(reference(state(), x)))
+                self.assertNotAllClose(y, before)
+                continue
+            with self.assertRaisesRegex(ValueError, "k // "):
+                _set_g_idx(layer, _other_groups(layer))
+            self.assertAllEqual(_numpy(compiled(state(), x)), before)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Exports with `jax.export`."
+    )
+    def test_exported_artifact_with_other_state(self):
+        """A `jax.export` artifact of a GPTQ layer whose groups are
+        contiguous holds the guard, so the state of an activation-order
+        model gives the output of the reference path."""
+        case = ROUTABLE["dense"]
+        source = _calibrated(case, "gptq_act_order")
+        layer = _calibrated(case, "gptq")
+        x = _random(case[2])
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+
+        def call(state, v):
+            return layer.stateless_call([], state, v)[0]
+
+        state = [v.value for v in layer.non_trainable_variables]
+        specs = [jax.ShapeDtypeStruct(v.shape, v.dtype) for v in state]
+        x_spec = jax.ShapeDtypeStruct(x.shape, x.dtype)
+        with kernels.force_route("n5"):
+            exported = jax.export.export(jax.jit(call))(specs, x_spec)
+        source_state = [v.value for v in source.non_trainable_variables]
+        y = _numpy(exported.call(source_state, x))
+        self.assertTrue(np.all(np.isfinite(y)))
+        self.assertAllClose(y, expected)
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax" or not is_nnx_enabled(),
+        reason="Runs NNX updates.",
+    )
+    def test_nnx_update_with_other_state(self):
+        """`nnx.update` writes the state of another model without
+        `assign`. GPTQ with the state of an activation-order model gives
+        the output of the reference path, eager, under `nnx.jit` and in
+        `predict`. For int4 and AWQ, other groups in the stored `g_idx`
+        change no output."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        source = _model(_calibrated(case, "gptq_act_order"), case)
+        target = _model(_calibrated(case, "gptq"), case)
+        with kernels.policy("off"):
+            expected = _numpy(source(x))
+        nnx.update(target, nnx.state(source))
+        call = nnx.jit(lambda model, v: model(v))
+        with kernels.force_route("n5"):
+            outputs = (
+                _numpy(target(x)),
+                _numpy(call(target, x)),
+                target.predict(x, verbose=0),
+            )
+        for y in outputs:
+            self.assertTrue(np.all(np.isfinite(y)))
+            self.assertAllClose(y, expected)
+        for mode in (None, "awq"):
+            model = _model(_quantized(case, mode), case)
+            with kernels.force_route("n5"):
+                before = (_numpy(model(x)), _numpy(call(model, x)))
+            other = _model(_quantized(case, mode), case)
+            other_layer = other.layers[0]
+            other_layer.g_idx._direct_assign(
+                ops.convert_to_tensor(_other_groups(other_layer), "float32")
+            )
+            nnx.update(model, nnx.state(other))
+            self.assertAllEqual(
+                _numpy(model.layers[0].g_idx), _numpy(other_layer.g_idx)
+            )
+            with kernels.force_route("n5"):
+                self.assertAllEqual(_numpy(model(x)), before[0])
+                self.assertAllEqual(_numpy(call(model, x)), before[1])
+
+    @pytest.mark.skipif(
+        backend.backend() != "jax", reason="Counts JAX compilations."
+    )
+    def test_load_does_not_trace_other_models_again(self):
+        """A GPTQ load into one model compiles nothing again for another
+        model: no state outside the variables describes the groups."""
+        case = ROUTABLE["dense"]
+        x = _random(case[2])
+        model = _model(_layer(case), case)
+        model.predict(x, verbose=0)
+        saved = _model(_calibrated(case, "gptq_act_order"), case)
+        path = os.path.join(self.get_temp_dir(), "gptq.keras")
+        saved.save(path)
+        compiles = []
+
+        def count(event, duration_secs, **kwargs):
+            if event == "/jax/core/compile/backend_compile_duration":
+                compiles.append(duration_secs)
+
+        saving.load_model(path)
+        jax.monitoring.register_event_duration_secs_listener(count)
+        try:
+            model.predict(x, verbose=0)
+        finally:
+            jax.monitoring.unregister_event_duration_listener(count)
+        self.assertEqual(compiles, [])
+
+    def test_activation_order_round_trip(self):
+        """A saved GPTQ model in activation order loads its `g_idx`, and
+        N5 under the guard gives the output of the reference path."""
+        case = ROUTABLE["dense"]
+        layer = _calibrated(case, "gptq_act_order")
+        model = _model(layer, case)
+        path = os.path.join(self.get_temp_dir(), "act_order.keras")
+        model.save(path)
+        loaded = saving.load_model(path)
+        x = _random(case[2])
+        self.assertAllEqual(_numpy(loaded.layers[0].g_idx), _numpy(layer.g_idx))
+        with kernels.policy("off"):
+            expected = _numpy(model(x))
+        with kernels.force_route("n5"):
+            y = _numpy(loaded(x))
+        self.assertTrue(np.all(np.isfinite(y)))
+        self.assertAllEqual(y, expected)
 
 
 class FallbackTest(testing.TestCase):

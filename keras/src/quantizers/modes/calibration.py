@@ -391,19 +391,22 @@ class CalibrationStrategy(QuantizationStrategy):
         bits = self.resolve_weight_bits(layer, None)
         group_size = self.resolve_group_size(layer, None)
         view = geometry.contraction_view()
+        # `-1` means one group spanning every input row of a problem.
+        group = view.rows if group_size == -1 else group_size
+        # Where the mode fixes the groups, row `k` is in group `k // group`,
+        # and the view does not read the stored `g_idx`.
+        contiguous = self._contiguous_groups(view, group)
         return QuantizedWeight(
             codes=layer.quantized_kernel,
             scale=layer.kernel_scale,
             zero_point=layer.kernel_zero,
-            g_idx=layer.g_idx,
+            g_idx=None if contiguous else layer.g_idx,
             layout=self._get_pack_layout(bits, view.columns),
             scheme=WeightScheme(
                 code_range=(0, 2**bits - 1),
                 scale_form="multiplier",
                 has_zero_point=True,
-                # `-1` means one group spanning every input row of a
-                # problem.
-                group_size=view.rows if group_size == -1 else group_size,
+                group_size=group,
             ),
             shape=geometry.weight_shape,
             axis=0,

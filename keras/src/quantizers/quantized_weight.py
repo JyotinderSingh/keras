@@ -42,11 +42,14 @@ class WeightScheme:
             multiplier.
         has_zero_point: Whether a zero point is stored.
         group_size: Length of a group along the view's `axis` for a grouped
-            scale, or `None` for a per-channel or per-tensor scale. `g_idx`
-            is always authoritative: a group may be shorter, under GPTQ's
-            activation order the groups are not contiguous, and on a view
-            whose stored rows stack several problems the groups restart at
-            each problem, so each problem's last group may be shorter.
+            scale, or `None` for a per-channel or per-tensor scale. A view
+            with a `g_idx` reads the groups from it: a group may be
+            shorter, under GPTQ's activation order the groups are not
+            contiguous, and on a view whose stored rows stack several
+            problems the groups restart at each problem, so each problem's
+            last group may be shorter. A view with no `g_idx` puts position
+            `i` in group `i // group_size`, and only its last group may be
+            shorter.
     """
 
     code_range: tuple
@@ -240,20 +243,26 @@ class QuantizedWeight:
         shape: Shape of the weight the codes stand for.
         axis: For a grouped weight only: the axis of the unpacked codes
             its groups run along. The scale and zero point have one entry
-            per group along it, and `g_idx` maps each position on it to
-            its group. When the stored rows stack independent problems
+            per group along it, and `group_index()` gives the group of each
+            position on it. When the stored rows stack independent problems
             (the batch axis of a GPTQ or AWQ einsum kernel), the groups
             restart at each problem and are numbered across the problems,
             so the scale holds `batch * n_groups` rows and each problem's
-            last group may be shorter; `g_idx` is authoritative. An int4
-            einsum kernel never stacks problems: its batch axes are in the
-            columns.
+            last group may be shorter. Such a view gives `g_idx` unless
+            each problem holds whole groups. An int4 einsum kernel never
+            stacks problems: its batch axes are in the columns.
         permutation: Axis order of `shape` in which the codes are stored,
             or `None` for the weight's own order.
         zero_point: The stored zero point, given exactly when
             `scheme.has_zero_point`.
         g_idx: The stored group index, one entry per position along
-            `axis`, given exactly when `scheme.group_size` is set.
+            `axis`, for a grouped weight whose stored values give its
+            groups: GPTQ with several groups per problem, and stacked
+            problems with a partial last group. `None` for a grouped
+            weight whose mode fixes the groups (int4, AWQ, GPTQ with one
+            group per problem): position `i` is in group
+            `i // scheme.group_size`. `None` when the weight is not
+            grouped.
         input_scales: Optional scales with one entry per position along
             `axis`, divided out of the weight (AWQ's `awq_scales`). The
             codes, scale and zero point describe the weight multiplied by
@@ -286,13 +295,12 @@ class QuantizedWeight:
                 f"zero point. Received: scheme={scheme!r}, "
                 f"zero_point={'given' if zero_point is not None else None}"
             )
-        if (scheme.group_size is not None) != (g_idx is not None):
+        if scheme.group_size is None and g_idx is not None:
             raise ValueError(
-                "`g_idx` must be given exactly when the scheme is grouped. "
-                f"Received: scheme={scheme!r}, "
-                f"g_idx={'given' if g_idx is not None else None}"
+                "`g_idx` can be given only when the scheme is grouped. "
+                f"Received: scheme={scheme!r}, g_idx=given"
             )
-        if g_idx is not None:
+        if scheme.group_size is not None:
             if not isinstance(axis, int) or scale_axes is not None:
                 raise ValueError(
                     "A grouped weight needs the one `axis` its groups run "
@@ -350,6 +358,26 @@ class QuantizedWeight:
         return [
             name for name in _TENSOR_FIELDS if getattr(self, name) is not None
         ]
+
+    def group_index(self):
+        """Returns the group of each position along `axis`, as `int32`.
+
+        The stored `g_idx`, or `i // scheme.group_size` for position `i`
+        when the view has no `g_idx`.
+        """
+        if self.g_idx is not None:
+            return ops.cast(self.g_idx, "int32")
+        length = self.layout.unpacked_shape(self.codes.shape)[self.axis]
+        size = self.scheme.group_size
+        groups = -(-length // size)
+        # Each group number repeats `size` times. A Python number operand
+        # would become a tensor on each call: on torch, a copy from the
+        # host, which a CUDA graph capture refuses.
+        index = ops.broadcast_to(
+            ops.expand_dims(ops.arange(groups, dtype="int32"), 1),
+            (groups, size),
+        )
+        return ops.reshape(index, (-1,))[:length]
 
     def unpack(self):
         """Returns the integer codes in `shape`."""
@@ -414,12 +442,12 @@ class QuantizedWeight:
     def _dequantize_stored(self, dtype):
         """`dequantize(dtype)` in the stored coordinates."""
         codes = ops.cast(self.layout.unpack(self.codes), dtype)
-        if self.g_idx is not None:
+        if self.scheme.group_size is not None:
             weight = dequantize_with_sz_map(
                 codes,
                 self.scale,
                 self.zero_point,
-                self.g_idx,
+                self.group_index(),
                 group_axis=self.axis,
             )
         else:
@@ -446,7 +474,10 @@ class QuantizedWeight:
         that rounds outside `scheme.code_range` is a weight the stored
         parameters do not cover.
         """
-        if self.g_idx is None or self.scheme.scale_form != "multiplier":
+        if (
+            self.scheme.group_size is None
+            or self.scheme.scale_form != "multiplier"
+        ):
             raise NotImplementedError(
                 "`code_image` supports grouped multiplier schemes only. "
                 f"Received: scheme={self.scheme!r}"
@@ -456,7 +487,7 @@ class QuantizedWeight:
             input_scales = ops.cast(self.input_scales, "float32")
             image = ops.multiply(image, self._along_axis(input_scales, image))
         scales, zeros = _take_group_params(
-            self.scale, self.zero_point, self.g_idx, self.axis
+            self.scale, self.zero_point, self.group_index(), self.axis
         )
         image = ops.divide(image, ops.cast(scales, "float32"))
         return ops.add(image, ops.cast(zeros, "float32"))
