@@ -13,6 +13,7 @@ from keras.src.backend.common import standardize_dtype
 from keras.src.backend.common import standardize_shape
 from keras.src.backend.common.variables import AutocastScope
 from keras.src.backend.common.variables import shape_equal
+from keras.src.backend.common.variables import skip_assign_checks
 from keras.src.testing import test_case
 from keras.src.testing.test_utils import named_product
 
@@ -566,6 +567,47 @@ class VariableNumpyValueAndAssignmentTest(test_case.TestCase):
         v = backend.Variable(initializer=np.array([2.0, 3.0, 4.0]))
         r = v.assign_sub(np.array([1.0, 1.0, 1.0]))
         self.assertAllClose(r, np.array([1.0, 2.0, 3.0]))
+
+    def test_assign_check(self):
+        """`assign`, `assign_add` and `assign_sub` call `_assign_check`
+        with the converted value, before the write. A refused value leaves
+        the variable as it was. A stateless scope and
+        `skip_assign_checks()` call no check."""
+        seen = []
+
+        def refuse_negative(value):
+            seen.append(value)
+            if np.any(ops.convert_to_numpy(value) < 0):
+                raise ValueError("A negative value.")
+
+        v = backend.Variable(initializer=np.array([1.0, 2.0, 3.0]))
+        v._assign_check = refuse_negative
+        # A list of integers arrives as a tensor in the variable's dtype.
+        v.assign([4, 5, 6])
+        self.assertTrue(ops.is_tensor(seen[-1]))
+        self.assertEqual(standardize_dtype(seen[-1].dtype), v.dtype)
+        self.assertAllClose(v, [4.0, 5.0, 6.0])
+        for write in (
+            lambda: v.assign(np.array([-1.0, 0.0, 0.0])),
+            lambda: v.assign_add(np.array([-9.0, 0.0, 0.0])),
+            lambda: v.assign_sub(np.array([9.0, 0.0, 0.0])),
+        ):
+            with self.assertRaisesRegex(ValueError, "negative"):
+                write()
+            self.assertAllClose(v, [4.0, 5.0, 6.0])
+        calls = len(seen)
+        with backend.StatelessScope() as scope:
+            v.assign(np.array([-1.0, 0.0, 0.0]))
+        self.assertAllClose(scope.get_current_value(v), [-1.0, 0.0, 0.0])
+        with skip_assign_checks():
+            v.assign(np.array([-2.0, 0.0, 0.0]))
+        self.assertLen(seen, calls)
+        self.assertAllClose(v, [-2.0, 0.0, 0.0])
+        # The scope restores the state before it.
+        with self.assertRaisesRegex(ValueError, "negative"):
+            v.assign(np.array([-3.0, 0.0, 0.0]))
+        # A variable with no check.
+        self.assertIsNone(backend.Variable(initializer=1.0)._assign_check)
 
     def test_deferred_initialize_within_stateless_scope(self):
         """Test deferred init within a stateless scope."""

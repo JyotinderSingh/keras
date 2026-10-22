@@ -1,3 +1,5 @@
+import contextlib
+
 import numpy as np
 
 from keras.src import backend
@@ -90,6 +92,13 @@ class Variable:
     )
     ```
     """
+
+    # A callable that `assign` calls with the converted value of each write,
+    # before the write, outside a stateless scope and outside
+    # `skip_assign_checks()`. It raises to refuse the value. Quantization
+    # sets it on a group index whose value its mode fixes
+    # (`quantizers/modes/common.py`).
+    _assign_check = None
 
     def __init__(
         self,
@@ -294,6 +303,10 @@ class Variable:
             scope = get_stateless_scope()
             scope.add_update((self, value))
         else:
+            if self._assign_check is not None and not (
+                global_state.get_global_attribute("skip_assign_checks", False)
+            ):
+                self._assign_check(value)
             self._direct_assign(value)
         return value
 
@@ -550,6 +563,22 @@ class Variable:
     def __round__(self, ndigits=None):
         decimals = ndigits or 0
         return backend.ops.numpy.round(self.value, decimals=decimals)
+
+
+@contextlib.contextmanager
+def skip_assign_checks():
+    """Writes in the block skip `Variable._assign_check`.
+
+    The JAX trainer writes back the state that its compiled step returned.
+    A write inside the step is a traced write, which no check reads, so the
+    write-back has nothing to check, and it reads no value on the host.
+    """
+    previous = global_state.get_global_attribute("skip_assign_checks", False)
+    global_state.set_global_attribute("skip_assign_checks", True)
+    try:
+        yield
+    finally:
+        global_state.set_global_attribute("skip_assign_checks", previous)
 
 
 def register_uninitialized_variable(variable):

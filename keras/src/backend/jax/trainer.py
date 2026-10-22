@@ -11,6 +11,7 @@ from keras.src import optimizers as optimizers_module
 from keras.src import tree
 from keras.src.backend import config
 from keras.src.backend import distribution_lib as jax_distribution_lib
+from keras.src.backend.common.variables import skip_assign_checks
 from keras.src.backend.config import is_nnx_enabled
 from keras.src.distribution import distribution_lib
 from keras.src.trainers import trainer as base_trainer
@@ -967,20 +968,26 @@ class Trainer(base_trainer.BaseTrainer):
         )
         optimizer_variables = self._jax_state.get("optimizer_variables", None)
         metrics_variables = self._jax_state.get("metrics_variables", None)
-        if trainable_variables:
-            for ref_v, v in zip(self.trainable_variables, trainable_variables):
-                ref_v.assign(v)
-        if non_trainable_variables:
-            for ref_v, v in zip(
-                self.non_trainable_variables, non_trainable_variables
-            ):
-                ref_v.assign(v)
-        if optimizer_variables:
-            for ref_v, v in zip(self.optimizer.variables, optimizer_variables):
-                ref_v.assign(v)
-        if metrics_variables:
-            for ref_v, v in zip(self.metrics_variables, metrics_variables):
-                ref_v.assign(v)
+        # The writes inside the step were traced, so no check applies.
+        with skip_assign_checks():
+            if trainable_variables:
+                for ref_v, v in zip(
+                    self.trainable_variables, trainable_variables
+                ):
+                    ref_v.assign(v)
+            if non_trainable_variables:
+                for ref_v, v in zip(
+                    self.non_trainable_variables, non_trainable_variables
+                ):
+                    ref_v.assign(v)
+            if optimizer_variables:
+                for ref_v, v in zip(
+                    self.optimizer.variables, optimizer_variables
+                ):
+                    ref_v.assign(v)
+            if metrics_variables:
+                for ref_v, v in zip(self.metrics_variables, metrics_variables):
+                    ref_v.assign(v)
         self._jax_state_synced = True
 
     def jax_state_sync(self):
