@@ -97,8 +97,14 @@ POLICIES = {
 # compiles the code of sm_89 and has the same limit.
 SHARED_MEMORY = {(8, 0): 166912, (8, 9): 101376, (9, 0): 232448}
 POINTERS = {"bfloat16": "*bf16", "float16": "*fp16", "float32": "*fp32"}
-# (per-channel, signed): per-channel int4, grouped int4, GPTQ and AWQ.
-VARIANTS = ((True, True), (False, True), (False, False))
+# (per-channel, signed, AWQ): per-channel int4, grouped int4, GPTQ and
+# AWQ, which divides the activations in the kernel.
+VARIANTS = (
+    (True, True, False),
+    (False, True, False),
+    (False, False, False),
+    (False, False, True),
+)
 
 
 def _layer(case, mode, dtype="float32", bias=False, seed=0):
@@ -251,23 +257,24 @@ def _compile_jobs(capability):
 
     Each default row of `_CONFIGS` compiles with the largest K tile, 128,
     which needs the most shared memory: in float16 and in float32 (IEEE
-    and TF32 dots), for per-channel and grouped int4. A bfloat16 tile has
-    the bytes of a float16 tile, and GPTQ and AWQ codes have the bytes of
-    int4 codes. So bfloat16, GPTQ and AWQ compile with the K tile 32
-    only, as does split-K. Each row of the device compiles with its own K
-    tile, or 128 when it has none: a bfloat16 row in float16, and a row
-    with `None` in place of `G` per channel and grouped. The split-K sum
-    compiles for each output dtype with 4 splits, and with the splits of
-    each row of the device.
+    and TF32 dots), for per-channel int4, grouped int4 and AWQ. A
+    bfloat16 tile has the bytes of a float16 tile, and GPTQ codes have
+    the bytes of int4 codes. So bfloat16 and GPTQ compile with the K tile
+    32 only, as does split-K. Each row of the device compiles with its
+    own K tile, or 128 when it has none: a bfloat16 row in float16, for
+    grouped int4 and AWQ, and per channel for a row with `None` in place
+    of `G`. The split-K sum compiles for each output dtype with 4 splits,
+    and with the splits of each row of the device.
     """
     jobs = []
 
     def add(dtype, variant, config, precision="ieee"):
-        per_channel, signed = variant
+        per_channel, signed, awq = variant
         job = {
             "dtype": dtype,
             "per_channel": per_channel,
             "signed": signed,
+            "awq": awq,
             "precision": precision,
             "config": dataclasses.asdict(config),
         }
@@ -282,12 +289,12 @@ def _compile_jobs(capability):
     for (dtype, precision), m, variant in itertools.product(
         (("float16", "ieee"), ("float32", "ieee"), ("float32", "tf32")),
         (1, 17, 65, 257),
-        VARIANTS[:2],
+        VARIANTS[:2] + VARIANTS[3:],
     ):
         config = quantized.kernel_config(None, dtype, m, None)
         add(dtype, variant, dataclasses.replace(config, block_k=128), precision)
     for dtype, variant in itertools.product(POINTERS, VARIANTS):
-        if dtype == "bfloat16" or variant == VARIANTS[2]:
+        if dtype == "bfloat16" or variant in VARIANTS[2:]:
             config = quantized.kernel_config(None, dtype, 1, 32)
             add(dtype, variant, dataclasses.replace(config, block_k=32))
     config = quantized.kernel_config(None, "float32", 1, 32)
@@ -302,7 +309,10 @@ def _compile_jobs(capability):
             add_sum(dtype, config.split_k)
         config = dataclasses.replace(config, block_k=config.block_k or 128)
         dtype = "float16" if dtype == "bfloat16" else dtype
-        for variant in VARIANTS[:2] if group is None else VARIANTS[1:2]:
+        variants = [VARIANTS[1], VARIANTS[3]]
+        if group is None:
+            variants.insert(0, VARIANTS[0])
+        for variant in variants:
             add(dtype, variant, config)
     return jobs
 
@@ -349,13 +359,14 @@ def _compile_for_cuda(capability, jobs):
         codes = "*i8" if job["signed"] else "*u8"
         per_channel = job["per_channel"]
         # Per-channel int4 passes its scale as the zero point and as the
-        # group index.
+        # group index. A call without AWQ passes `x` as the input scales.
         signature = {
             "x_ptr": x,
             "codes_ptr": codes,
             "scale_ptr": x,
             "zero_ptr": x if per_channel else codes,
             "g_idx_ptr": x if per_channel else "*fp32",
+            "awq_ptr": x,
             "y_ptr": "*fp32" if config.split_k > 1 else x,
             "M": "i32",
             "N": "i32",
@@ -371,6 +382,7 @@ def _compile_for_cuda(capability, jobs):
         constants = {
             "XOR": 8 if job["signed"] else 0,
             "PER_CHANNEL": per_channel,
+            "HAS_AWQ": job["awq"],
             "UPCAST_DOT": False,
             "INPUT_PRECISION": job["precision"],
             "SPLIT_K": config.split_k,
@@ -509,20 +521,25 @@ class W4A16MatmulTest(testing.TestCase):
         self.assertEqual(empty.dtype, torch.float32)
 
     @parameterized.named_parameters(
-        ("float32", "float32", 1),
-        ("float16", "float16", 1),
-        ("bfloat16", "bfloat16", 1),
-        ("float16_split_k", "float16", 4),
+        ("float32", "float32", 1, "int4_g32"),
+        ("float16", "float16", 1, "int4_g32"),
+        ("bfloat16", "bfloat16", 1, "int4_g32"),
+        ("float16_split_k", "float16", 4, "int4_g32"),
+        ("awq_float16_split_k", "float16", 4, "awq_g64"),
     )
-    def test_op_registration(self, dtype, split_k):
+    def test_op_registration(self, dtype, split_k, mode):
         """The schema and the fake implementation of the custom op."""
-        layer = _layer("dense_decode", "int4_g32", dtype)
+        layer = _layer("dense_decode", mode, dtype)
         view = _view(layer)
         x = ops.convert_to_tensor(_inputs("dense_decode"), layer.compute_dtype)
         tensors = (x, view.codes, view.scale, view.zero_point, view.g_idx)
-        # group size, signed, per-channel, the blocks, warps, stages,
-        # split-K, input precision, upcast.
-        options = (32, True, False, 16, 32, 32, 4, 3, split_k, "ieee", False)
+        # The input scales (`None` without AWQ), then the group size,
+        # signed, per-channel, the blocks, warps, stages, split-K, input
+        # precision and upcast.
+        group_size = view.scheme.group_size
+        signed = view.codes.dtype == torch.int8
+        options = (view.input_scales, group_size, signed, False, 16, 32, 32)
+        options += (4, 3, split_k, "ieee", False)
         torch.library.opcheck(
             torch.ops.keras.w4a16_matmul.default,
             tensors + options,

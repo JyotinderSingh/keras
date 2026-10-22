@@ -28,7 +28,9 @@ loop, one check reads the `g_idx` rows of all these tiles:
   gives `d = q - XOR`, and the epilogue divides each column by its scale.
 
 No loop body has a runtime branch, so the compiler can pipeline the
-loads of the next tiles.
+loads of the next tiles. For AWQ, both loops divide each activation tile
+by the input scales, in float32 with IEEE rounding, and round each
+quotient to the compute dtype.
 
 The epilogue interleaves the two accumulators into column order, casts to
 the compute dtype and stores with a column mask. With split-K, each split
@@ -87,13 +89,17 @@ _CONFIGS = {
     (None, None, "1-16", None): KernelConfig(16, 32, num_stages=4),
     (None, None, "17-64", None): KernelConfig(32, 32),
     (None, None, "65-256", None): KernelConfig(64, 64),
-    (None, None, "257+", None): KernelConfig(128, 64),
+    # AWQ also stages its divided activation tile. With 128 rows of `x`,
+    # float16 AWQ needs 120.5 KB on sm_89, and one block has 99 KB.
+    (None, None, "257+", None): KernelConfig(64, 64),
     # A float32 tile needs two times the shared memory of a 16-bit tile.
     # With a K tile of 128, these rows fit in the 99 KB of one block on
-    # sm_86 and sm_89. The general loop also stages its scale and zero
-    # point tiles: with 64 rows of `x`, it needs 108 KB on sm_89.
-    (None, "float32", "65-256", None): KernelConfig(32, 32, num_stages=2),
-    (None, "float32", "257+", None): KernelConfig(32, 32, num_stages=2),
+    # sm_86 and sm_89. The general loop stages its scale and zero point
+    # tiles, and AWQ its divided activation tile: with `BNH` 32, float32
+    # AWQ needs 108.5 KB on sm_89.
+    (None, "float32", "17-64", None): KernelConfig(32, 16, num_stages=2),
+    (None, "float32", "65-256", None): KernelConfig(32, 16, num_stages=2),
+    (None, "float32", "257+", None): KernelConfig(32, 16, num_stages=2),
     # sm_89 rows from the sweeps on an RTX 4090: t1a-20261022-2 (bfloat16)
     # and t1b-20261022-2 (float16, decode). The float16 prefill rows take
     # the bfloat16 values: the tiles have the same bytes. Split-K is on at
@@ -197,17 +203,19 @@ def w4a16_matmul(
         signed: Whether the codes are int8 (sign-extended nibbles).
         per_channel: Whether the weight is per-channel int4.
         config: A `KernelConfig`, or `None` for the row of `_CONFIGS`.
-        awq_scales: AWQ's `(K,)` input scales. The activations are
-            divided by them in the dtype of `x`.
+        awq_scales: AWQ's `(K,)` input scales. The kernel divides the
+            activations by them in the dtype of `x`: it rounds the scales
+            to that dtype, divides in float32 with IEEE rounding, and
+            rounds each quotient once to that dtype.
         upcast_dot: For the interpreter tests only: casts both dot
             operands to float32. The Triton interpreter computes a wrong
             bfloat16 `tl.dot`, so with this switch it checks every
-            bfloat16 step except the bfloat16 dot itself.
+            bfloat16 step except the bfloat16 dot itself. The switch also
+            rounds AWQ's quotients to bfloat16 to the nearest value, as a
+            GPU does: the interpreter rounds them toward zero.
     """
     if triton is None:
         raise ImportError("`w4a16_matmul` requires Triton.")
-    if awq_scales is not None:
-        x = x / awq_scales.to(x.dtype)
     m, k = x.shape
     n = scale.shape[-1]
     if m == 0:
@@ -225,12 +233,15 @@ def w4a16_matmul(
     if per_channel:
         # The kernel reads no zero point and no group index.
         zero, g_idx, group_size = scale, scale, k
+    if awq_scales is not None:
+        awq_scales = awq_scales.contiguous()
     return torch.ops.keras.w4a16_matmul(
         x.contiguous(),
         codes.contiguous(),
         scale.contiguous(),
         zero.contiguous(),
         g_idx.contiguous(),
+        awq_scales,
         group_size,
         signed,
         per_channel,
@@ -257,12 +268,37 @@ if triton is not None:
         )
 
     @triton.jit
+    def _round(v, dtype: tl.constexpr, BY_HAND: tl.constexpr):
+        # A float32 to `dtype`, to the nearest value. The Triton
+        # interpreter rounds a float32 to bfloat16 toward zero. So with
+        # `BY_HAND` (the interpreter tests), integer operations first round
+        # to the nearest bfloat16 (ties to even), and the cast is exact.
+        if BY_HAND and dtype == tl.bfloat16:
+            bits = v.to(tl.uint32, bitcast=True)
+            bits = (bits + 0x7FFF + ((bits >> 16) & 1)) & 0xFFFF0000
+            v = bits.to(tl.float32, bitcast=True)
+        return v.to(dtype)
+
+    @triton.jit
+    def _divide_by_awq(x, awq_ptr, ks, k_mask, UPCAST_DOT: tl.constexpr):
+        # AWQ's divide of the activations. The scales round to the dtype of
+        # `x`, and the quotient rounds once to that dtype. `div_rn` has
+        # IEEE rounding, as torch has: Triton's `/` on float32 gives
+        # `div.full.f32`, which is an approximation.
+        dtype = x.dtype
+        s = tl.load(awq_ptr + ks, mask=k_mask, other=1.0).to(tl.float32)
+        s = _round(s, dtype, UPCAST_DOT).to(tl.float32)
+        x = tl.math.div_rn(x.to(tl.float32), s[None, :])
+        return _round(x, dtype, UPCAST_DOT)
+
+    @triton.jit
     def _w4a16_kernel(
         x_ptr,
         codes_ptr,
         scale_ptr,
         zero_ptr,
         g_idx_ptr,
+        awq_ptr,
         y_ptr,
         M,
         N,
@@ -272,6 +308,7 @@ if triton is not None:
         NH,
         XOR: tl.constexpr,
         PER_CHANNEL: tl.constexpr,
+        HAS_AWQ: tl.constexpr,
         UPCAST_DOT: tl.constexpr,
         INPUT_PRECISION: tl.constexpr,
         SPLIT_K: tl.constexpr,
@@ -338,19 +375,27 @@ if triton is not None:
                     mask=row_mask[:, None] & k_mask[None, :],
                     other=0.0,
                 )
+                if HAS_AWQ:
+                    x = _divide_by_awq(x, awq_ptr, ks, k_mask, UPCAST_DOT)
                 b = tl.load(
                     codes_ptr + ks[:, None] * NH + bytes_[None, :],
                     mask=k_mask[:, None] & (bytes_ < NH)[None, :],
                     other=0,
                 ).to(tl.int32)
-                even = (b & 15) ^ XOR
-                odd = ((b >> 4) & 15) ^ XOR
-                # An integer goes to the dot dtype through float32, which
-                # holds it exactly: the Triton interpreter converts an int32
-                # to a wrong bfloat16.
+                # `q | 0x4B000000` is the bit pattern of the float32
+                # `2^23 + q`, so a bitcast replaces the conversion of the
+                # integer. The subtraction of `2^23 + z'` is exact, and so
+                # is the cast of `q - z'` to the dot dtype. (The Triton
+                # interpreter converts an int32 to a wrong bfloat16.)
+                f_even = (((b & 15) ^ XOR) | 0x4B000000).to(
+                    tl.float32, bitcast=True
+                )
+                f_odd = ((((b >> 4) & 15) ^ XOR) | 0x4B000000).to(
+                    tl.float32, bitcast=True
+                )
                 if PER_CHANNEL:
-                    d_even = (even - XOR).to(tl.float32).to(dtype)
-                    d_odd = (odd - XOR).to(tl.float32).to(dtype)
+                    d_even = (f_even - (8388608.0 + XOR)).to(dtype)
+                    d_odd = (f_odd - (8388608.0 + XOR)).to(dtype)
                     acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
                     acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
                 else:
@@ -365,12 +410,12 @@ if triton is not None:
                     s_row_even, s_row_odd = tl.split(
                         tl.reshape(s_row.to(tl.float32), (BNH, 2))
                     )
+                    z_row = z_row.to(tl.float32) + (8388608.0 + XOR)
                     z_row_even, z_row_odd = tl.split(
-                        tl.reshape(z_row.to(tl.int32) + XOR, (BNH, 2))
+                        tl.reshape(z_row, (BNH, 2))
                     )
-                    d_even = (even - z_row_even[None, :]).to(tl.float32)
-                    d_odd = (odd - z_row_odd[None, :]).to(tl.float32)
-                    d_even, d_odd = d_even.to(dtype), d_odd.to(dtype)
+                    d_even = (f_even - z_row_even[None, :]).to(dtype)
+                    d_odd = (f_odd - z_row_odd[None, :]).to(dtype)
                     partial = _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
                     acc_even += partial * s_row_even[None, :]
                     partial = _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
@@ -385,6 +430,8 @@ if triton is not None:
                     mask=row_mask[:, None] & k_mask[None, :],
                     other=0.0,
                 )
+                if HAS_AWQ:
+                    x = _divide_by_awq(x, awq_ptr, ks, k_mask, UPCAST_DOT)
                 b = tl.load(
                     codes_ptr + ks[:, None] * NH + bytes_[None, :],
                     mask=k_mask[:, None] & (bytes_ < NH)[None, :],
@@ -412,8 +459,11 @@ if triton is not None:
                 acc_odd += _dot(x, w_odd, UPCAST_DOT, INPUT_PRECISION)
         acc = tl.interleave(acc_even, acc_odd)
         if PER_CHANNEL:
+            # `div_rn` has IEEE rounding, as the reference path has.
+            # Triton's `/` on float32 gives `div.full.f32`, which is an
+            # approximation.
             s = tl.load(scale_ptr + columns, mask=column_mask, other=1.0)
-            acc = acc / s.to(tl.float32)[None, :]
+            acc = tl.math.div_rn(acc, s.to(tl.float32)[None, :])
         if SPLIT_K > 1:
             # `y_ptr` is the `(SPLIT_K, M, N)` float32 workspace. Its offsets
             # can pass 2^31, so they are int64.
@@ -448,6 +498,7 @@ if triton is not None:
         scale: torch.Tensor,
         zero: torch.Tensor,
         g_idx: torch.Tensor,
+        awq_scales: torch.Tensor | None,
         group_size: int,
         signed: bool,
         per_channel: bool,
@@ -462,6 +513,9 @@ if triton is not None:
     ) -> torch.Tensor:
         m, k = x.shape
         n = scale.shape[-1]
+        has_awq = awq_scales is not None
+        # Without AWQ, the kernel reads no input scales.
+        awq = awq_scales if has_awq else x
         y = x.new_empty((m, n))
         out = y
         if split_k > 1:
@@ -483,6 +537,7 @@ if triton is not None:
                 scale,
                 zero,
                 g_idx,
+                awq,
                 out,
                 m,
                 n,
@@ -492,6 +547,7 @@ if triton is not None:
                 codes.shape[1],
                 XOR=8 if signed else 0,
                 PER_CHANNEL=per_channel,
+                HAS_AWQ=has_awq,
                 UPCAST_DOT=upcast_dot,
                 INPUT_PRECISION=input_precision,
                 SPLIT_K=split_k,
