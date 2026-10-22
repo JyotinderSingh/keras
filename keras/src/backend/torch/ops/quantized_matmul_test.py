@@ -402,6 +402,11 @@ def _compile_for_cuda(capability, jobs):
             "n_groups": "i32",
             "group_size": "i32",
             "NH": "i32",
+            # `w4a16_matmul` passes zeros: it reads no strides.
+            "stride_cb": "i32",
+            "stride_cn": "i32",
+            "stride_sg": "i32",
+            "stride_sn": "i32",
         }
         divisible = {
             (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
@@ -410,6 +415,7 @@ def _compile_for_cuda(capability, jobs):
         constants = {
             "XOR": 8 if job["signed"] else 0,
             "PER_CHANNEL": per_channel,
+            "PACK_K": False,
             "UPCAST_DOT": False,
             "INPUT_PRECISION": job["precision"],
             "SPLIT_K": config.split_k,
