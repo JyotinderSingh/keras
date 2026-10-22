@@ -163,6 +163,26 @@ def _reference(layer, geometry, quantized_weight, inputs, config=None):
     return geometry.contract(inputs, float_kernel)
 
 
+def _wait_for_inputs(inputs, view):
+    """Under a JAX trace, makes the work on the weight wait for `inputs`.
+
+    The work on the weight alone (the unpacked and cast codes of N5) does
+    not depend on the inputs. Without a barrier, XLA runs it for every
+    layer of a program at the start and keeps each result live: on CPU,
+    a chain of 8 int4 layers of 1024 x 1024 then reserves 32 MiB of temp
+    memory in place of 4 MiB. One `jax.lax.optimization_barrier` over the
+    inputs and the tensors of the weight orders the work after the
+    inputs. Outside a JAX trace, the inputs and the view return as they
+    are.
+    """
+    if backend.backend() != "jax" or not isinstance(inputs, jax.core.Tracer):
+        return inputs, view
+    inputs, tensors = jax.lax.optimization_barrier(
+        (inputs, view.read_tensors())
+    )
+    return inputs, view.with_tensors(tensors)
+
+
 def _sum_then_scale(layer, geometry, quantized_weight, inputs, config=None):
     """N5: the `(M, K)` inputs against the 4-bit codes, scaled per group.
 
@@ -172,9 +192,11 @@ def _sum_then_scale(layer, geometry, quantized_weight, inputs, config=None):
     small integers `q - z`, so each product is exact. The group scale
     multiplies the partial sum of its group. Per-channel int4 is one group
     with no zero point, and its scale divides the result. AWQ divides the
-    inputs by its input scales in the compute dtype.
+    inputs by its input scales in the compute dtype. Under a JAX trace,
+    the work on the weight waits for the inputs (`_wait_for_inputs`).
     """
-    view, dtype = quantized_weight, layer.compute_dtype
+    inputs, view = _wait_for_inputs(inputs, quantized_weight)
+    dtype = layer.compute_dtype
     rows, columns = view.codes.shape[0], view.layout.orig_len
     grouped = view.g_idx is not None
     groups = rows // min(view.scheme.group_size, rows) if grouped else 1
