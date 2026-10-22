@@ -256,7 +256,9 @@ def _compile_jobs(capability):
     int4 codes. So bfloat16, GPTQ and AWQ compile with the K tile 32
     only, as does split-K. Each row of the device compiles with its own K
     tile, or 128 when it has none: a bfloat16 row in float16, and a row
-    with `None` in place of `G` per channel and grouped.
+    with `None` in place of `G` per channel and grouped. The split-K sum
+    compiles for each output dtype with 4 splits, and with the splits of
+    each row of the device.
     """
     jobs = []
 
@@ -269,6 +271,11 @@ def _compile_jobs(capability):
             "precision": precision,
             "config": dataclasses.asdict(config),
         }
+        if job not in jobs:
+            jobs.append(job)
+
+    def add_sum(dtype, split_k):
+        job = {"kernel": "splitk_sum", "dtype": dtype, "split_k": split_k}
         if job not in jobs:
             jobs.append(job)
 
@@ -286,9 +293,13 @@ def _compile_jobs(capability):
     config = quantized.kernel_config(None, "float32", 1, 32)
     config = dataclasses.replace(config, block_k=32, split_k=4)
     add("float32", VARIANTS[2], config)
+    for dtype in POINTERS:
+        add_sum(dtype, 4)
     for (device, dtype, _, group), config in quantized._CONFIGS.items():
         if device != capability:
             continue
+        if config.split_k > 1:
+            add_sum(dtype, config.split_k)
         config = dataclasses.replace(config, block_k=config.block_k or 128)
         dtype = "float16" if dtype == "bfloat16" else dtype
         for variant in VARIANTS[:2] if group is None else VARIANTS[1:2]:
@@ -297,7 +308,8 @@ def _compile_jobs(capability):
 
 
 def _compile_for_cuda(capability, jobs):
-    """Compiles `_w4a16_kernel` for a CUDA device, on any host.
+    """Compiles `_w4a16_kernel` and `_splitk_sum` for a CUDA device, on
+    any host.
 
     A subprocess with `TRITON_INTERPRET=0` runs it, so that `triton.jit`
     gives a kernel that compiles. The Triton wheel holds `ptxas`, so no
@@ -306,10 +318,32 @@ def _compile_for_cuda(capability, jobs):
     multiples of 16), which needs the most shared memory. Prints the
     shared memory of each job, in bytes, as a JSON list.
     """
-    kernel = quantized._w4a16_kernel
     target = GPUTarget("cuda", 10 * capability[0] + capability[1], 32)
     shared = []
     for job in jobs:
+        if job.get("kernel") == "splitk_sum":
+            kernel = quantized._splitk_sum
+            signature = {
+                "ws_ptr": "*fp32",
+                "y_ptr": POINTERS[job["dtype"]],
+                "MN": "i32",
+            }
+            constants = {
+                "SPLIT_K": job["split_k"],
+                "BLOCK": quantized._SUM_BLOCK,
+            }
+            divisible = {
+                (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
+                for name in signature
+            }
+            signature.update(dict.fromkeys(constants, "constexpr"))
+            compiled = quantized.triton.compile(
+                ASTSource(kernel, signature, constants, divisible),
+                target=target,
+            )
+            shared.append(compiled.metadata.shared)
+            continue
+        kernel = quantized._w4a16_kernel
         config = quantized.KernelConfig(**job["config"])
         x = POINTERS[job["dtype"]]
         codes = "*i8" if job["signed"] else "*u8"

@@ -31,8 +31,10 @@ No loop body has a runtime branch, so the compiler can pipeline the
 loads of the next tiles.
 
 The epilogue interleaves the two accumulators into column order, casts to
-the compute dtype and stores with a column mask. The kernel is forward
-only: its caller runs it inside a custom gradient.
+the compute dtype and stores with a column mask. With split-K, each split
+stores its float32 partial, and a second kernel in the same op adds the
+partials in a fixed order and casts the sum once. The kernels are
+forward only: their caller runs them inside a custom gradient.
 
 Triton ships with torch on Linux. Where it does not import, this module
 has no kernel.
@@ -53,6 +55,8 @@ except ImportError:
 
 # The largest M of each bucket; a larger M is in the bucket "257+".
 _M_BUCKETS = ((16, "1-16"), (64, "17-64"), (256, "65-256"))
+# The outputs of one program of the split-K sum.
+_SUM_BLOCK = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,6 +319,16 @@ if triton is not None:
         # general loop holds tiles, so their names are different. The
         # interpreter does not check this.
         if uniform:
+            if not PER_CHANNEL:
+                # The pipeliner stages only the loads of dot operands, and
+                # the scale multiplies a dot result. So the loop loads the
+                # scale row of the next tile one tile ahead. A program with
+                # no tiles reads no row.
+                s_next = tl.load(
+                    scale_ptr + first * BK // group_size * N + columns,
+                    column_mask & (first < last),
+                    other=0.0,
+                )
             for tile in tl.range(first, last):
                 k0 = tile * BK
                 ks = k0 + tl.arange(0, BK)
@@ -341,8 +355,12 @@ if triton is not None:
                     acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
                 else:
                     # The scale and the zero row of the group of the tile.
+                    s_row = s_next
+                    group = tl.minimum(tile + 1, last - 1) * BK // group_size
+                    s_next = tl.load(
+                        scale_ptr + group * N + columns, column_mask, other=0.0
+                    )
                     row = k0 // group_size * N + columns
-                    s_row = tl.load(scale_ptr + row, column_mask, other=0.0)
                     z_row = tl.load(zero_ptr + row, column_mask, other=0)
                     s_row_even, s_row_odd = tl.split(
                         tl.reshape(s_row.to(tl.float32), (BNH, 2))
@@ -407,6 +425,22 @@ if triton is not None:
             mask=row_mask[:, None] & column_mask[None, :],
         )
 
+    @triton.jit
+    def _splitk_sum(
+        ws_ptr, y_ptr, MN, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr
+    ):
+        # The sum of the `(SPLIT_K, M, N)` float32 partials, in the order
+        # 0 to `SPLIT_K - 1`, with one cast to the dtype of `y_ptr`. The
+        # offsets of a split can pass 2^31, so they are int64. `tl.cast`
+        # also takes `MN = 1`, which a launch gives as a constant.
+        offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+        mask = offsets < MN
+        acc = tl.load(ws_ptr + offsets, mask=mask, other=0.0)
+        for s in tl.static_range(1, SPLIT_K):
+            step = s * tl.cast(MN, tl.int64)
+            acc += tl.load(ws_ptr + step + offsets, mask=mask, other=0.0)
+        tl.store(y_ptr + offsets, acc.to(y_ptr.dtype.element_ty), mask=mask)
+
     @torch.library.triton_op("keras::w4a16_matmul", mutates_args=())
     def _w4a16_matmul(
         x: torch.Tensor,
@@ -428,10 +462,11 @@ if triton is not None:
     ) -> torch.Tensor:
         m, k = x.shape
         n = scale.shape[-1]
+        y = x.new_empty((m, n))
+        out = y
         if split_k > 1:
-            y = x.new_empty((split_k, m, n), dtype=torch.float32)
-        else:
-            y = x.new_empty((m, n))
+            # The float32 partials of the splits.
+            out = x.new_empty((split_k, m, n), dtype=torch.float32)
         grid = (
             triton.cdiv(m, block_m),
             triton.cdiv(codes.shape[1], block_nh),
@@ -448,7 +483,7 @@ if triton is not None:
                 scale,
                 zero,
                 g_idx,
-                y,
+                out,
                 m,
                 n,
                 k,
@@ -466,9 +501,11 @@ if triton is not None:
                 num_warps=num_warps,
                 num_stages=num_stages,
             )
-        if split_k > 1:
-            # A sum in a fixed order: the result is deterministic.
-            y = torch.sum(y, dim=0).to(x.dtype)
+            if split_k > 1:
+                # A sum in a fixed order: the result is deterministic.
+                torch.library.wrap_triton(_splitk_sum)[
+                    (triton.cdiv(m * n, _SUM_BLOCK),)
+                ](out, y, m * n, SPLIT_K=split_k, BLOCK=_SUM_BLOCK)
         return y
 
     @_w4a16_matmul.register_fake
