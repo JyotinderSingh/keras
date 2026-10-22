@@ -1,3 +1,5 @@
+# The version check must run before the other modules use newer torch APIs.
+from keras.src.backend.torch import version_check  # isort: skip
 from keras.src.backend.common.name_scope import name_scope
 from keras.src.backend.torch import distribution_lib
 from keras.src.backend.torch import ops
