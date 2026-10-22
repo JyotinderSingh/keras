@@ -656,10 +656,12 @@ def run_lookup_route(route, layer, table, orientation, inputs):
 
 
 # Triton K1 (torch with CUDA): `backend.ops.quantized.w4a16_matmul`, a
-# `matrix` route. It is in `_ROUTES` only where Triton imports, and it has
-# no allow-list row until the GPU sessions measure one. It is the kernel of
-# `"require"` on a CUDA device (device type "gpu" in `list_devices`), but
-# not on ROCm, where `pytorch-triton-rocm` imports as `triton`.
+# `matrix` route. Its K-packed variant `w4a16_logits` is the reverse lookup
+# route of the same name. They are in `_ROUTES` and `_LOOKUP_ROUTES` only
+# where Triton imports, and they have no allow-list row until the GPU
+# sessions measure one. They are the kernels of `"require"` on a CUDA
+# device (device type "gpu" in `list_devices`), but not on ROCm, where
+# `pytorch-triton-rocm` imports as `triton`.
 # The Triton releases that a run under `"require"` passed on (GPU CI or a
 # pod).
 TRITON_TESTED = ("3.8",)
@@ -714,11 +716,54 @@ def _triton_available(m, k, n, view):
     return False
 
 
+def _triton_logits(layer, table, orientation, inputs, config=None):
+    """Triton K-packed: the `(M, D)` inputs with the stored 4-bit table."""
+    return backend.ops.quantized.w4a16_logits(
+        inputs,
+        table.codes,
+        table.scale,
+        table.zero_point,
+        group_size=table.scheme.group_size,
+        per_channel=table.g_idx is None,
+        orientation=orientation,
+        config=config,
+    )
+
+
+def _triton_logits_available(m, d, v, table):
+    """Gate 5 of the Triton logits: the alignment, K tiles in one group,
+    and the gate of K1 on compute capability 8.0 or newer.
+
+    `D` and `V` must be multiples of 128. A K tile is a power of two from
+    32 to 128 rows of `D`, and it must lie in one group. So a grouped
+    table has groups of 128 or 256 rows, or one group (`G >= D`). On
+    compute capability 7.5, the gate refuses the call, also under
+    `"require"`, and the call takes the reference path. The gate of K1
+    reads the dtype of the scale there, and the scale of a table reads
+    float32 in a model, because an `Embedding` does not autocast.
+    """
+    group = table.scheme.group_size
+    if d % 128 or v % 128 or (group not in (None, 128, 256) and group < d):
+        return False
+    device = getattr(table.codes, "value", table.codes).device
+    if device.type == "cuda":
+        if backend.ops.quantized.device_capability(device) == (7, 5):
+            return False
+    return _triton_available(m, d, v, table)
+
+
 if backend.backend() == "torch" and backend.ops.quantized.triton is not None:
     _ROUTES["triton"] = RouteSource(
         _triton,
         dtypes=("bfloat16", "float16", "float32"),
         available=_triton_available,
+        version=lambda: backend.ops.quantized.triton.__version__,
+        tested_versions=TRITON_TESTED,
+    )
+    _LOOKUP_ROUTES["triton"] = RouteSource(
+        _triton_logits,
+        dtypes=("bfloat16", "float16", "float32"),
+        available=_triton_logits_available,
         version=lambda: backend.ops.quantized.triton.__version__,
         tested_versions=TRITON_TESTED,
     )

@@ -1,9 +1,9 @@
 """int8 and int4 store an embeddings table through one `LookupHandlers`.
 
-The int4 reverse lookup selects a route of `kernels.py`. The library has
-no reverse lookup route yet, so the tests run the reference contraction
-as a route (`force_route("reference_wrapped")`), and `matrix`, a route of
-this file.
+The int4 reverse lookup selects a route of `kernels.py`. The tests run the
+reference contraction as a route (`force_route("reference_wrapped")`),
+and `matrix`, a route of this file. `quantized_logits_test.py` of the
+torch backend tests the Triton route.
 """
 
 import contextlib
