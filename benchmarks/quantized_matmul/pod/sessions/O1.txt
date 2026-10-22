@@ -1,0 +1,77 @@
+# O1: sm_89, optimization of Triton K1 and Triton K-packed (plan_v3.md 8.9).
+# Cards: RTX 4090 community $0.34; L4 secure $0.59; RTX 4090 secure $0.89.
+# Budget 1.5 h. Session deadline 135 min (1.5 x budget).
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 120 min,
+# KHARD_UNTIL 125 min. pod_env.py also sets KQUEUE_BRANCH to
+# kernel-pod-queue-<RUN_ID>, the default branch of push_job.sh. The first
+# push to the pod needs --create (PARALLEL.md).
+# Loop mode (SESSION.md section 10). The stages of this file are job 0: they
+# run once after the setup, on the measurement commit of the create. Then
+# the pod runs each job that Claude pushes with push_job.sh, and stops 15
+# min after the end of the last job (idle_stop_s), or at KHARD_UNTIL.
+# global_timeout is the stage window of job 0 and the default timeout of
+# each later job: give push_job.sh a timeout for the later jobs. Job 0 has
+# about 8 min of checks and 15 min of timing and profiling (50 min at most),
+# so the loop jobs get most of the budget. The configuration sweep of
+# Triton K1 (tune.py) is the session T1 (SESSION.md section 8); a loop job
+# can run one sweep stage of T1.txt again after a kernel change.
+# Goal (plan 8.9): Triton K1 decode at 60% or more of the copy bandwidth at
+# K = N >= 4096; Triton K-packed past the K-packed row rule against F0
+# (plan 8.3). Claude deletes the pod when the goal is met, when two jobs in
+# sequence gain less than 3%, or at the budget.
+# Content of later jobs (plan 8.9): tiles, stages, split-K, the general
+# path, the epilogue, the CUDA-graph and torch.compile paths.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session O1
+loop yes
+idle_stop_s 900
+venvs torch
+install_timeout 12
+global_timeout 50
+deadline 135
+grace_s 300
+# The largest L2 of the O1 cards (RTX 4090: 72 MB; L4: 48 MB). bench.py
+# reads the L2 of the card on torch; only the JAX and TF stages pass it.
+l2_mb 72
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+# ncu and the GPU performance counters (the result of S0 decides if ncu is
+# usable). A failure skips only the ncu stages.
+check prof-ncu ncu torch gpu 8 $PROF probe --install --require ncu
+
+# --- Correctness. A failure prints KFAIL <route> and skips the timing and
+# profiling stages of that route.
+# Triton K1: the whole test module (125 tests: W4A16MatmulTest and
+# TritonRouteTest) under "require", as in the GPU CI step: every routable
+# call of the module runs the Triton kernel.
+check triton-k1 triton torch gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+TODO check kpack-triton kpack-triton torch gpu 10 python -m pytest -q -p no:cacheprovider TODO_triton_kpacked_test_file
+# CPU stand-in for the dry run (TRITON_INTERPRET=1): the 32 float32 cases
+# of test_matches_the_oracle and test_exact_data. "require" needs a CUDA
+# device, so plain pytest.
+check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "float32 and (test_matches_the_oracle or test_exact_data)"
+
+# --- Timing. ---
+# The roofline: the copy bandwidth of the card (plan 8.2). Each bench.py run
+# also measures it before its cells.
+time copy base torch any 3 $BENCH --levels= --copy_mb=1024
+# The decode cells of plan 8.1 (chain level, M 1, 4 and 16) at K = N = 4096
+# and the keras-hub decoder shapes (Llama-3-8B 4096x14336 and 14336x4096,
+# Gemma2-2B 2304x9216 and 2304x2304). The kernel and the forms interleave
+# call by call; each cell reports pct_copy.
+time decode-k1 triton torch any 20 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,gptq_act,awq --shapes=4096x4096,4096x14336,14336x4096,2304x9216,2304x2304 --m=1,4,16 --forms=float,F0,F3 --routes=triton,n5
+# K-packed logits at decode. TODO: the route name of P11b is not final.
+TODO time decode-kpack kpack-triton torch any 10 $BENCH --levels=logits --modes=int4_g128,int4_pc --logits_m=1,4,16 --forms=float,F0 --routes= --logits_routes=TODO_triton_kpacked_route
+
+
+# --- Profiling (SESSION.md section 3.4). ---
+# The compiled-kernel metadata of each configuration that the route uses at
+# these cells (n_regs, n_spills, shared memory, warps, stages), and
+# do_bench of each kernel alone. Add --ir to a job line for the TTGIR and PTX.
+prof triton-meta triton torch any 10 $PROF run --triton -- --levels=dense --modes=int4_g128,int4_pc,gptq,awq --shapes=4096x4096,4096x14336,14336x4096,2304x9216,2304x2304 --m=1,4,16 --forms=F0 --routes=triton --timing=eager --warmup=1 --calls=2
+TODO prof kpack-triton-meta kpack-triton torch any 8 $PROF run --triton -- --levels=logits --modes=int4_g128,int4_pc --logits_m=1,4,16 --forms=F0 --routes= --logits_routes=TODO_triton_kpacked_route --timing=eager --warmup=1 --calls=2
+# The torch profiler table: the device time of each kernel of the chain.
+prof torch-profile triton torch any 8 $PROF run --torch-profile -- --levels=chain --modes=int4_g128 --shapes=4096x4096 --m=1,16 --forms=F0 --routes=triton --timing=eager --warmup=2 --calls=5
+# ncu on one launch of the kernel. The cell launches `_w4a16_kernel` 8 times
+# (2 warm-up calls, 5 timed calls, 1 call for err); ncu measures the fifth.
+prof ncu-k1 triton+ncu torch gpu 8 $PROF ncu --kernel regex:_w4a16_kernel --launch-skip 4 -- --levels=dense --modes=int4_g128 --shapes=4096x4096 --m=1 --forms=F0 --routes=triton --timing=eager --warmup=2 --calls=5 --copy_mb=64

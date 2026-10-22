@@ -1,0 +1,108 @@
+# S1: sm_89, baseline and first kernel numbers (plan_v3.md 8.4).
+# Cards: RTX 4090 community $0.34; 4090 secure $0.89; RTX 6000 Ada secure
+# $0.99; L40S secure $1.09. Budget 1.5 h. Session deadline 135 min.
+# Times from the create (pod_env.py): KSTAGES_UNTIL 115 min, KHARD_UNTIL
+# 125 min. Worst case: the stages stop at 115 min, KDONE at about 117 min,
+# the grace ends at about 127 min. The watchdog can then stop the pod up to
+# 2 min before the grace ends.
+# Format: SESSION.md, "Session files". Stage order is priority order: the
+# stage deadline skips the tail. Set the stage timeouts from the S0 times.
+#
+# Not a stage: the Mosaic GPU stop rule of plan 8.3. Compute it from the
+# decode cells (chain level, M <= 16) of forms-jax-new after the session.
+session S1
+venvs jax-ci jax-new jax-floor torch tf
+install_timeout 15
+global_timeout 105
+deadline 135
+# The read window after KDONE. S1 sends the most chunks. TODO after S0: set
+# it to at least 2x the read time of S1 at the S0 read rate.
+grace_s 600
+# The largest L2 of the S1 cards (RTX 6000 Ada and L40S: 96 MB). The chain
+# then holds at least 4x the L2 on each card.
+l2_mb 96
+
+check env-jax-ci env jax-ci any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-tf env tf any 3 python -c "import os, tensorflow as tf; g = tf.config.list_physical_devices('GPU'); print(tf.__version__, g); assert os.environ['KMODE'] == 'cpu' or g"
+
+# --- Correctness. A failure prints KFAIL <route> and skips the timing
+# stages of that route. ---
+# Triton K1 (P8a), bfloat16 first. TODO: the test selection is not final.
+TODO check triton-k1-bf16 triton torch gpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "bfloat16"
+TODO check triton-k1 triton torch gpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+# Triton K-packed (P11b). TODO: the test file and names are not final.
+TODO check kpack-triton kpack-triton torch gpu 10 python -m pytest -q -p no:cacheprovider TODO_triton_kpacked_test_file
+# Mosaic GPU K1 (P12a) under "require", on both JAX venvs (G1-G8). TODO: no
+# GPU test exists yet. A failure writes its per-block and per-plane error
+# maps as JSON files into $KSTAGE_OUT.
+TODO check mosaic-k1-new mosaic jax-new gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check mosaic-k1-floor mosaic-floor jax-floor gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+# Mosaic GPU K-packed (P12b). TODO: the test file and names are not final.
+TODO check kpack-mosaic-new kpack-mosaic jax-new gpu 15 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check kpack-mosaic-floor kpack-mosaic-floor jax-floor gpu 15 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+# CPU stand-ins for the dry run.
+TODO check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_float32_cases"
+TODO check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+TODO check mosaic-cpu-floor mosaic-floor jax-floor cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+# The existing quantization tests under "auto" (the default policy) and under
+# "require" (the runner .github/workflows/scripts/pytest_require_kernels.py
+# of P8a). Their routes gate no timing stage. Only the kernel suites above
+# gate the kernel timing.
+# The jax-new stages deselect four tests:
+# - Two tests import TensorFlow, and the jax-new venv has no TensorFlow.
+#   On torch the two tests skip.
+# - Two calibration tests fail on JAX 0.11.2 and 0.12.0 and pass on 0.10.2:
+#   the output is not rounded to bfloat16 (max abs diff 0.0031). This is a
+#   known failure outside the pod tooling. Remove the two deselects when the
+#   test is fixed.
+# The limits are estimates. Set them from the first GPU times. On 4 CPUs the
+# jax-new suite needs more than 20 min.
+check existing-auto-torch base torch any 20 python -m pytest -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py keras/src/layers/core/embedding_test.py keras/src/layers/core/reversible_embedding_test.py
+check existing-auto-jax base jax-new any 20 python -m pytest -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py keras/src/layers/core/embedding_test.py keras/src/layers/core/reversible_embedding_test.py --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_awq_mixed_bfloat16 --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_gptq_mixed_bfloat16
+check existing-require-torch require-torch torch gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py keras/src/layers/core/embedding_test.py keras/src/layers/core/reversible_embedding_test.py
+check existing-require-jax require-jax jax-new gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py keras/src/layers/core/embedding_test.py keras/src/layers/core/reversible_embedding_test.py --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_awq_mixed_bfloat16 --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_gptq_mixed_bfloat16
+
+# --- Timing. Each bench.py run measures the copy bandwidth first. ---
+# The forms of today (F0, F1, F3) and the shipped N5 route (with its guard)
+# on both JAX venvs, and F3 and N5 in TF eager. The decode cells of
+# forms-jax-new decide the Mosaic GPU stop rule.
+time forms-jax-new base jax-new any 20 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F1,F3 --routes=n5 --l2_mb=$KL2_MB
+time forms-jax-ci base jax-ci any 15 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F1,F3 --routes=n5 --l2_mb=$KL2_MB
+time forms-tf base tf any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=n5 --timing=eager --l2_mb=$KL2_MB
+# First kernel numbers. The kernel and the forms interleave call by call.
+time triton-k1-time triton torch any 15 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F3 --routes=triton,n5
+time mosaic-k1 mosaic jax-new any 15 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F1,F3 --routes=mosaic_gpu --l2_mb=$KL2_MB
+# K-packed logits. TODO: the route names of P11b and P12b are not final.
+TODO time kpack-triton-logits kpack-triton torch any 8 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=float,F0 --routes= --logits_routes=TODO_triton_kpacked_route
+TODO time kpack-mosaic-logits kpack-mosaic jax-new any 8 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=float,F0 --routes= --logits_routes=TODO_mosaic_kpacked_route
+# Today's paths for every mode at M 1, 16 and 512, with HLO and memory.
+time today-jax-new base jax-new any 10 $BENCH --levels=dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --m=1,16,512 --forms=float,F0 --routes=
+time today-jax-ci base jax-ci any 10 $BENCH --levels=dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --m=1,16,512 --forms=float,F0 --routes=
+time today-torch base torch any 10 $BENCH --levels=dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --m=1,16,512 --forms=float,F0 --routes=
+time today-tf base tf any 10 $BENCH --levels=dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --m=1,16,512 --forms=float,F0 --routes=
+# int8 W8A8 and weight-only baselines for the follow-up plan (decode chain).
+time int8-jax-new base jax-new any 6 $BENCH --levels=chain --modes=int8,int8_wo --forms=float,F0 --routes= --l2_mb=$KL2_MB
+time int8-torch base torch any 6 $BENCH --levels=chain --modes=int8,int8_wo --forms=float,F0 --routes=
+time int8-tf base tf any 6 $BENCH --levels=chain --modes=int8,int8_wo --forms=float,F0 --routes= --l2_mb=$KL2_MB
+# TODO: the JAX TN ablation of int8 has no harness candidate yet.
+TODO time int8-tn-jax-new base jax-new any 6 $BENCH --levels=chain --modes=int8 --forms=float,F0 --routes=TODO_tn_ablation_route --l2_mb=$KL2_MB
+# Whole-model decode with the logits share.
+time model-torch triton torch any 12 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=triton
+time model-jax-new mosaic jax-new any 12 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=mosaic_gpu
+TODO time model-torch-kpack kpack-triton torch any 12 $BENCH --levels=model --modes=int4_pc --forms=float,F0 --routes=triton --logits_routes=TODO_triton_kpacked_route
+TODO time model-jax-kpack kpack-mosaic jax-new any 12 $BENCH --levels=model --modes=int4_pc --forms=float,F0 --routes=mosaic_gpu --logits_routes=TODO_mosaic_kpacked_route
+# Split-K and general-path ablations. TODO: bench.py has a configuration
+# sweep for the Pallas TPU routes only.
+TODO time triton-splitk triton torch any 10 $BENCH --levels=chain --modes=int4_g128 --forms=F0 --routes=triton TODO_split_k_sweep_flag
+TODO time mosaic-splitk mosaic jax-new any 10 $BENCH --levels=chain --modes=int4_g128 --forms=F0 --routes=mosaic_gpu TODO_split_k_sweep_flag --l2_mb=$KL2_MB
+
+# --- Baselines for a kernel that fails its correctness stage. Plan 8.7
+# step 5: the baseline stages still run. When the kernel stage ran, these
+# stages repeat its float, F0, F3 and N5 rows. They are last, so the stage
+# deadline cuts them first. ---
+time forms-torch base torch any 15 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F3 --routes=n5
+time model-base-torch base torch any 12 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=
+time model-base-jax-new base jax-new any 12 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=

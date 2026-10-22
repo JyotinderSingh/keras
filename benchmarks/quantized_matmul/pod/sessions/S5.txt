@@ -1,0 +1,47 @@
+# S5: sm_89, final numbers on frozen code (plan_v3.md 8.4, 4.3).
+# Cards: as S1. Budget 0.75 h. Session deadline 67 min.
+# Times from the create (pod_env.py): KSTAGES_UNTIL 52 min, KHARD_UNTIL
+# 57 min. Worst case: the stages stop at 52 min, KDONE at about 54 min, the
+# grace ends at about 59 min. The watchdog can stop the pod 2 min earlier.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+# The Mosaic GPU correctness on jax-floor and jax-new sets the version
+# constant MOSAIC_GPU_TESTED_JAX.
+session S5
+venvs jax-new jax-floor torch
+install_timeout 12
+global_timeout 45
+deadline 67
+grace_s 300
+l2_mb 96
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+
+# Correctness. TODO: the test selections are not final.
+TODO check triton-k1 triton torch gpu 12 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+TODO check kpack-triton kpack-triton torch gpu 8 python -m pytest -q -p no:cacheprovider TODO_triton_kpacked_test_file
+TODO check mosaic-k1-new mosaic jax-new gpu 12 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check mosaic-k1-floor mosaic-floor jax-floor gpu 12 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check kpack-mosaic-new kpack-mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check kpack-mosaic-floor kpack-mosaic-floor jax-floor gpu 8 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_float32_cases"
+TODO check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+TODO check mosaic-cpu-floor mosaic-floor jax-floor cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# Final numbers for the four GPU kernels, with the same grid as S1.
+time triton-k1-time triton torch any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F3 --routes=triton,n5
+time mosaic-k1 mosaic jax-new any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F1,F3 --routes=mosaic_gpu --l2_mb=$KL2_MB
+TODO time kpack-triton-logits kpack-triton torch any 6 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=float,F0 --routes= --logits_routes=TODO_triton_kpacked_route
+TODO time kpack-mosaic-logits kpack-mosaic jax-new any 6 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=float,F0 --routes= --logits_routes=TODO_mosaic_kpacked_route
+time model-torch triton torch any 6 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=triton
+time model-jax-new mosaic jax-new any 6 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=mosaic_gpu
+
+# --- Baselines for a kernel that fails its correctness stage. Plan 8.7
+# step 5: the baseline stages still run. When the kernel stage ran, these
+# stages repeat its float, F0, F1, F3 and N5 rows. They are last, so the
+# stage deadline cuts them first. ---
+time forms-jax-new base jax-new any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F1,F3 --routes=n5 --l2_mb=$KL2_MB
+time forms-torch base torch any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,gptq_act,awq --forms=float,F0,F3 --routes=n5
+time model-base-torch base torch any 6 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=
+time model-base-jax-new base jax-new any 6 $BENCH --levels=model --modes=int4_g128,int4_pc,gptq,awq --forms=float,F0,F3 --routes=

@@ -1,0 +1,44 @@
+# S6: x86 CPU (plan_v3.md 8.4). The header line `kmode cpu` makes pod_env.py
+# set KMODE=cpu: CPU wheels of JAX, torch and TF. The "cpu" and "any" stages
+# run.
+# Pod: RunPod CPU pod, cpu3c, 8 vCPU, $0.24/h (0.03 per vCPU-hour, 16 GB RAM).
+# Budget 0.5 h. Session deadline 45 min.
+# Times from the create (pod_env.py): KSTAGES_UNTIL 30 min, KHARD_UNTIL
+# 35 min. Worst case: the stages stop at 30 min, KDONE at about 31 min, the
+# grace ends at about 36 min. The watchdog can stop the pod 1 min earlier.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+#
+# The grid is smaller than the GPU grid: 3 shapes, M up to 256. A float32
+# M = 2048 cell at 8192 x 8192 takes about 1 s per call on 8 vCPU. Check the
+# stage times in the dry run on the measurement commit.
+session S6
+venvs jax-ci jax-new torch tf
+install_timeout 10
+global_timeout 25
+deadline 45
+grace_s 300
+kmode cpu
+l2_mb 0
+
+check env-jax-ci env jax-ci any 3 python -c "import jax; print(jax.__version__, jax.devices())"
+check env-jax-new env jax-new any 3 python -c "import jax; print(jax.__version__, jax.devices())"
+check env-torch env torch any 3 python -c "import torch; print(torch.__version__, torch.get_num_threads())"
+check env-tf env tf any 3 python -c "import tensorflow as tf; print(tf.__version__, tf.config.list_physical_devices())"
+
+# N5 correctness: the route tests of kernels_test.py on torch and TF.
+check n5-tests-torch n5 torch any 6 python -m pytest -q -p no:cacheprovider keras/src/quantizers/kernels_test.py
+check n5-tests-tf n5-tf tf any 6 python -m pytest -q -p no:cacheprovider keras/src/quantizers/kernels_test.py
+
+# N5 rows for torch and TF eager.
+time n5-torch n5 torch any 8 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32,bfloat16 --shapes=4096x4096,4096x14336,2304x9216 --m=1,4,16,64,256 --forms=float,F0,F3 --routes=n5 --timing=eager
+time n5-tf n5-tf tf any 8 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32,bfloat16 --shapes=4096x4096,4096x14336,2304x9216 --m=1,4,16,64,256 --forms=float,F0,F3 --routes=n5 --timing=eager
+# The XLA CPU baseline.
+time xla-cpu-jax-new base jax-new any 6 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq,int8,int8_wo --dtypes=float32,bfloat16 --shapes=4096x4096,4096x14336,2304x9216 --m=1,4,16,64,256 --forms=float,F0,F1,F3 --routes=
+time xla-cpu-jax-ci base jax-ci any 6 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32,bfloat16 --shapes=4096x4096,2304x9216 --m=1,16,256 --forms=float,F0,F1,F3 --routes=
+# N1 (exact int8 matmul on torch CPU, the threshold M_min) and N3 (the
+# one-row pad of the JAX int8 matmul on CPU). TODO: their routes and tests
+# are in later PRs and the names are not final.
+TODO check n1-tests n1 torch any 6 python -m pytest -q -p no:cacheprovider TODO_n1_test_file
+TODO time n1-torch n1 torch any 6 $BENCH --levels=dense --modes=int8,int8_wo --dtypes=float32,bfloat16 --m=1,2,4,8,16,32,64,128,256 --forms=float,F0 --routes=TODO_n1_route --timing=eager
+TODO check n3-tests n3 jax-new any 6 python -m pytest -q -p no:cacheprovider TODO_n3_test_file
+TODO time n3-jax n3 jax-new any 6 $BENCH --levels=dense --modes=int8,int8_wo --m=1,2,4,16 --forms=float,F0 --routes=TODO_n3_route
