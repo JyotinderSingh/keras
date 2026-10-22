@@ -1,0 +1,73 @@
+# S0: smoke session, sm_89 (plan_v3.md 8.4 and 4.3).
+# Cards: RTX 2000 Ada secure $0.24; L4 secure $0.59; RTX 4090 community $0.34.
+# Budget 0.5 h. Session deadline 45 min (1.5 x budget).
+# Times from the create (pod_env.py): restart probe 5 min, KSTART_BY 20 min,
+# KSTAGES_UNTIL 30 min, KHARD_UNTIL 35 min.
+# Worst case: pull and probe 5 + install 12.5 + stages to KSTAGES_UNTIL (30)
+# + chunks 1 + grace 5 = KDONE at 31 min, the grace ends at 36 min. The
+# watchdog can stop the pod at 35 min, 1 min before the grace ends.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+#
+# S0 items outside this file:
+# - Image contents, versions, nvidia-smi: the KPROBE lines.
+# - Install time of each venv: the KINSTALL lines.
+# - The size cap of stream-pod-logs: the KFILL lines (logcap_kb).
+# - The read rate of the chunks, and if stream-pod-logs reads an EXITED pod.
+# - Restart behavior after an exit: env KRESTART_PROBE_UNTIL (SESSION.md).
+# - The self-stop with the pod-scoped key: after KDONE and the grace time.
+session S0
+venvs jax-ci jax-new jax-floor torch tf
+install_timeout 12
+global_timeout 22
+deadline 45
+grace_s 300
+restart_probe_s 300
+l2_mb 72
+logcap_kb 1024
+
+# Each venv sees the device (plan 8.4). A failure stops the later stages of
+# that venv.
+check env-jax-ci env jax-ci any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-tf env tf any 3 python -c "import os, tensorflow as tf; g = tf.config.list_physical_devices('GPU'); print(tf.__version__, g); assert os.environ['KMODE'] == 'cpu' or g"
+
+# Triton K1: one bfloat16 correctness case (P8a, branch
+# quantization-33-triton-w4a16). TODO: the test name is not final.
+TODO check triton-bf16-case triton torch gpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_one_bfloat16_case_of_test_matches_the_oracle"
+# CPU stand-in for the dry run (TRITON_INTERPRET=1). The interpreter computes
+# a wrong bfloat16 tl.dot (docker/README.md), so it runs a float32 case.
+TODO check triton-interpret triton torch cpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_one_float32_case_of_test_matches_the_oracle"
+
+# Mosaic GPU K1 checks of plan 4.3 (P12a, branch quantization-35-mosaic-gpu-w4a16).
+# TODO: no GPU test exists yet. Each GPU test that fails writes its per-block
+# and per-plane error maps as JSON files into $KSTAGE_OUT. run_pod.sh adds
+# every file there to the results.
+# 1. The first real ptxas compile and its register count. jaxlib 0.12.0
+#    (libjax_common.so) and jax-cuda13-pjrt 0.12.0 hold the names
+#    MOSAIC_GPU_DUMP_PTXAS, MOSAIC_GPU_DUMP_RESOURCES and MOSAIC_GPU_DUMP_TO
+#    (strings of the manylinux x86_64 wheels, read 2026-10-22). The dumps go
+#    to $KSTAGE_OUT, so the results hold them.
+TODO check mosaic-ptxas mosaic jax-new gpu 8 MOSAIC_GPU_DUMP_PTXAS=1 MOSAIC_GPU_DUMP_RESOURCES=1 MOSAIC_GPU_DUMP_TO=$KSTAGE_OUT python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_decode_case"
+# 2. A decode configuration below 48 KB of SMEM (BM 16, BNH 32, 3 stages) and
+#    a prefill configuration above it (BM 64, BNH 64, 2 stages, about 83 KB).
+TODO check mosaic-smem mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_decode_and_prefill_configs"
+# 3. The G3 exactness case with N/2 > BNH and several groups, on both JAX venvs.
+TODO check mosaic-g3-new mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_g3_case"
+TODO check mosaic-g3-floor mosaic-floor jax-floor gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_g3_case"
+# CPU stand-ins for the dry run: the lowering with the copy-contiguity check,
+# and interpret mode.
+TODO check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+TODO check mosaic-cpu-floor mosaic-floor jax-floor cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# The CUDA-graph capture of every harness candidate on torch (float, F0, F1,
+# F3 and every route of the commit), at every level and mode.
+time s0-graph-capture harness torch any 8 $BENCH --levels=raw,dense,chain,logits,model --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --shapes=2304x2304 --m=1,16 --logits_shapes=gemma3-1b --logits_m=1 --models=tiny --timing=graph,eager --warmup=3 --calls=10 --copy_mb=256
+# No graph record is skipped for a failed capture.
+check s0-graph-capture-ok harness - gpu 2 python3 -c "import json, os, sys; p = os.environ['KOUT'] + '/stages/s0-graph-capture/bench.jsonl'; r = [json.loads(t) for t in open(p)]; g = [x for x in r if x.get('timing') == 'graph']; bad = [x for x in g if 'capture failed' in str(x.get('skipped', ''))]; print(len(g), 'graph records,', len(bad), 'failed captures'); [print(x.get('level'), x.get('mode'), x.get('candidate'), str(x.get('skipped'))[:300]) for x in bad]; sys.exit(1 if bad or not g else 0)"
+
+# The harness on the JAX and TensorFlow GPU paths, before S1 spends on them.
+time s0-smoke-jax-new harness jax-new any 5 $BENCH --levels=dense,chain,logits --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --logits_shapes=gemma3-1b --logits_m=1 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
+time s0-smoke-jax-ci harness jax-ci any 5 $BENCH --levels=dense,chain --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
+time s0-smoke-tf harness tf any 5 $BENCH --levels=dense,chain --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
