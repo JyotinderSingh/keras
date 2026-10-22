@@ -14,15 +14,21 @@ One formula covers signed and unsigned codes: with `XOR = 8` for int8
 storage and `XOR = 0` for uint8 storage, `q = nibble ^ XOR` and
 `z' = z + XOR` give `d = q - z'`.
 
-- Fast path: all rows of the tile are in the group `k0 // G` (`g_idx`
-  holds contiguous groups). The kernel reads one scale row and one zero
-  row at that static index.
-- General path: any other tile, for example under GPTQ's activation
+A program runs the K tiles of its split in one of two loops. Before the
+loop, one check reads the `g_idx` rows of all these tiles:
+
+- Fast loop: each tile lies in the group `k0 // G` (`g_idx` holds
+  contiguous groups), and that group exists. Per tile, the kernel reads
+  one scale row and one zero row at that static index.
+- General loop: any other program, for example under GPTQ's activation
   order. The kernel clamps the group of each row to `[0, n_groups - 1]`,
   gathers its scale and zero point, dequantizes each weight in float32
   and casts it to the dot dtype, as the reference path rounds it.
-- Per-channel int4: no zero point and no group index. `d = q - XOR`, and
-  the epilogue divides each column by its scale.
+- Per-channel int4: no zero point and no group index. The fast loop
+  gives `d = q - XOR`, and the epilogue divides each column by its scale.
+
+No loop body has a runtime branch, so the compiler can pipeline the
+loads of the next tiles.
 
 The epilogue interleaves the two accumulators into column order, casts to
 the compute dtype and stores with a column mask. The kernel is forward
@@ -80,9 +86,10 @@ _CONFIGS = {
     (None, None, "257+", None): KernelConfig(128, 64),
     # A float32 tile needs two times the shared memory of a 16-bit tile.
     # With a K tile of 128, these rows fit in the 99 KB of one block on
-    # sm_86 and sm_89.
-    (None, "float32", "65-256", None): KernelConfig(64, 32, num_stages=2),
-    (None, "float32", "257+", None): KernelConfig(64, 32, num_stages=2),
+    # sm_86 and sm_89. The general loop also stages its scale and zero
+    # point tiles: with 64 rows of `x`, it needs 108 KB on sm_89.
+    (None, "float32", "65-256", None): KernelConfig(32, 32, num_stages=2),
+    (None, "float32", "257+", None): KernelConfig(32, 32, num_stages=2),
     # sm_89 rows from the sweeps on an RTX 4090: t1a-20261022-2 (bfloat16)
     # and t1b-20261022-2 (float16, decode). The float16 prefill rows take
     # the bfloat16 values: the tiles have the same bytes. Split-K is on at
@@ -258,6 +265,7 @@ if triton is not None:
         K,
         n_groups,
         group_size,
+        NH,
         XOR: tl.constexpr,
         PER_CHANNEL: tl.constexpr,
         UPCAST_DOT: tl.constexpr,
@@ -267,10 +275,12 @@ if triton is not None:
         BNH: tl.constexpr,
         BK: tl.constexpr,
     ):
+        # `NH` is the row stride of the codes, `ceil(N/2)`. It is an
+        # argument, so that the compiler knows when it divides by 16. Then
+        # the codes load as vectors.
         pid_m = tl.program_id(0)
         pid_n = tl.program_id(1)
         pid_k = tl.program_id(2)
-        NH = (N + 1) // 2
         rows = pid_m * BM + tl.arange(0, BM)
         # Byte `j` holds the columns `2j` and `2j + 1`.
         bytes_ = pid_n * BNH + tl.arange(0, BNH)
@@ -282,43 +292,56 @@ if triton is not None:
         acc_odd = tl.zeros((BM, BNH), dtype=tl.float32)
         # The K tiles of this split.
         tiles = tl.cdiv(tl.cdiv(K, BK), SPLIT_K)
+        first = pid_k * tiles
         last = tl.minimum((pid_k + 1) * tiles, tl.cdiv(K, BK))
-        for tile in tl.range(pid_k * tiles, last):
-            k0 = tile * BK
-            ks = k0 + tl.arange(0, BK)
-            k_mask = ks < K
-            x = tl.load(
-                x_ptr + rows[:, None] * K + ks[None, :],
-                mask=row_mask[:, None] & k_mask[None, :],
-                other=0.0,
-            )
-            b = tl.load(
-                codes_ptr + ks[:, None] * NH + bytes_[None, :],
-                mask=k_mask[:, None] & (bytes_ < NH)[None, :],
-                other=0,
-            ).to(tl.int32)
-            even = (b & 15) ^ XOR
-            odd = ((b >> 4) & 15) ^ XOR
-            # An integer goes to the dot dtype through float32, which holds
-            # it exactly: the Triton interpreter converts an int32 to a
-            # wrong bfloat16.
-            if PER_CHANNEL:
-                d_even = (even - XOR).to(tl.float32).to(dtype)
-                d_odd = (odd - XOR).to(tl.float32).to(dtype)
-                acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
-                acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
-            else:
-                group = k0 // group_size
+        uniform = True
+        if not PER_CHANNEL:
+            # One check per program, `CHECK` rows of `g_idx` per step: each
+            # row of tile `t` is in the group `t * BK // G`, and the group
+            # of the last tile exists.
+            CHECK: tl.constexpr = 1024
+            bad = tl.zeros((CHECK,), dtype=tl.int32)
+            for start in tl.range(first * BK, last * BK, CHECK):
+                ks = start + tl.arange(0, CHECK)
+                k_mask = ks < tl.minimum(last * BK, K)
                 g = tl.load(g_idx_ptr + ks, mask=k_mask, other=0.0)
-                g = g.to(tl.int32)
-                outside = tl.where(k_mask & (g != group), 1, 0)
-                # In compiled Triton, a name that both branches of a runtime
-                # `if` assign must have one type. The fast path holds rows
-                # and the general path holds tiles, so their names are
-                # different. The interpreter does not check this.
-                if (tl.max(outside, axis=0) == 0) & (group < n_groups):
-                    # Fast path: the scale and the zero row of the group.
-                    row = group * N + columns
+                want = (ks // BK) * BK // group_size
+                bad = bad | tl.where(k_mask & (g.to(tl.int32) != want), 1, 0)
+            uniform = (tl.max(bad, axis=0) == 0) & (
+                (last - 1) * BK // group_size < n_groups
+            )
+        # In compiled Triton, a name that both branches of a runtime `if`
+        # assign must have one type. The fast loop holds rows and the
+        # general loop holds tiles, so their names are different. The
+        # interpreter does not check this.
+        if uniform:
+            for tile in tl.range(first, last):
+                k0 = tile * BK
+                ks = k0 + tl.arange(0, BK)
+                k_mask = ks < K
+                x = tl.load(
+                    x_ptr + rows[:, None] * K + ks[None, :],
+                    mask=row_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                b = tl.load(
+                    codes_ptr + ks[:, None] * NH + bytes_[None, :],
+                    mask=k_mask[:, None] & (bytes_ < NH)[None, :],
+                    other=0,
+                ).to(tl.int32)
+                even = (b & 15) ^ XOR
+                odd = ((b >> 4) & 15) ^ XOR
+                # An integer goes to the dot dtype through float32, which
+                # holds it exactly: the Triton interpreter converts an int32
+                # to a wrong bfloat16.
+                if PER_CHANNEL:
+                    d_even = (even - XOR).to(tl.float32).to(dtype)
+                    d_odd = (odd - XOR).to(tl.float32).to(dtype)
+                    acc_even += _dot(x, d_even, UPCAST_DOT, INPUT_PRECISION)
+                    acc_odd += _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
+                else:
+                    # The scale and the zero row of the group of the tile.
+                    row = k0 // group_size * N + columns
                     s_row = tl.load(scale_ptr + row, column_mask, other=0.0)
                     z_row = tl.load(zero_ptr + row, column_mask, other=0)
                     s_row_even, s_row_odd = tl.split(
@@ -334,24 +357,41 @@ if triton is not None:
                     acc_even += partial * s_row_even[None, :]
                     partial = _dot(x, d_odd, UPCAST_DOT, INPUT_PRECISION)
                     acc_odd += partial * s_row_odd[None, :]
-                else:
-                    # General path: the scale and the zero point of each
-                    # row. The clamp keeps a corrupt `g_idx` in bounds.
-                    g = tl.minimum(tl.maximum(g, 0), n_groups - 1)
-                    offsets = g[:, None] * N + columns[None, :]
-                    mask = k_mask[:, None] & column_mask[None, :]
-                    s = tl.load(scale_ptr + offsets, mask=mask, other=0.0)
-                    z = tl.load(zero_ptr + offsets, mask=mask, other=0)
-                    s_even, s_odd = tl.split(
-                        tl.reshape(s.to(tl.float32), (BK, BNH, 2))
-                    )
-                    z_even, z_odd = tl.split(
-                        tl.reshape(z.to(tl.int32) + XOR, (BK, BNH, 2))
-                    )
-                    w_even = ((even - z_even).to(tl.float32) * s_even).to(dtype)
-                    w_odd = ((odd - z_odd).to(tl.float32) * s_odd).to(dtype)
-                    acc_even += _dot(x, w_even, UPCAST_DOT, INPUT_PRECISION)
-                    acc_odd += _dot(x, w_odd, UPCAST_DOT, INPUT_PRECISION)
+        else:
+            for tile in tl.range(first, last):
+                k0 = tile * BK
+                ks = k0 + tl.arange(0, BK)
+                k_mask = ks < K
+                x = tl.load(
+                    x_ptr + rows[:, None] * K + ks[None, :],
+                    mask=row_mask[:, None] & k_mask[None, :],
+                    other=0.0,
+                )
+                b = tl.load(
+                    codes_ptr + ks[:, None] * NH + bytes_[None, :],
+                    mask=k_mask[:, None] & (bytes_ < NH)[None, :],
+                    other=0,
+                ).to(tl.int32)
+                even = (b & 15) ^ XOR
+                odd = ((b >> 4) & 15) ^ XOR
+                # The scale and the zero point of each row. The clamp keeps
+                # a corrupt `g_idx` in bounds.
+                g = tl.load(g_idx_ptr + ks, mask=k_mask, other=0.0)
+                g = tl.minimum(tl.maximum(g.to(tl.int32), 0), n_groups - 1)
+                offsets = g[:, None] * N + columns[None, :]
+                mask = k_mask[:, None] & column_mask[None, :]
+                s = tl.load(scale_ptr + offsets, mask=mask, other=0.0)
+                z = tl.load(zero_ptr + offsets, mask=mask, other=0)
+                s_even, s_odd = tl.split(
+                    tl.reshape(s.to(tl.float32), (BK, BNH, 2))
+                )
+                z_even, z_odd = tl.split(
+                    tl.reshape(z.to(tl.int32) + XOR, (BK, BNH, 2))
+                )
+                w_even = ((even - z_even).to(tl.float32) * s_even).to(dtype)
+                w_odd = ((odd - z_odd).to(tl.float32) * s_odd).to(dtype)
+                acc_even += _dot(x, w_even, UPCAST_DOT, INPUT_PRECISION)
+                acc_odd += _dot(x, w_odd, UPCAST_DOT, INPUT_PRECISION)
         acc = tl.interleave(acc_even, acc_odd)
         if PER_CHANNEL:
             s = tl.load(scale_ptr + columns, mask=column_mask, other=1.0)
@@ -414,6 +454,7 @@ if triton is not None:
                 k,
                 scale.shape[0],
                 group_size,
+                codes.shape[1],
                 XOR=8 if signed else 0,
                 PER_CHANNEL=per_channel,
                 UPCAST_DOT=upcast_dot,

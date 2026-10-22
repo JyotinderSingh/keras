@@ -246,15 +246,17 @@ def _exact_data(layer, m, extreme=None, seed=2):
     return x
 
 
-def _compile_jobs():
-    """The compilations of `test_compiles_for_cuda`.
+def _compile_jobs(capability):
+    """The compilations of `test_compiles_for_cuda` for one device.
 
     Each default row of `_CONFIGS` compiles with the largest K tile, 128,
     which needs the most shared memory: in float16 and in float32 (IEEE
     and TF32 dots), for per-channel and grouped int4. A bfloat16 tile has
     the bytes of a float16 tile, and GPTQ and AWQ codes have the bytes of
     int4 codes. So bfloat16, GPTQ and AWQ compile with the K tile 32
-    only, as does split-K.
+    only, as does split-K. Each row of the device compiles with its own K
+    tile, or 128 when it has none: a bfloat16 row in float16, and a row
+    with `None` in place of `G` per channel and grouped.
     """
     jobs = []
 
@@ -284,6 +286,13 @@ def _compile_jobs():
     config = quantized.kernel_config(None, "float32", 1, 32)
     config = dataclasses.replace(config, block_k=32, split_k=4)
     add("float32", VARIANTS[2], config)
+    for (device, dtype, _, group), config in quantized._CONFIGS.items():
+        if device != capability:
+            continue
+        config = dataclasses.replace(config, block_k=config.block_k or 128)
+        dtype = "float16" if dtype == "bfloat16" else dtype
+        for variant in VARIANTS[:2] if group is None else VARIANTS[1:2]:
+            add(dtype, variant, config)
     return jobs
 
 
@@ -319,6 +328,7 @@ def _compile_for_cuda(capability, jobs):
             "K": "i32",
             "n_groups": "i32",
             "group_size": "i32",
+            "NH": "i32",
         }
         divisible = {
             (kernel.arg_names.index(name),): [["tt.divisibility", 16]]
@@ -577,7 +587,8 @@ class W4A16MatmulTest(testing.TestCase):
 
     def test_compiles_for_cuda(self):
         """Each variant compiles for sm_80, sm_89 and sm_90, and each
-        default row fits in the shared memory of one block there.
+        default row and each row of the device fits in the shared memory
+        of one block there.
 
         Subprocesses with `TRITON_INTERPRET=0` compile the float32 jobs
         and the other jobs of each device in parallel. The interpreter
@@ -604,7 +615,7 @@ class W4A16MatmulTest(testing.TestCase):
         ):
             jobs = [
                 job
-                for job in _compile_jobs()
+                for job in _compile_jobs(capability)
                 if (job["dtype"] == "float32") == float32
             ]
             arguments = [json.dumps(capability), json.dumps(jobs)]
