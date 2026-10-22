@@ -22,6 +22,9 @@ plgpu = LazyModule("jax.experimental.pallas.mosaic_gpu", required_attr="mma")
 # The rows of a K step. With 16 activation rows, the MMA left operand
 # needs four (8, 64) tiles, so 64 rows do not lower.
 _BK = 128
+# float32 2**23: its ulp is 1, so 2**23 + q is exact for 0 <= q < 2**23.
+_MAGIC = 2.0**23
+_MAGIC_BITS = 0x4B000000
 # Compute capability -> the SM count of its card: an A100, an A40, an RTX
 # 4090 and an H100 SXM.
 _SMS = {"8.0": 108, "8.6": 84, "8.9": 128, "9.0": 132}
@@ -110,7 +113,7 @@ def mosaic_gpu_w4a16_matmul(
         # so the columns split here. A block `(1, 1, 4, BNH)` is one
         # contiguous run, as an untiled `cp.async` copy needs.
         scale_rows = scale.astype("float32")
-        zero_rows = zero.astype("float32") + xor
+        zero_rows = zero.astype("float32") + (xor + _MAGIC)
         shape = (scale.shape[0], half // block_n, block_n)
         inputs.append(
             jnp.stack(
@@ -208,12 +211,15 @@ def _w4a16_kernel(
             a = x_s[...]
             out = []
             for p, (acc, w_s) in enumerate(zip(carry, (even_s, odd_s))):
-                w = (((b >> (4 * p)) & 15) ^ xor).astype(jnp.float32)
+                # The bits of the float32 2**23 + (nibble ^ XOR): no
+                # int-to-float conversion.
+                q = ((b >> (4 * p)) & 15) ^ (xor | _MAGIC_BITS)
+                w = lax.bitcast_convert_type(q, jnp.float32)
                 if rows_s:
                     zero = rows_s[0][0, 0, 2 + p, :]
                     w = w - lax.broadcast_in_dim(zero, w.shape, (1,))
                 else:
-                    w = w - xor
+                    w = w - (xor + _MAGIC)
                 w_s[...] = w.astype(dtype)
                 part = mma(jnp.zeros(acc.shape, jnp.float32), a, w_s[...])
                 if rows_s:
