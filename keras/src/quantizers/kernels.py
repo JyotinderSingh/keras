@@ -114,6 +114,10 @@ _ALLOW_LIST = {
     ("torch", "cuda-sm90", "bfloat16", "17-64"): (("triton", None),),
     ("torch", "cuda-sm90", "bfloat16", "65-256"): (("triton", None),),
     ("torch", "cuda-sm90", "float16", "1-16"): (("triton", None),),
+    # 2026-10-23-rtx4090-jax-cuda-mosaic-gpu.jsonl (NVIDIA GeForce RTX
+    # 4090, JAX 0.12.0 under `jit`). Three shapes at M = 64.
+    ("jax", "cuda-sm89", "bfloat16", "17-64"): (("mosaic_gpu", None),),
+    ("jax", "cuda-sm89", "float16", "17-64"): (("mosaic_gpu", None),),
 }
 # backend -> {device type of `list_devices`: the kernel of `"require"`}
 _REQUIRED = {}
@@ -667,6 +671,16 @@ _LOOKUP_ALLOW_LIST = {
     ("torch", "cuda-sm90", "bfloat16", "17-64"): (("triton", None),),
     ("torch", "cuda-sm90", "float16", "1-16"): (("triton", None),),
     ("torch", "cuda-sm90", "float16", "17-64"): (("triton", None),),
+    # 2026-10-23-rtx4090-jax-cuda-mosaic-gpu.jsonl (NVIDIA GeForce RTX
+    # 4090, JAX 0.12.0 under `jit`). Five tables at M 1 and 16, and at
+    # M = 64.
+    ("jax", "cuda-sm89", "bfloat16", "1-16"): (("mosaic_gpu", None),),
+    ("jax", "cuda-sm89", "bfloat16", "17-64"): (("mosaic_gpu", None),),
+    ("jax", "cuda-sm89", "float16", "1-16"): (("mosaic_gpu", None),),
+    ("jax", "cuda-sm89", "float16", "17-64"): (("mosaic_gpu", None),),
+    # 2026-10-23-h100sxm-jax-cuda-mosaic-gpu.jsonl (NVIDIA H100 SXM, JAX
+    # 0.12.0 under `jit`). Five tables at M 1 and 16.
+    ("jax", "cuda-sm90", "bfloat16", "1-16"): (("mosaic_gpu", None),),
 }
 
 
@@ -852,7 +866,11 @@ if backend.backend() == "torch" and backend.ops.quantized.triton is not None:
 # backend's `ops.quantized`. Under `"auto"`, it runs only with equal jax
 # and jaxlib versions in `MOSAIC_GPU_TESTED_JAX`: the Mosaic GPU compiler
 # ships in jaxlib, and a jax release accepts an older jaxlib. A version
-# enters the constant after a correctness run on a GPU passes on it.
+# enters the constant after a correctness run on a GPU passes on it. On
+# 0.11.2 and 0.12.0, the K1 and K-packed tests pass under `"require"` on
+# an RTX 4090 (2026-10-23-rtx4090-jax-cuda-mosaic-gpu.jsonl). The
+# allow-list rows hold the measured cells: compute capability 8.9 for K1,
+# and 8.9 and 9.0 for K-packed.
 MOSAIC_GPU_TESTED_JAX = ("0.11.2", "0.12.0")
 # The device gate: CUDA compute capabilities. A ROCm device reports a
 # `gfx` name.

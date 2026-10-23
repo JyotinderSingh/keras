@@ -863,6 +863,42 @@ class GateTest(testing.TestCase):
         with _routes(_row("bfloat16", 3, "gated"), gated=gated):
             self.assertEqual(_counts(layer, _random((3, 256))), {expected: 1})
 
+    def test_rows_run_with_their_configuration(self):
+        """Each Mosaic GPU row of the reverse lookup allow-list leaves the
+        configuration to `MOSAIC_GPU_LOGITS_CONFIGS`, which has a row for
+        the compute capability, the compute dtype and the M bucket of the
+        row. With that configuration and the values of the real route, a
+        call in the bucket of the row runs the kernel on a tied and an
+        untied table, and passes G1, G2 and G4."""
+        rows = [
+            (key, routes)
+            for key, routes in kernels._LOOKUP_ALLOW_LIST.items()
+            if any(name == "mosaic_gpu" for name, _ in routes)
+        ]
+        self.assertNotEqual(rows, [])
+        for (
+            (_, device_class, dtype, bucket),
+            routes,
+        ), orientation in itertools.product(rows, ORIENTATIONS):
+            with self.subTest(
+                device_class=device_class,
+                dtype=dtype,
+                bucket=bucket,
+                orientation=orientation,
+            ):
+                self.assertIn(("mosaic_gpu", None), routes)
+                number = device_class.removeprefix("cuda-sm")
+                capability = f"{number[:-1]}.{number[-1]}"
+                key = (capability, dtype, bucket)
+                config = quantized.MOSAIC_GPU_LOGITS_CONFIGS[key]
+                m = BUCKET_ROWS[bucket]
+                layer = _layer(orientation, 128, dtype, dim=256, vocab=256)
+                x = _random((m, 256))
+                with _routes(_row(dtype, m, "real", config), real=_real()):
+                    self.assertEqual(_counts(layer, x), {"real": 1})
+                    y = layer(x, reverse=True)
+                _check_accuracy(self, layer, x, y)
+
     def test_route_values(self):
         """The logits routes have the dtypes, the version range and the
         `"require"` entry of Mosaic GPU K1."""

@@ -988,6 +988,33 @@ class GateTest(testing.TestCase):
         with _routes(row, gated=gated):
             self.assertEqual(_counts(layer, _random((3, 256))), {expected: 1})
 
+    def test_rows_run_with_their_configuration(self):
+        """Each Mosaic GPU row of the allow-list leaves the configuration
+        to `MOSAIC_GPU_CONFIGS`, which has a row for the compute
+        capability, the compute dtype and the M bucket of the row. With
+        that configuration and the values of the real route, a call in
+        the bucket of the row runs the kernel and passes G1, G2 and G4."""
+        rows = [
+            (key, routes)
+            for key, routes in kernels._ALLOW_LIST.items()
+            if any(name == "mosaic_gpu" for name, _ in routes)
+        ]
+        self.assertNotEqual(rows, [])
+        for (_, device_class, dtype, bucket), routes in rows:
+            with self.subTest(device_class=device_class, dtype=dtype):
+                self.assertIn(("mosaic_gpu", None), routes)
+                number = device_class.removeprefix("cuda-sm")
+                capability = f"{number[:-1]}.{number[-1]}"
+                key = (capability, dtype, bucket)
+                config = quantized.MOSAIC_GPU_CONFIGS[key]
+                m = BUCKET_ROWS[bucket]
+                layer = _layer(CASES["dense"], "int4", 128, f"mixed_{dtype}")
+                x = _random((m, 256))
+                with _routes(_row(dtype, m, "real", config), real=_real()):
+                    self.assertEqual(_counts(layer, x), {"real": 1})
+                    y = layer(x)
+                _check_accuracy(self, layer, x, y)
+
     def test_versions(self):
         source = kernels._ROUTES["mosaic_gpu"]
         self.assertEqual(kernels.MOSAIC_GPU_TESTED_JAX, ("0.11.2", "0.12.0"))
