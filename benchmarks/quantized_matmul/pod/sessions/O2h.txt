@@ -1,0 +1,19 @@
+# O2h: sm_90, optimization of Mosaic GPU K1 on an H100 SXM
+# (quant-tooling/kernels/opt/mosaic-k1/PLAN.md). Loop mode (SESSION.md
+# section 10). Card: H100 SXM secure, $3.99/h (the H0 card; the grid of
+# `_SMS["9.0"]` = 132 needs the SXM). Budget 1.0 h. Session deadline 90 min
+# (1.5 x budget). Job 0: the device check and the nsys install only. The
+# jobs are in opt/mosaic-k1/jobs/ (job 1: the time split; job 2: the 9.0
+# rows).
+session O2h
+loop yes
+idle_stop_s 900
+venvs jax-new
+install_timeout 12
+global_timeout 10
+deadline 90
+grace_s 300
+l2_mb 50
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check prof-nsys nsys jax-new gpu 8 $PROF probe --install --require nsys

@@ -1,0 +1,48 @@
+# H0: sm_90, the first run of both kernels on a Hopper GPU (plan_v3.md 8.4,
+# 8.9). S0 ran them on sm_89 only. On sm_90 the Mosaic GPU kernel uses the
+# TMA pipeline (`mosaic_gpu_lowering` lowers it on the CPU, but no GPU has
+# run it), and Triton K1 uses the sm_90 rows of `_CONFIGS` or the default
+# row. H0 is correctness first; S3 stays the sm_90 session of near-final
+# code.
+# Cards: H100 PCIe community $1.99; PCIe secure $2.89; NVL secure $3.19;
+# SXM secure $3.99. On 2026-10-22 only the SXM secure had stock. Any H100 is
+# sm_90 with 50 MB of L2. bench.py writes the card name into each record.
+# H200 only after the user agrees in the chat.
+# Budget 0.55 h. Session deadline 50 min (1.5 x budget). Margin cost at the
+# 2026-10-22 prices: 1.5 x 0.55 h x ($3.99 + $0.011 for the 80 GB disk) =
+# $3.30.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 35 min,
+# KHARD_UNTIL 40 min. The correctness stages need about 15 min. The stage
+# minutes add up to more than global_timeout, so the stage deadline cuts
+# the last (timing) stages first.
+# Not a loop session: the pod runs the stages once, sends the results and
+# stops after the grace time.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session H0
+venvs torch jax-new jax-floor
+install_timeout 12
+global_timeout 30
+deadline 50
+grace_s 300
+# The L2 of the H100.
+l2_mb 50
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+
+# --- Correctness. ---
+# Mosaic GPU K1 on sm_90: the register and SMEM report of one decode case
+# (as S0), then GPUTest (24 tests) under "require" on JAX 0.12.0, then the
+# same tests on JAX 0.11.2. A failure writes the error maps of SESSION.md
+# section 3.3.
+check mosaic-ptxas mosaic jax-new gpu 8 MOSAIC_GPU_DUMP_PTXAS=1 MOSAIC_GPU_DUMP_RESOURCES=1 MOSAIC_GPU_DUMP_TO=$KSTAGE_OUT python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+check mosaic-k1 mosaic jax-new gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-k1-floor mosaic-floor jax-floor gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+# Triton K1 on sm_90: the whole test module (125 tests) under "require".
+check triton-k1 triton torch gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+
+# --- First sm_90 numbers (decode). Each bench.py run measures the copy
+# bandwidth first. ---
+time triton-k1-decode triton torch any 12 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,4096x14336,14336x4096 --m=1,4,16 --forms=float,F0,F3 --routes=triton,n5
+time mosaic-k1-decode mosaic jax-new any 10 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,4096x14336,14336x4096 --m=1,4,16 --forms=float,F0,F3 --routes=mosaic_gpu,n5 --l2_mb=$KL2_MB

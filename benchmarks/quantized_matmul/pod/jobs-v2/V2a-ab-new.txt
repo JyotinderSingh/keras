@@ -1,0 +1,35 @@
+# V2a jobs 2, 3 and 5: the Mosaic GPU K1 A/B stages and the Triton K1
+# decode cells on the new code (questions Q1, Q2 and Q3 of SESSION.md
+# section 8, V2). Card: the V2a pod (RTX 4090).
+# Commits: job 2 and job 5 on fork branch kbench-v2-37 = code e1d652e89
+# (refs/fix quantization-37, the new 35-37 code) + the torch
+# custom-gradient device fix 8759b67e7 (cherry-pick) + the pod files; job
+# 3 on fork branch kbench-v2-41 = code bb5205253 (refs/fix
+# quantization-41, the tip) + the same fix + the pod files. The
+# measurement SHAs and the push order: SESSION.md section 8 (V2).
+# Push (from quant-tooling/kernels/pod/):
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-37 jobs-v2/V2a-ab-new.txt 15
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-41 jobs-v2/V2a-ab-new.txt 15
+# Expected time: about 9.5 min on a normal host (the 7 min of
+# V2a-ab-old.txt, then the Triton smoke check 0.5 and ab-decode-goal 2).
+# The Mosaic GPU lines are the same as in V2a-ab-old.txt and run first,
+# so the Mosaic GPU stages of jobs 1-5 run in the same order. Their
+# meaning: V2a-ab-old.txt.
+#
+# Triton K1 (Q3): on 41 a fixed group index (int4 G128, AWQ) runs the
+# CONTIGUOUS fast loop, which compiles alone; GPTQ G128 (a free index)
+# and int4 per channel run the same code as on 37 and are the controls.
+# ab-decode-goal holds the goal cells of O1 job 3 and V1 decode-goal
+# (int4_g128, gptq and awq at 4096x4096, M 1, 4 and 16) and the two
+# Llama-3-8B shapes, without gptq_act and 8192x8192. It runs after the
+# Mosaic GPU stages, in its own process (V1-FOLLOWUPS item 6).
+
+check mosaic-smoke mosaic jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+check prof-nsys nsys jax-new gpu 5 $PROF probe --install --require nsys
+check triton-smoke triton torch gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py -k "W4A16MatmulTest and test_matches_the_oracle_int4_g128_dense_decode_bfloat16"
+
+time ab-bench-chain mosaic jax-new any 6 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,14336x4096,4096x14336 --m=1 --forms=float --routes=mosaic_gpu --timing=graph --l2_mb=$KL2_MB
+prof ab-chain mosaic jax-new any 8 export PYTHONUNBUFFERED=1; C=""; if [ "$KMODE" = cpu ]; then C="--interpret --shape=256x512 --layers=2 --calls=2 --warmup=1"; fi; rc=0; for c in int4_g128:4096x4096:float,shipped,noguard gptq:4096x4096:shipped,noguard awq:4096x4096:shipped,noguard int4_pc:4096x4096:shipped,noguard int4_g128:14336x4096:float,shipped,noguard int4_g128:4096x14336:float,shipped,noguard; do IFS=: read -r mode shape cands <<< "$c"; echo "$(date -u +%H:%M:%S) cell $mode $shape $cands"; python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cands --l2_mb=$KL2_MB --out="$KSTAGE_OUT/chain_ab.jsonl" $C || { echo "cell $mode $shape failed"; rc=1; }; done; bash -c 'exit $0' $rc
+prof ab-chain-nsys mosaic+nsys jax-new gpu 8 NSYS=$(python -c "from benchmarks.quantized_matmul.pod.prof import find_tool; print(find_tool('nsys'))"); rc=0; for run in int4_g128:4096x4096:shipped int4_g128:4096x4096:noguard gptq:4096x4096:shipped awq:4096x4096:shipped int4_pc:4096x4096:shipped int4_g128:14336x4096:shipped int4_g128:4096x14336:shipped int4_g128:4096x4096:float; do IFS=: read -r mode shape cand <<< "$run"; t="$KSTAGE_OUT/$mode-$shape-$cand"; echo "$(date -u +%H:%M:%S) run $run"; "$NSYS" profile --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o "$t" python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cand --calls=20 --warmup=3 --gap_ms=2 --l2_mb=$KL2_MB --out="$t.jsonl" > "$t.log" 2>&1 && "$NSYS" export --type=sqlite --force-overwrite=true -o "$t.sqlite" "$t.nsys-rep" > /dev/null 2>&1 && python benchmarks/quantized_matmul/pod/chain_split.py report "$t.sqlite" --meta="$t.jsonl" --calls=20 > "$t.split.json" || { echo "run $run failed"; rc=1; }; rm -f "$t.nsys-rep" "$t.sqlite"; done; bash -c 'exit $0' $rc
+prof ab-tune-direct mosaic jax-new any 6 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=bfloat16 --modes=int4_g128,int4_pc --shapes=4096x4096,14336x4096,4096x14336 --m=1 --grid=small --l2_mb=$KL2_MB
+time ab-decode-goal triton torch any 6 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,awq --shapes=4096x4096,14336x4096,4096x14336 --m=1,4,16 --forms=float --routes=triton --timing=graph

@@ -1,0 +1,37 @@
+# S1b: conditional Mosaic GPU retry, sm_89 (plan_v3.md 4.3, 8.4, 8.6).
+# Runs only if the Mosaic GPU correctness stage fails in S1 and again in S2,
+# between S2 and S3, and only under the S1b ledger rule of plan 8.6.
+# Card: RTX 4090, as S1. Budget 0.75 h. Session deadline 67 min.
+# Times from the create (pod_env.py): KSTAGES_UNTIL 52 min, KHARD_UNTIL
+# 57 min. Worst case: the stages stop at 52 min, KDONE at about 53 min, the
+# grace ends at about 58 min. The watchdog can stop the pod 1 min earlier.
+# Format: SESSION.md, "Session files".
+session S1b
+venvs jax-new jax-floor
+install_timeout 10
+global_timeout 45
+deadline 67
+grace_s 300
+l2_mb 96
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+
+# Mosaic GPU K1 and K-packed under "require", both JAX venvs. TODO: the GPU
+# test names are not final. A failure writes its per-block and per-plane
+# error maps as JSON files into $KSTAGE_OUT.
+TODO check mosaic-g3-new mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_g3_case"
+TODO check mosaic-k1-new mosaic jax-new gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check mosaic-k1-floor mosaic-floor jax-floor gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check kpack-mosaic-new kpack-mosaic jax-new gpu 10 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check kpack-mosaic-floor kpack-mosaic-floor jax-floor gpu 10 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+TODO check mosaic-cpu-floor mosaic-floor jax-floor cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+# The existing quantization tests under "require". Their route gates no
+# timing stage. The four deselects are the same as in S1.txt (see there).
+check existing-require-jax require-jax jax-new gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py keras/src/layers/core/embedding_test.py keras/src/layers/core/reversible_embedding_test.py --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_awq_mixed_bfloat16 --deselect keras/src/quantizers/modes/calibration_test.py::CalibrationRouteTest::test_wrapped_reference_dense_gptq_mixed_bfloat16
+
+# The decode numbers that S1 could not give, against the XLA forms on the
+# same JAX.
+time mosaic-k1-decode mosaic jax-new any 12 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --m=1,4,16 --forms=float,F0,F1,F3 --routes=mosaic_gpu --l2_mb=$KL2_MB
+TODO time kpack-mosaic-logits kpack-mosaic jax-new any 8 $BENCH --levels=logits --modes=int4_g128,int4_pc --logits_m=1,4,16 --forms=float,F0 --routes= --logits_routes=TODO_mosaic_kpacked_route
