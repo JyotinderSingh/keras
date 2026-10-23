@@ -1,0 +1,12 @@
+# SX job 2, optional (run sx-20261024-1), on fork branch kbench-sx-b
+# (commit B + the pod files). Pushed only when the budget allows after
+# job 1 (SESSION.md section 10.4).
+# rows-group: the stage command of gt-triton-prefill on the float16
+# 14336x4096 group only (the modes int4_g128, int4_pc and gptq at M 64,
+# 256 and 2048, the cells 49 to 56 of the full stage), with no cells
+# before it. rows-blocking of job 0 named the faulting launch: the first
+# replay of the float graph in cell 56 (captured in cell 50, replayed in
+# cells 50 and 53). Does the group alone give the fault? If it does, it is
+# a repro of about 2 min. The probe stops after cell 56.
+check probe-env-group crash torch any 2 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py env
+prof rows-group crash torch any 4 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py rows --stop-after=float16/gptq/14336x4096/256 -- --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq --dtypes=float16 --shapes=14336x4096 --m=64,256,2048 --l2_mb=$KL2_MB
