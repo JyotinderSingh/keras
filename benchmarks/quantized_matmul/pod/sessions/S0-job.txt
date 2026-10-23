@@ -1,0 +1,23 @@
+# S0 loop job (plan_v3.md 8.9, SESSION.md section 10.5). Not a session file:
+# push it with push_job.sh twice, each time after the KJOB DONE line of the
+# job before. Both jobs use the measurement SHA of the session. Each job
+# runs its check lines first, then its time and prof lines.
+#
+# Correctness. TODO: the test names are not final (as in S0.txt).
+TODO check triton-bf16-case triton torch gpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_one_bfloat16_case_of_test_matches_the_oracle"
+TODO check triton-interpret triton torch cpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_one_float32_case_of_test_matches_the_oracle"
+# The counters again: the route gate of job-ncu needs a check of this job.
+check prof-ncu ncu torch gpu 3 $PROF probe --require ncu
+
+# Timing: the roofline copy and one decode cell, the forms only.
+time job-copy base torch any 3 $BENCH --levels= --copy_mb=1024
+time job-decode base torch any 5 $BENCH --levels=chain --modes=int4_g128 --shapes=4096x4096 --m=1 --forms=float,F0,F3 --routes=
+
+# Profiling: each tool once, on the routes of the base commit. The Triton
+# self-test kernel shows n_regs, n_spills, shared memory, warps, stages and
+# do_bench before a kernel route exists.
+prof job-triton-selftest base torch any 4 $PROF run --triton --selftest
+prof job-torch-profile base torch any 5 $PROF run --torch-profile -- --levels=dense --modes=int4_g128 --shapes=4096x4096 --m=1,16 --forms=F0,F3 --routes= --timing=eager --warmup=2 --calls=5
+prof job-jax-profile base jax-new any 5 $PROF run --jax-profile --mosaic --xla-dump='.*' -- --levels=dense --modes=int4_g128 --shapes=4096x4096 --m=1,16 --forms=F0,F3 --routes= --warmup=2 --calls=5 --l2_mb=$KL2_MB
+# ncu on one kernel launch (the 21st of the run), if the counters work.
+prof job-ncu base+ncu torch gpu 6 $PROF ncu --kernel regex:. --launch-skip 20 -- --levels=dense --modes=int4_g128 --shapes=4096x4096 --m=1 --forms=F0 --routes= --timing=eager --warmup=1 --calls=2 --copy_mb=64
