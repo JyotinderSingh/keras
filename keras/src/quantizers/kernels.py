@@ -95,6 +95,25 @@ _ALLOW_LIST = {
     ("torch", "cpu-arm64", "bfloat16", "17-64"): (("n5", None),),
     ("torch", "cpu-arm64", "bfloat16", "65-256"): (("n5", None),),
     ("torch", "cpu-arm64", "bfloat16", "257+"): (("n5", None),),
+    # 2026-10-23-cpu3c-x86-torch-cpu-n5.jsonl (8 vCPU x86_64, torch eager).
+    # K = N = 4096 at M = 64.
+    ("torch", "cpu-x86_64", "float32", "17-64"): (("n5", None),),
+    # 2026-10-23-rtx4090-torch-cuda-triton.jsonl (NVIDIA GeForce RTX 4090,
+    # torch eager). Six shapes at M 1 and 16, three shapes above.
+    ("torch", "cuda-sm89", "bfloat16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm89", "bfloat16", "17-64"): (("triton", None),),
+    ("torch", "cuda-sm89", "bfloat16", "65-256"): (("triton", None),),
+    ("torch", "cuda-sm89", "bfloat16", "257+"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "17-64"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "65-256"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "257+"): (("triton", None),),
+    # 2026-10-23-h100sxm-torch-cuda-triton.jsonl (NVIDIA H100 SXM, torch
+    # eager). Four shapes at M 1 and 16, three shapes above.
+    ("torch", "cuda-sm90", "bfloat16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm90", "bfloat16", "17-64"): (("triton", None),),
+    ("torch", "cuda-sm90", "bfloat16", "65-256"): (("triton", None),),
+    ("torch", "cuda-sm90", "float16", "1-16"): (("triton", None),),
 }
 # backend -> {device type of `list_devices`: the kernel of `"require"`}
 _REQUIRED = {}
@@ -634,7 +653,21 @@ _LOOKUP_ROUTES = {
     "reference_wrapped": RouteSource(_reference_lookup, matrix=False)
 }
 # (backend, device class, compute dtype, M bucket) -> ((route, config), ...)
-_LOOKUP_ALLOW_LIST = {}
+# The compute dtype is the reverse dtype of the layer, when it has one.
+_LOOKUP_ALLOW_LIST = {
+    # 2026-10-23-rtx4090-torch-cuda-triton.jsonl (NVIDIA GeForce RTX 4090,
+    # torch eager). Five tables at M 1 and 16, and at M = 64.
+    ("torch", "cuda-sm89", "bfloat16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm89", "bfloat16", "17-64"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm89", "float16", "17-64"): (("triton", None),),
+    # 2026-10-23-h100sxm-torch-cuda-triton.jsonl (NVIDIA H100 SXM, torch
+    # eager). Five tables at M 1 and 16, and at M = 64.
+    ("torch", "cuda-sm90", "bfloat16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm90", "bfloat16", "17-64"): (("triton", None),),
+    ("torch", "cuda-sm90", "float16", "1-16"): (("triton", None),),
+    ("torch", "cuda-sm90", "float16", "17-64"): (("triton", None),),
+}
 
 
 def select_lookup_route(layer, table, orientation, inputs):
@@ -701,10 +734,11 @@ def run_lookup_route(route, layer, table, orientation, inputs):
 # Triton K1 (torch with CUDA): `backend.ops.quantized.w4a16_matmul`, a
 # `matrix` route. Its K-packed variant `w4a16_logits` is the reverse lookup
 # route of the same name. They are in `_ROUTES` and `_LOOKUP_ROUTES` only
-# where Triton imports, and they have no allow-list row until the GPU
-# sessions measure one. They are the kernels of `"require"` on a CUDA
-# device (device type "gpu" in `list_devices`), but not on ROCm, where
-# `pytorch-triton-rocm` imports as `triton`.
+# where Triton imports. Their allow-list rows hold the measured cells:
+# compute capability 8.9 and 9.0, bfloat16 and float16 compute. They are
+# the kernels of `"require"` on a CUDA device (device type "gpu" in
+# `list_devices`), but not on ROCm, where `pytorch-triton-rocm` imports as
+# `triton`.
 # The Triton releases that a run under `"require"` passed on (GPU CI or a
 # pod).
 TRITON_TESTED = ("3.8",)

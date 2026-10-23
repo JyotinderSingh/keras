@@ -248,6 +248,22 @@ def _counts(layer, x):
     return dict(kernels.route_counts)
 
 
+def _first_tested_route(routes):
+    """The first route of an allow-list row that this process has, with
+    its library version in its tested range, else `"reference"`. On the
+    device class of the row, this is the route that `"auto"` selects for a
+    call that passes the shape gates."""
+    for name, _ in routes:
+        source = kernels._ROUTES.get(name)
+        if source is None:
+            continue
+        if source.version is None or kernels.tested(
+            source.version(), source.tested_versions
+        ):
+            return name
+    return "reference"
+
+
 def _floor_and_bound(layer):
     """The G1 floor and the G2 bound of the layer's compute dtype."""
     if layer.compute_dtype == "float32":
@@ -563,26 +579,6 @@ class N5Test(testing.TestCase):
             self.assertEqual(
                 _counts(layer, _random((17, 256))), {"reference": 1}
             )
-
-    def test_rows_of_this_platform(self):
-        """Each allow-list row of this backend and device runs N5 (G8)."""
-        platform_key = _row_key("float32", "1-16")[:2]
-        rows = [key for key in kernels._ALLOW_LIST if key[:2] == platform_key]
-        if not rows:
-            self.skipTest("The allow-list has no row for this platform.")
-        for _, _, dtype, bucket in rows:
-            self.assertEqual(
-                kernels._ALLOW_LIST[(*platform_key, dtype, bucket)],
-                (("n5", None),),
-            )
-            policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
-            layer = _layer(ROUTABLE["dense"], 128, policy.get(dtype, dtype))
-            x = _random((BUCKET_ROWS[bucket], 256))
-            # Only `"auto"` reads the allow-list.
-            with kernels.policy("auto"):
-                self.assertEqual(_counts(layer, x), {"n5": 1})
-                direct = _numpy(_direct(layer, x))
-                self.assertAllEqual(_numpy(layer(x)), direct)
 
     @parameterized.named_parameters(("grouped", 32), ("per_channel", -1))
     @pytest.mark.skipif(
@@ -1197,6 +1193,88 @@ class AllowListTest(testing.TestCase):
         device = "cpu" if backend.backend() == "torch" else None
         cpu = f"cpu-{platform.machine()}"
         self.assertEqual(kernels._device_class(device), cpu)
+
+    def test_rows_can_pass_their_gates(self):
+        """Each row of both allow-lists has a backend, a device class of
+        `_device_class`, a compute dtype and an M bucket. Its routes serve
+        that backend, device class and compute dtype (gates 5 and 7), so
+        a row cannot name a cell that its routes refuse."""
+        buckets = [name for _, name in kernels._M_BUCKETS] + ["257+"]
+        mosaic_gpu = {
+            "cuda-sm" + capability.replace(".", "")
+            for capability in kernels._MOSAIC_GPU_CAPABILITIES
+        }
+        # Kernel -> (its backend, whether it serves a device class).
+        kernel_classes = {
+            "triton": (
+                "torch",
+                lambda c: c.startswith("cuda-sm") and int(c[7:]) >= 80,
+            ),
+            "mosaic_gpu": ("jax", lambda c: c in mosaic_gpu),
+            "pallas_tpu": ("jax", lambda c: c.startswith("tpu-")),
+        }
+        backends = ("jax", "numpy", "tensorflow", "torch")
+        device_classes = r"^(cuda-sm\d+|tpu-.+|mps|cpu-.+|gpu)$"
+        # The reverse lookup has kernel routes only.
+        tables = (
+            (kernels._ALLOW_LIST, kernels._ROUTES, ("n5", *kernel_classes)),
+            (
+                kernels._LOOKUP_ALLOW_LIST,
+                kernels._LOOKUP_ROUTES,
+                kernel_classes,
+            ),
+        )
+        for allow_list, sources, names in tables:
+            for key, routes in allow_list.items():
+                backend_name, device_class, dtype, bucket = key
+                self.assertIn(backend_name, backends)
+                self.assertRegex(device_class, device_classes)
+                self.assertIn(dtype, ("bfloat16", "float16", "float32"))
+                self.assertIn(bucket, buckets)
+                self.assertNotEqual(len(routes), 0, key)
+                for name, _ in routes:
+                    self.assertIn(name, names, key)
+                    if name in kernel_classes:
+                        owner, serves = kernel_classes[name]
+                        self.assertEqual(backend_name, owner, key)
+                        self.assertTrue(serves(device_class), key)
+                    # A source that this process does not register (Triton
+                    # off torch) has no dtypes to read.
+                    source = sources.get(name)
+                    if source is not None and source.dtypes:
+                        self.assertIn(dtype, source.dtypes, key)
+
+    def test_rows_of_this_platform(self):
+        """Under `"auto"`, each row of this backend and device runs its
+        first route that this process has in its tested version range,
+        and the layer output equals a direct call of the route (G8). With
+        no such route, the reference path runs. The layer passes the
+        shape gates of every route: `K = 256`, `N = 128` and groups of
+        128."""
+        platform_key = _row_key("float32", "1-16")[:2]
+        rows = {
+            key: routes
+            for key, routes in kernels._ALLOW_LIST.items()
+            if key[:2] == platform_key
+        }
+        if not rows:
+            self.skipTest("The allow-list has no row for this platform.")
+        policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
+        for (_, _, dtype, bucket), routes in rows.items():
+            with self.subTest(dtype=dtype, bucket=bucket):
+                case = (None, 128, (BUCKET_ROWS[bucket], 256))
+                layer = _layer(case, 128, policy.get(dtype, dtype))
+                x = _random(case[2])
+                expected = _first_tested_route(routes)
+                # Only `"auto"` reads the allow-list.
+                with kernels.policy("auto"):
+                    self.assertEqual(_counts(layer, x), {expected: 1})
+                    y = _numpy(layer(x))
+                    if expected != "reference":
+                        self.assertAllEqual(y, _numpy(_direct(layer, x)))
+                if expected == "reference":
+                    with kernels.policy("off"):
+                        self.assertAllEqual(y, _numpy(layer(x)))
 
 
 class PolicyTest(testing.TestCase):
