@@ -1,0 +1,100 @@
+# S0: smoke session, sm_89 (plan_v3.md 8.4, 4.3 and 8.9).
+# Cards: RTX 2000 Ada secure $0.24; L4 secure $0.59; RTX 4090 community $0.34.
+# Budget 0.67 h (plan 8.4: 0.5 h; plan 8.9 adds the loop and the profilers).
+# Session deadline 60 min (1.5 x budget).
+# Times from the create (pod_env.py): restart probe 5 min, KSTART_BY 20 min,
+# KSTAGES_UNTIL 45 min, KHARD_UNTIL 50 min.
+# Loop mode (SESSION.md section 10): the stages of this file are job 0.
+# Then Claude pushes sessions/S0-job.txt twice (two jobs in a row, and the
+# dedupe), and pushes nothing more: the idle stop comes 5 min after the end
+# of the last job (idle_stop_s, short for S0 only). Claude pushes job 1 at
+# `KJOB <RUN_ID>-j0 DONE` and reads the chunks of job 0 while job 1 runs.
+# Typical case: probe 5 + pull 2 + install 7 + job 0 15 = 29 min; two jobs
+# of 3 min and the reads between them: 37 min; the idle stop at 42 min.
+# Worst case: job 0 runs to KSTAGES_UNTIL (45 min), no loop job starts, and
+# the self-stop starts after the grace time at about 51 min. The watchdog
+# can stop the pod at 50 min.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+#
+# S0 items outside this file:
+# - Image contents, versions, nvidia-smi: the KPROBE lines.
+# - Install time of each venv: the KINSTALL lines.
+# - The size cap of stream-pod-logs: known from s0-20261022-2 (about 240 KB
+#   per read, SESSION.md section 2.3). So this file has no logcap_kb line,
+#   and the pod prints no KFILL lines.
+# - The read rate of the chunks, and if stream-pod-logs reads an EXITED pod.
+# - Restart behavior after an exit: env KRESTART_PROBE_UNTIL (SESSION.md).
+# - The loop mode: two jobs, the dedupe, the idle stop (SESSION.md 10.5).
+# - The self-stop with the pod-scoped key: after the idle stop.
+session S0
+loop yes
+idle_stop_s 300
+# The venvs of the stages of this file, and no more (SESSION.md section 7).
+venvs jax-ci jax-new jax-floor torch tf
+install_timeout 12
+global_timeout 25
+deadline 60
+grace_s 300
+restart_probe_s 300
+l2_mb 72
+
+# Each venv sees the device (plan 8.4). A failure stops the later stages of
+# that venv.
+check env-jax-ci env jax-ci any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-tf env tf any 3 python -c "import os, tensorflow as tf; g = tf.config.list_physical_devices('GPU'); print(tf.__version__, g); assert os.environ['KMODE'] == 'cpu' or g"
+
+# Triton K1: one bfloat16 correctness case (P8a, branch
+# quantization-33-triton-w4a16). The test name is final: S0
+# (s0-20261022-2) ran this test, and it passed.
+check triton-bf16-case triton torch gpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "W4A16MatmulTest and test_matches_the_oracle_int4_g128_dense_decode_bfloat16"
+# CPU stand-in for the dry run (TRITON_INTERPRET=1). The interpreter computes
+# a wrong bfloat16 tl.dot (docker/README.md), so it runs a float32 case.
+check triton-interpret triton torch cpu 10 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "W4A16MatmulTest and test_matches_the_oracle_int4_g128_dense_decode_float32"
+
+# Mosaic GPU K1 checks of plan 4.3 (P12a, branch quantization-35-mosaic-gpu-w4a16).
+# The GPU tests are the GPUTest cases of quantized_test.py. S0
+# (s0-20261022-2) ran them, and they passed. Each GPU test that fails writes
+# its per-block and per-plane error maps as JSON files into $KSTAGE_OUT.
+# run_pod.sh adds every file there to the results.
+# 1. The first real ptxas compile and its register count. jaxlib 0.12.0
+#    (libjax_common.so) and jax-cuda13-pjrt 0.12.0 hold the names
+#    MOSAIC_GPU_DUMP_PTXAS, MOSAIC_GPU_DUMP_RESOURCES and MOSAIC_GPU_DUMP_TO
+#    (strings of the manylinux x86_64 wheels, read 2026-10-22). The dumps go
+#    to $KSTAGE_OUT, so the results hold them.
+check mosaic-ptxas mosaic jax-new gpu 8 MOSAIC_GPU_DUMP_PTXAS=1 MOSAIC_GPU_DUMP_RESOURCES=1 MOSAIC_GPU_DUMP_TO=$KSTAGE_OUT python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+# 2. A decode configuration below 48 KB of SMEM (BM 16, BNH 32, 3 stages) and
+#    a prefill configuration above it (BM 64, BNH 64, 2 stages, about 83 KB).
+check mosaic-smem mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_against_the_oracle"
+# 3. The G3 exactness case with N/2 > BNH and several groups, on both JAX venvs.
+check mosaic-g3-new mosaic jax-new gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data"
+check mosaic-g3-floor mosaic-floor jax-floor gpu 8 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data"
+# CPU stand-ins for the dry run: the lowering with the copy-contiguity check,
+# and interpret mode.
+check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+check mosaic-cpu-floor mosaic-floor jax-floor cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# The CUDA-graph capture of every harness candidate on torch (float, F0, F1,
+# F3 and every route of the commit), at every level and mode.
+time s0-graph-capture harness torch any 8 $BENCH --levels=raw,dense,chain,logits,model --modes=int4_g128,int4_pc,gptq,gptq_act,awq,int8,int8_wo --shapes=2304x2304 --m=1,16 --logits_shapes=gemma3-1b --logits_m=1 --models=tiny --timing=graph,eager --warmup=3 --calls=10 --copy_mb=256
+# No graph record is skipped for a failed capture.
+check s0-graph-capture-ok harness - gpu 2 python3 -c "import json, os, sys; p = os.environ['KOUT'] + '/stages/s0-graph-capture/bench.jsonl'; r = [json.loads(t) for t in open(p)]; g = [x for x in r if x.get('timing') == 'graph']; bad = [x for x in g if 'capture failed' in str(x.get('skipped', ''))]; print(len(g), 'graph records,', len(bad), 'failed captures'); [print(x.get('level'), x.get('mode'), x.get('candidate'), str(x.get('skipped'))[:300]) for x in bad]; sys.exit(1 if bad or not g else 0)"
+
+# The harness on the JAX and TensorFlow GPU paths, before S1 spends on them.
+time s0-smoke-jax-new harness jax-new any 5 $BENCH --levels=dense,chain,logits --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --logits_shapes=gemma3-1b --logits_m=1 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
+time s0-smoke-jax-ci harness jax-ci any 5 $BENCH --levels=dense,chain --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
+time s0-smoke-tf harness tf any 5 $BENCH --levels=dense,chain --modes=int4_g128,gptq --shapes=4096x4096 --m=1,16 --l2_mb=$KL2_MB --calls=10 --copy_mb=256
+
+# Profilers (plan 8.9): are ncu and nsys in the image, and can the container
+# read the GPU performance counters (ERR_NVGPUCTRPERM)? `--install` installs
+# the tool of `--require` when it is missing, from the NVIDIA CUDA apt
+# repository, inside the stage limit. It does not install ncu when the
+# counters are blocked. A failure skips only the stages with the route ncu
+# or nsys. The CPU line runs the probe code. These stages come after the
+# kernel and harness stages: s0-20261022-2 gave their results (SESSION.md
+# section 3.4), so they have the lowest priority.
+check prof-ncu ncu torch gpu 10 $PROF probe --install --require ncu
+check prof-nsys nsys torch gpu 8 $PROF probe --install --require nsys
+check prof-probe-cpu prof-probe torch cpu 2 $PROF probe
