@@ -1,0 +1,15 @@
+# S1b: retired on 2026-10-23. Do not run it.
+# S1b was the conditional retry of the Mosaic GPU correctness stage, if it
+# failed in S1 and in S2. S2 became the sweeps T1 and T2, and Mosaic GPU
+# K1 and K-packed passed their GPU tests on JAX 0.12.0 and 0.11.2 on S0,
+# H0, V1, V2a (sm_89) and V2h (sm_90). S1 runs the same checks on the
+# frozen code. If they fail there, the error maps of SESSION.md section
+# 3.3 decide a new session. The old stage list is in the fork commit
+# f672d28ab (benchmarks/quantized_matmul/pod/sessions/S1b.txt).
+session S1b
+venvs jax-new
+install_timeout 1
+global_timeout 1
+deadline 10
+grace_s 300
+l2_mb 72

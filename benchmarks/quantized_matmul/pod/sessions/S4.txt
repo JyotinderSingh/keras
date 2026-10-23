@@ -1,0 +1,87 @@
+# S4: sm_86 (A40), the sm_86 allow-list rows of P8b and P12b and the
+# shared-memory fit rule on a card with 99 KB per block (plan_v3.md 4.1,
+# 4.3, 8.3, 8.4 and 9; SESSION.md section 8, the row sessions). The first
+# run of both kernels on sm_86. sm_86 has no tuned rows: Triton takes its
+# default rows, fitted to the shared memory of the device (`fit_config`),
+# and Mosaic GPU takes the start rows of MOSAIC_GPU_CONFIGS for 84 SMs.
+# Measurement commit: as S1 (fork branch kbench-rows).
+# Cards: A40 secure $0.59/h (48 GB, 84 SMs: the SM count of _SMS for
+# 8.6). Fallbacks with less memory and other SM counts change the Mosaic
+# GPU split: RTX A6000 secure $0.59 (84 SMs), RTX 3090 $0.22-0.50 (82
+# SMs). No RTX 3070 (8 GB).
+# Budget 1.2 h (SESSION.md section 8: 0.75 h; the rows of two kernels on a
+# card with no tuned rows need the stages of S1 at a smaller grid).
+# Session deadline 108 min. Margin cost at the secure price: 1.5 x 1.2 h
+# x ($0.59 + $0.011) = $1.08.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 93
+# min, KHARD_UNTIL 98 min.
+# Expected stage times (normal host / slow host): the kernel checks 8 /
+# 15 min; the fit stages 3 / 5 min; rows-triton 4 / 6 + 4 / 6 + 4 / 6
+# min; rows-mosaic 7 / 11 + 4 / 6 + 4 / 6 min; the N5 stages 5 / 8 + 2 /
+# 3 + 5 / 8 min. In total about 50 / 80 min. The stage deadline cuts the
+# last stages first: the TF N5 rows.
+#
+# The fit rule (plan 4.1, 4.3): `triton-fit` lists each compiled Triton
+# kernel of the default rows at M 1, 64, 256 and 2048 in three dtypes,
+# with its shared memory (`shared`, KPROF lines; the limit is 101376
+# bytes); `mosaic-fit` gives the SMEM of each Mosaic GPU kernel from
+# ptxas. The triton-k1 module also holds the compile test of the rows
+# for sm_86 (`test_compiles_for_cuda`).
+# Rows (rows.py; stream timing, as in S1.txt). M per bucket: 1 and 16
+# (1-16), 64 (17-64), 256 (65-256), 2048 (257+).
+# - rows-triton-*: _ALLOW_LIST and _LOOKUP_ALLOW_LIST (torch, cuda-sm86,
+#   {bfloat16, float16, float32}, ...), routes triton and n5.
+# - rows-mosaic-*: _ALLOW_LIST (jax, cuda-sm86, {bfloat16, float16},
+#   every bucket) and _LOOKUP_ALLOW_LIST (..., {1-16, 17-64}), route
+#   mosaic_gpu, and n5 on JAX 0.12.0.
+# - rows-n5-*: n5 on JAX 0.10.2, JAX 0.12.0 in float32, and TF eager
+#   (a TF row needs S1, S3 and S4).
+# Format: SESSION.md, "Session files". Stage order is priority order. Not
+# a loop session.
+session S4
+venvs jax-ci jax-new torch tf
+install_timeout 12
+global_timeout 85
+deadline 108
+grace_s 300
+# The L2 of the A40 (6 MB): every chain has the least 8 layers.
+l2_mb 6
+
+check env-jax-ci env jax-ci any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-tf env tf any 3 python -c "import os, tensorflow as tf; g = tf.config.list_physical_devices('GPU'); print(tf.__version__, g); assert os.environ['KMODE'] == 'cpu' or g"
+
+# --- Correctness: the kernel modules under "require" (the first sm_86
+# run of both kernels). A Mosaic GPU failure writes the error maps of
+# SESSION.md section 3.3. ---
+check triton-k1 triton torch gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py
+check triton-logits triton-logits torch gpu 6 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py
+check mosaic-k1 mosaic jax-new gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-logits mosaic-logits jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+# CPU stand-ins for the dry run.
+check triton-k1-cpu triton torch cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py -k "test_config_table or test_fit_config or test_gate"
+check triton-logits-cpu triton-logits torch cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py -k "test_gate"
+check mosaic-cpu mosaic jax-new cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "ConfigTest or GateTest"
+check mosaic-logits-cpu mosaic-logits jax-new cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "ConfigTest or GateTest"
+
+# --- The fit rule on 99 KB per block. The bench records of a profiled
+# run go to a temporary file; the reports are the results. ---
+prof triton-fit triton torch any 6 $PROF run --triton -- --levels=dense,logits --modes=int4_g128,int4_pc,gptq,gptq_act --dtypes=bfloat16,float16,float32 --shapes=4096x4096 --m=1,64,256,2048 --logits_shapes=gemma2-2b,llama3-8b --logits_m=1,64 --forms= --routes=triton --logits_routes=triton --timing=eager --warmup=1 --calls=2
+prof mosaic-fit mosaic jax-new any 6 $PROF run --mosaic -- --levels=dense,logits --modes=int4_g128,int4_pc --dtypes=bfloat16 --shapes=4096x4096 --m=1,64,256,2048 --logits_shapes=gemma2-2b,llama3-8b --logits_m=1,64 --forms= --routes=mosaic_gpu --logits_routes=mosaic_gpu --timing=graph --warmup=1 --calls=2
+
+# --- The rows: Triton K1 and Triton K-packed (P8b). ---
+prof rows-triton-decode triton torch any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,gptq_act,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096,4096x14336,2304x9216 --m=1,16 --l2_mb=$KL2_MB
+prof rows-triton-prefill triton torch any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,gptq_act,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof rows-triton-logits triton-logits torch any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --level=logits --timing=stream,graph --modes=int4_g128,int4_pc --dtypes=bfloat16,float16,float32 --logits_shapes=gemma2-2b,gemma3-1b,llama3.2-1b,llama3-8b,mistral-7b-v0.3 --logits_m=1,16,64 --l2_mb=$KL2_MB
+
+# --- The rows: Mosaic GPU K1 and Mosaic GPU K-packed (P12b), with N5 on
+# JAX 0.12.0. ---
+prof rows-mosaic-decode mosaic jax-new any 12 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336,2304x9216 --m=1,16 --l2_mb=$KL2_MB
+prof rows-mosaic-prefill mosaic jax-new any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof rows-mosaic-logits mosaic-logits jax-new any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --level=logits --modes=int4_g128,int4_pc --dtypes=bfloat16,float16 --logits_shapes=gemma2-2b,gemma3-1b,llama3.2-1b,llama3-8b,mistral-7b-v0.3 --logits_m=1,16,64 --l2_mb=$KL2_MB
+
+# --- The N5 rows on sm_86 (P8b). ---
+prof rows-n5-jax-ci base jax-ci any 9 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=float,F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096 --m=1,16,64,256,2048 --l2_mb=$KL2_MB
+prof rows-n5-jax-new-f32 base jax-new any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=float,F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096,14336x4096 --m=1,16,64,256,2048 --l2_mb=$KL2_MB
+prof rows-n5-tf base tf any 9 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096 --m=1,16,64,256,2048 --l2_mb=$KL2_MB

@@ -1,0 +1,41 @@
+# V2a jobs 1 and 4: the Mosaic GPU K1 A/B stages on old 35 (questions Q1
+# and Q2 of SESSION.md section 8, V2). Card: the V2a pod (RTX 4090).
+# Commit: fork branch kbench-v2-old = code 717b9912f (old branch 35, the
+# M1 code of O2) + the torch custom-gradient device fix 8759b67e7 (its
+# child) + the pod files. The measurement SHA and the push order:
+# SESSION.md section 8 (V2).
+# Push (from quant-tooling/kernels/pod/):
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-old jobs-v2/V2a-ab-old.txt 12
+# Expected time: about 7 min on a normal host (smoke 0.5, nsys check 0.3,
+# bench chain 1, chain A/B 1.5, chain nsys 1.5, tune direct 2).
+# The Mosaic GPU lines are the same in V2a-ab-old.txt and V2a-ab-new.txt,
+# and the pod files are the same in the three commits, so jobs 1-5
+# differ only in the code. bench.py of old 35 differs from the new code
+# only in `_read_variables` (the bytes of an untied logits table), which
+# the chain level does not read.
+#
+# Stages (each one process; the checks run first):
+# - ab-bench-chain: bench.py chain timing (parallel chain, graph timing,
+#   M = 1), float and the route, as V1 mosaic-k1-decode and O2 decode-k1
+#   measured it (the V1 ratio 1.54x came from this method).
+# - ab-chain: chain_split.py, sequential chain, M = 1: float, shipped
+#   (the route as it is: the group guard on old 35 and 37; on 41 only
+#   GPTQ G128 has it) and noguard. sync_min_us, stream_us, temp_bytes,
+#   max_diff_vs_first_route per candidate.
+# - ab-chain-nsys: the same runs under nsys, one candidate per process;
+#   chain_split.py report: span, busy, idle, kernels per layer, the time
+#   of the Mosaic GPU kernel and of each frontend fusion (per_name_us).
+# - ab-tune-direct: tune.py, the kernel alone (no route, no guard), the
+#   small decode grid and the default row of the commit, M = 1, then the
+#   confirmation pass. The old default row (16,32,3,256) runs as
+#   (16,32,3,4) at 4096x4096 and 14336x4096 and (16,32,3,2) at
+#   4096x14336; the small grid holds these configurations, so both
+#   commits time them.
+
+check mosaic-smoke mosaic jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+check prof-nsys nsys jax-new gpu 5 $PROF probe --install --require nsys
+
+time ab-bench-chain mosaic jax-new any 6 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,14336x4096,4096x14336 --m=1 --forms=float --routes=mosaic_gpu --timing=graph --l2_mb=$KL2_MB
+prof ab-chain mosaic jax-new any 8 export PYTHONUNBUFFERED=1; C=""; if [ "$KMODE" = cpu ]; then C="--interpret --shape=256x512 --layers=2 --calls=2 --warmup=1"; fi; rc=0; for c in int4_g128:4096x4096:float,shipped,noguard gptq:4096x4096:shipped,noguard awq:4096x4096:shipped,noguard int4_pc:4096x4096:shipped,noguard int4_g128:14336x4096:float,shipped,noguard int4_g128:4096x14336:float,shipped,noguard; do IFS=: read -r mode shape cands <<< "$c"; echo "$(date -u +%H:%M:%S) cell $mode $shape $cands"; python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cands --l2_mb=$KL2_MB --out="$KSTAGE_OUT/chain_ab.jsonl" $C || { echo "cell $mode $shape failed"; rc=1; }; done; bash -c 'exit $0' $rc
+prof ab-chain-nsys mosaic+nsys jax-new gpu 8 NSYS=$(python -c "from benchmarks.quantized_matmul.pod.prof import find_tool; print(find_tool('nsys'))"); rc=0; for run in int4_g128:4096x4096:shipped int4_g128:4096x4096:noguard gptq:4096x4096:shipped awq:4096x4096:shipped int4_pc:4096x4096:shipped int4_g128:14336x4096:shipped int4_g128:4096x14336:shipped int4_g128:4096x4096:float; do IFS=: read -r mode shape cand <<< "$run"; t="$KSTAGE_OUT/$mode-$shape-$cand"; echo "$(date -u +%H:%M:%S) run $run"; "$NSYS" profile --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o "$t" python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cand --calls=20 --warmup=3 --gap_ms=2 --l2_mb=$KL2_MB --out="$t.jsonl" > "$t.log" 2>&1 && "$NSYS" export --type=sqlite --force-overwrite=true -o "$t.sqlite" "$t.nsys-rep" > /dev/null 2>&1 && python benchmarks/quantized_matmul/pod/chain_split.py report "$t.sqlite" --meta="$t.jsonl" --calls=20 > "$t.split.json" || { echo "run $run failed"; rc=1; }; rm -f "$t.nsys-rep" "$t.sqlite"; done; bash -c 'exit $0' $rc
+prof ab-tune-direct mosaic jax-new any 6 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=bfloat16 --modes=int4_g128,int4_pc --shapes=4096x4096,14336x4096,4096x14336 --m=1 --grid=small --l2_mb=$KL2_MB

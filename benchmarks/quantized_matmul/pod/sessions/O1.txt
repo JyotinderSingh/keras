@@ -1,0 +1,20 @@
+# O1: sm_89, optimization of Triton K1 (plan_v3.md 8.9;
+# quant-tooling/kernels/opt/triton-k1/PLAN.md). Loop mode (SESSION.md
+# section 10). Job 0: the device check, the Triton checks and the nsys
+# install. The jobs are in opt/triton-k1/jobs/. Budget 1.5 h, session
+# deadline 135 min.
+session O1
+loop yes
+idle_stop_s 900
+venvs torch
+install_timeout 12
+global_timeout 12
+deadline 135
+grace_s 300
+l2_mb 72
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check triton-k1 triton torch gpu 8 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "float32 and (test_matches_the_oracle or test_exact_data)"
+check prof-nsys nsys torch gpu 8 $PROF probe --install --require nsys
+TODO check kpack-triton kpack-triton torch gpu 10 python -m pytest -q -p no:cacheprovider TODO_triton_kpacked_test_file

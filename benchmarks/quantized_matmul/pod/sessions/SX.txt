@@ -1,0 +1,69 @@
+# SX: sm_89 (RTX 4090), run sx-20261024-1. Loop mode (SESSION.md
+# section 10), two jobs: the cause of the CUDA launch failure of S1r job 1
+# and S1x job 0.
+# There, the rows.py stage gt-triton-prefill on commit B (kbench-s1x-b
+# 2e0e834ca: the old 43 + the host-scalar fix 6b8fc4cb6) stopped in cell
+# 56, float16 gptq 14336x4096 M=256, in the CUDA-graph samples of float,
+# F0 and triton (the n5 capture failed), with "torch.AcceleratorError:
+# CUDA error: unspecified launch failure" (CUDA_ERROR_LAUNCH_FAILED 719
+# from cuCtxSynchronize_v2). Each candidate alone, the short flows and
+# Triton alone with CUDA_LAUNCH_BLOCKING=1 passed, with correct values.
+# Hypotheses: H1, a kernel reads or writes out of bounds and faults only
+# with a certain memory layout; H2, the failed N5 captures before the
+# cell leave torch or the harness in a bad state; H3, the F0 graph (new
+# since the host-scalar fix).
+# Job 0 (this file), on fork branch kbench-sx-b = commit B + one
+# fork-only commit with the pod files of this folder.
+# probes/sx_probe.py (docstring) runs the stages:
+# - san-install: compute-sanitizer from the NVIDIA CUDA apt repository
+#   (cuda-sanitizer-13-2, the CUDA version of the driver, with cuda-gdb
+#   for the GPU core dumps), else cuda-sanitizer-13-0, else the pip
+#   package nvidia-cuda-sanitizer-api. A failure skips `sanitize` (route
+#   san). Mode gpu: the dry run has no CUDA repository.
+# - sanitize: memcheck and initcheck on the cell alone: triton, F0 and
+#   float at M=256 with no caching allocator (each tensor its own
+#   allocation, so memcheck knows its bounds) and with it (the graphs);
+#   triton at M=64 and in bfloat16; the S1r order with the failed n5
+#   capture.
+# - rows-blocking: the full stage command with CUDA_LAUNCH_BLOCKING=1 and
+#   a light GPU core dump on a GPU exception (cuda-gdb names the kernel).
+# - rows-no-n5: the stage command with no n5 candidate (no failed
+#   capture), no launch blocking.
+# - rows-no-f0-graph: the stage command with no F0 graph (F0 keeps its
+#   stream samples), no launch blocking.
+# The three rows stages stop after cell 56 (`--stop-after`), and each
+# records the cell, the candidate and the timing of a crash.
+# Job 1 (jobs-v2/SX-b2.txt), on fork branch kbench-sx-b2 = the stack tip
+# quantization-43-mosaic-gpu-rows 6420fe0c3 (its N5 makes no host tensor)
+# + the cherry-pick of 6b8fc4cb6 + one fork-only commit with the pod files
+# of this folder: the full stage command, no launch blocking.
+# Card: RTX 4090 community $0.34/h if it has stock, else secure $0.89/h.
+# Budget 0.8 h. Session deadline 72 min (1.5 x budget). Margin cost at
+# the secure price: 1.5 x 0.8 h x ($0.89 + $0.011) = $1.08.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL
+# 57 min, KHARD_UNTIL 62 min. global_timeout 33 caps job 0, so that job 1
+# (timeout at most the budget left) ends inside the budget of 48 min:
+# boot and install about 2.5 min + 33 + the push 1 + job 1 + the reads
+# and the delete 2.
+# Expected: install 1.5 min, sanitize 6, rows-blocking 9 (S1x: the crash
+# after 400 s), rows-no-n5 6, rows-no-f0-graph 7; job 1 7 (to cell 56).
+# The deadline can cut the last stages of job 0 and job 1.
+# Format: SESSION.md, "Session files".
+session SX
+venvs torch
+install_timeout 8
+global_timeout 33
+deadline 72
+grace_s 300
+l2_mb 72
+loop yes
+idle_stop_s 600
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check probe-env crash torch any 2 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py env
+check san-install san torch gpu 5 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py install
+
+prof sanitize san torch any 8 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py sanitize
+prof rows-blocking crash torch any 12 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py rows --blocking --coredump --stop-after=float16/gptq/14336x4096/256 -- --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof rows-no-n5 crash torch any 8 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py rows --stop-after=float16/gptq/14336x4096/256 -- --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB --candidates=float,F0,triton
+prof rows-no-f0-graph crash torch any 9 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py rows --no-graph=F0 --stop-after=float16/gptq/14336x4096/256 -- --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB

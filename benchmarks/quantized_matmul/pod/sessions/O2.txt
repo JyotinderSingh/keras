@@ -1,0 +1,84 @@
+# O2: sm_89, optimization of Mosaic GPU K1 and Mosaic GPU K-packed
+# (plan_v3.md 8.9).
+# Cards: RTX 4090 community $0.34; L4 secure $0.59; RTX 4090 secure $0.89.
+# Budget 1.5 h. Session deadline 135 min (1.5 x budget).
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 120 min,
+# KHARD_UNTIL 125 min. pod_env.py also sets KQUEUE_BRANCH to
+# kernel-pod-queue-<RUN_ID>, the default branch of push_job.sh. The first
+# push to the pod needs --create (PARALLEL.md).
+# Loop mode (SESSION.md section 10). The stages of this file are job 0: they
+# run once after the setup, on the measurement commit of the create. Then
+# the pod runs each job that Claude pushes with push_job.sh, and stops 15
+# min after the end of the last job (idle_stop_s), or at KHARD_UNTIL.
+# global_timeout is the stage window of job 0 and the default timeout of
+# each later job: give push_job.sh a timeout for the later jobs. Job 0 has
+# about 8 min of checks and 15 min of timing and profiling (50 min at most),
+# so the loop jobs get most of the budget. The configuration sweep of
+# Mosaic GPU K1 (tune.py) is the session T2 (SESSION.md section 8); a loop job
+# can run one sweep stage of T2.txt again after a kernel change.
+# Goal (plan 8.9): Mosaic GPU K1 decode at 50% or more of the copy bandwidth
+# at K = N >= 4096; Mosaic GPU K-packed past the K-packed row rule against
+# F0 (plan 8.3). Claude deletes the pod when the goal is met, when two jobs
+# in sequence gain less than 3%, or at the budget. If the Mosaic GPU stop
+# rule of plan 8.3 applied after S1, O2 does not run.
+# Content of later jobs (plan 8.9): BNH, stages, SPLIT_K, min_blocks, BM,
+# the cost of the `rows` frontend.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session O2
+loop yes
+idle_stop_s 900
+venvs jax-new
+install_timeout 12
+global_timeout 50
+deadline 135
+grace_s 300
+# The largest L2 of the O2 cards (RTX 4090: 72 MB; L4: 48 MB).
+l2_mb 72
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+# ncu and the GPU performance counters (the result of S0 decides if ncu is
+# usable). A failure skips only the ncu stages.
+check prof-ncu ncu jax-new gpu 8 $PROF probe --install --require ncu
+
+# --- Correctness under "require" (G1-G5, G8). A failure prints KFAIL
+# <route>, writes the error maps of SESSION.md section 3.3, and skips the
+# timing and profiling stages of that route.
+# Mosaic GPU K1: GPUTest (24 tests: G3 exact data and the oracle, decode
+# and prefill, int4, int4 per channel and GPTQ, bfloat16 and float16)
+# through the "require" runner. Each layer call runs the real route with the
+# MOSAIC_GPU_CONFIGS row of the card; the sweep of T2 checks every other
+# configuration. The other classes of the module (lowering, interpret mode,
+# the gates) assume the policy "auto" and run on CPU.
+check mosaic-k1 mosaic jax-new gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+TODO check kpack-mosaic kpack-mosaic jax-new gpu 15 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+# CPU stand-in for the dry run: the lowering (40 tests) and interpret mode
+# (42 tests).
+check mosaic-cpu mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# --- Timing. ---
+# The roofline: the copy bandwidth of the card (plan 8.2).
+time copy base jax-new any 3 $BENCH --levels= --copy_mb=1024 --l2_mb=$KL2_MB
+# The decode cells of plan 8.1 (chain level, M 1, 4 and 16) at K = N = 4096
+# and the keras-hub decoder shapes (Llama-3-8B 4096x14336 and 14336x4096,
+# Gemma2-2B 2304x9216 and 2304x2304), against the XLA forms on the same JAX.
+time decode-k1 mosaic jax-new any 20 $BENCH --levels=chain --modes=int4_g128,int4_pc,gptq,gptq_act,awq --shapes=4096x4096,4096x14336,14336x4096,2304x9216,2304x2304 --m=1,4,16 --forms=float,F0,F1,F3 --routes=mosaic_gpu,n5 --timing=graph --l2_mb=$KL2_MB
+# K-packed logits at decode. TODO: the route name of P12b is not final.
+TODO time decode-kpack kpack-mosaic jax-new any 10 $BENCH --levels=logits --modes=int4_g128,int4_pc --logits_m=1,4,16 --forms=float,F0 --routes= --logits_routes=TODO_mosaic_kpacked_route --l2_mb=$KL2_MB
+
+
+# --- Profiling (SESSION.md section 3.4). ---
+# The ptxas registers, spills and SMEM of each Mosaic GPU kernel of these
+# cells. On request, add --xla-dump=<module regex> for the XLA dump of the
+# lowered module, or --keep-dumps for all Mosaic GPU dump files.
+prof mosaic-ptxas mosaic jax-new any 10 $PROF run --mosaic -- --levels=dense --modes=int4_g128,int4_pc,gptq,awq --shapes=4096x4096,4096x14336,14336x4096,2304x9216,2304x2304 --m=1,4,16 --forms=F0 --routes=mosaic_gpu --warmup=1 --calls=2 --l2_mb=$KL2_MB
+TODO prof kpack-mosaic-ptxas kpack-mosaic jax-new any 8 $PROF run --mosaic -- --levels=logits --modes=int4_g128,int4_pc --logits_m=1,4,16 --forms=F0 --routes= --logits_routes=TODO_mosaic_kpacked_route --warmup=1 --calls=2 --l2_mb=$KL2_MB
+# The JAX profiler table: the device time of each kernel of the chain.
+prof jax-profile mosaic jax-new any 8 $PROF run --jax-profile -- --levels=chain --modes=int4_g128 --shapes=4096x4096 --m=1,16 --forms=F0 --routes=mosaic_gpu --warmup=2 --calls=5 --l2_mb=$KL2_MB
+# ncu on one launch of the kernel. The Pallas kernel `kernel` of
+# `_w4a16_kernel` lowers to the host function `kernel_mosaic_gpu` (the
+# exported module, JAX 0.12.0), so the regex takes the names with
+# `mosaic_gpu`. The jax-profile stage above lists the device kernel name;
+# if ncu finds no metric rows, set the regex to that name. The graph timing
+# of the cell launches the kernel 8 times (2 warm-up calls, 5 timed calls,
+# 1 call for err); ncu measures the fifth.
+prof ncu-k1 mosaic+ncu jax-new gpu 8 $PROF ncu --kernel regex:mosaic_gpu --launch-skip 4 -- --levels=dense --modes=int4_g128 --shapes=4096x4096 --m=1 --forms=F0 --routes=mosaic_gpu --timing=graph --warmup=2 --calls=5 --copy_mb=64 --l2_mb=$KL2_MB

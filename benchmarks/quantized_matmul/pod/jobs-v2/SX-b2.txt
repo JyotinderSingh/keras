@@ -1,0 +1,14 @@
+# SX job 1 (run sx-20261024-1). Fork branch kbench-sx-b2 = the stack tip
+# quantization-43-mosaic-gpu-rows 6420fe0c3 (branch 31 N5 makes no host
+# tensor, so the N5 of AWQ and of GPTQ with one group captures; GPTQ G128
+# still reads its guard predicate on the host) + the cherry-pick of
+# fix-torch-quantizer-host-scalars 6b8fc4cb6 (F0 captures) + one
+# fork-only commit with the pod files of this folder.
+# rows-b2: the full command of the S1r stage gt-triton-prefill through
+# probes/sx_probe.py (no launch blocking, no stop): does the crash of
+# cell 56 (float16 gptq 14336x4096 M=256) occur at the stack tip? The
+# probe records the cell, the candidate and the timing of a crash.
+# Push with a timeout of at most the budget left (SESSION.md section
+# 10.4); the timeout cuts the stage.
+check probe-env-b2 crash torch any 2 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py env
+prof rows-b2 crash torch any 12 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/sx_probe.py rows -- --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
