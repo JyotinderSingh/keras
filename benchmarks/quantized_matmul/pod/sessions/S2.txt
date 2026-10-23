@@ -1,0 +1,47 @@
+# S2: sm_89, tuning (plan_v3.md 8.4, 4.3).
+# Cards: as S1. Budget 1.25 h. Session deadline 112 min.
+# Times from the create (pod_env.py): KSTAGES_UNTIL 97 min, KHARD_UNTIL
+# 102 min. Worst case: the stages stop at 97 min, KDONE at about 99 min, the
+# grace ends at about 104 min. The watchdog can stop the pod 2 min earlier.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+#
+# If the Mosaic GPU stop rule of plan 8.3 applies after S1, remove the
+# Mosaic GPU timing and sweep stages (mosaic-*, kpack-mosaic-*) of this file.
+# Keep their correctness stages.
+#
+# TODO (harness): bench.py has a configuration sweep for the Pallas TPU
+# routes only (`_sweep`). The sweeps below need one for the Triton and Mosaic
+# GPU routes, a torch.compile candidate, an L2-sized chain (bench.py forces
+# 8 or more layers and 4x the L2), and the K2 trigger and `_int_mm` cells.
+session S2
+venvs jax-new torch
+install_timeout 12
+global_timeout 85
+deadline 112
+grace_s 300
+l2_mb 96
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+
+# Correctness of the code that S2 tunes. TODO: the test selections are not final.
+TODO check triton-k1 triton torch gpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+TODO check kpack-triton kpack-triton torch gpu 10 python -m pytest -q -p no:cacheprovider TODO_triton_kpacked_test_file
+TODO check mosaic-k1-new mosaic jax-new gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "TODO_gpu_suite"
+TODO check kpack-mosaic-new kpack-mosaic jax-new gpu 10 python -m pytest -q -p no:cacheprovider TODO_mosaic_kpacked_test_file
+TODO check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "TODO_float32_cases"
+TODO check mosaic-cpu-new mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# Configuration tables per dtype, M bucket and G.
+TODO time triton-config-sweep triton torch any 20 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --forms=F0,F3 --routes=triton TODO_triton_config_sweep_flag
+# Mosaic GPU: BNH 32 and 64 with SPLIT_K and STAGES together, then min_blocks and BM.
+TODO time mosaic-config-sweep mosaic jax-new any 20 $BENCH --levels=chain,dense --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --forms=F0,F1,F3 --routes=mosaic_gpu TODO_mosaic_config_sweep_flag --l2_mb=$KL2_MB
+TODO time kpack-triton-sweep kpack-triton torch any 10 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=F0 --routes= --logits_routes=TODO_triton_kpacked_route TODO_config_sweep_flag
+TODO time kpack-mosaic-sweep kpack-mosaic jax-new any 10 $BENCH --levels=logits --modes=int4_g128,int4_pc --forms=F0 --routes= --logits_routes=TODO_mosaic_kpacked_route TODO_config_sweep_flag
+# Eager against torch.compile.
+TODO time triton-compile triton torch any 10 $BENCH --levels=chain,dense --modes=int4_g128,gptq --forms=float,F0,F3 --routes=triton TODO_torch_compile_flag
+# L2-sized decode chains.
+TODO time l2-chains-torch triton torch any 8 $BENCH --levels=chain --modes=int4_g128 --forms=float,F0,F3 --routes=triton TODO_l2_sized_chain_flag
+TODO time l2-chains-jax mosaic jax-new any 8 $BENCH --levels=chain --modes=int4_g128 --forms=float,F0,F1,F3 --routes=mosaic_gpu TODO_l2_sized_chain_flag --l2_mb=$KL2_MB
+# The K2 trigger cells and `_int_mm` in both layouts (follow-up plan).
+TODO time k2-int-mm base torch any 8 $BENCH --levels=dense --modes=int8 --forms=float,F0 --routes= TODO_k2_trigger_and_int_mm_flags

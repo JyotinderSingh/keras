@@ -1,0 +1,48 @@
+# T1a: sm_89, the bfloat16 half of the configuration sweep of Triton K1
+# (tune.py; plan_v3.md 8.9; SESSION.md sections 3.4, 8 and 10.7).
+# T1 split in two pods that run at the same time: T1a sweeps
+# bfloat16, T1b float16. Each pod runs the correctness check of the
+# kernel first, so a failure skips the sweep of that pod only. The
+# stages, the stage minutes and the cards are those of T1.txt; its
+# header gives the compile and run times that size each stage.
+# Budget 1.75 h. Session deadline 158 min (1.5 x budget). Margin cost
+# at the 2026-10-22 prices: 1.5 x 1.75 h x ($0.89 + $0.011 for the 80 GB
+# disk) = $2.37.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL
+# 143 min, KHARD_UNTIL 148 min.
+# Not a loop session: the pod runs the stages once, sends the results and
+# stops after the grace time.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session T1a
+venvs torch
+install_timeout 12
+global_timeout 105
+deadline 158
+grace_s 300
+# The L2 of the RTX 4090. tune.py reads the L2 of the card on torch.
+l2_mb 72
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+
+# --- Correctness first. A failure prints KFAIL triton and skips the sweep.
+# Triton K1: the whole test module (125 tests: W4A16MatmulTest and
+# TritonRouteTest) under "require", as in the GPU CI step.
+check triton-k1 triton torch gpu 15 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py
+# CPU stand-in for the dry run (TRITON_INTERPRET=1): the 32 float32 cases
+# of test_matches_the_oracle and test_exact_data. "require" needs a CUDA
+# device, so plain pytest.
+check triton-interpret triton torch cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/torch/ops/quantized_matmul_test.py -k "float32 and (test_matches_the_oracle or test_exact_data)"
+
+# --- The sweep (tune.py; SESSION.md section 3.4). ---
+# The full grid of each M bucket (BM, BNH, BK, num_warps, num_stages,
+# split_k) at K = N = 4096 and the keras-hub shapes of plan 8.1, for int4
+# g128, GPTQ and AWQ g128 and int4 per channel. Each configuration passes
+# G1, G2, G4 and G5 against the float64 oracle before it is timed alone (a
+# CUDA graph of the calls over copies of the weights that total 4x the
+# L2). Then the confirmation pass: the 5 fastest rows of each key of
+# `_CONFIGS` (G 128 or per channel) and the default row, interleaved, 30
+# samples each. The KPROF lines give the best configuration per (mode,
+# dtype, shape, M bucket), over all shapes, and per key of `_CONFIGS`, with
+# the speedups over the default row, F0 and N5. Decode first.
+prof tune-bf16-decode triton torch any 52 python -m benchmarks.quantized_matmul.pod.tune --kernel=triton --dtypes=bfloat16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=1,4,16 --grid=full
+prof tune-bf16-prefill triton torch any 32 python -m benchmarks.quantized_matmul.pod.tune --kernel=triton --dtypes=bfloat16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=256,2048 --grid=full
