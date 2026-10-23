@@ -31,10 +31,13 @@
 # case crashed with a CUDA error (a result, shown by KPROF and KLOG
 # lines), 2 on an error of the probe. The route crash gates no other
 # stage.
-# Job 1 (jobs-v2/S1x-jax.txt), on fork branch kbench-s1x-a = kbench-s1r
-# (320cfb22a: 600f09d16 + the pod files) + the same fork-only commit:
-# the parts 3, 4, 5 and 6 of the JAX "require" suite of S1r.txt (S1r ran
-# parts 1 and 2 only).
+# Job 1 (jobs-v2/S1x-jax.txt), on fork branch kbench-s1x-a2 = the new
+# quantization-43 head 6420fe0c3 + one fork-only commit with the pod
+# files of this folder: the parts 3, 4, 5 and 6 of the JAX "require"
+# suite of S1r.txt (S1r ran parts 1 and 2 only), then the GPU checks of
+# the new stack fixes (the GateTest rows tests on jax-new and jax-floor,
+# the N5 host-tensor test and the N5 CUDA-graph check on torch). The
+# venvs line holds jax-floor for job 1; job 0 has no stage of it.
 # Card: RTX 4090 secure $0.89/h; RTX 4090 community $0.34/h.
 # Budget 1.3 h. Session deadline 117 min (1.5 x budget). Margin cost at
 # the secure price: 1.5 x 1.3 h x ($0.89 + $0.011) = $1.76.
@@ -48,7 +51,7 @@
 # what is left of the 24 min.
 # Format: SESSION.md, "Session files".
 session S1x
-venvs torch jax-new
+venvs torch jax-new jax-floor
 install_timeout 12
 global_timeout 24
 deadline 117
