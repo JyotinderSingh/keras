@@ -1,0 +1,68 @@
+# S1x: sm_89 (RTX 4090), run s1x-20261024-1. Loop mode (SESSION.md
+# section 10), two jobs.
+# Job 0 (this file), on fork branch kbench-s1x-b = kbench-s1r-hs
+# (d65f349fe: the quantization-43 head 600f09d16, the pod files and the
+# cherry-pick of the host-scalar fix 6b8fc4cb6, so that F0 captures in a
+# CUDA graph) + one fork-only commit with the pod files of this folder:
+# the cause of the crash of S1r job 1. There, gt-triton-prefill stopped
+# with "torch.AcceleratorError: CUDA error: unspecified launch failure
+# (CUDA_ERROR_LAUNCH_FAILED 719 from cuCtxSynchronize_v2)" in the graph
+# replays of the cell float16 gptq 14336x4096 M=256 (the graphs of float,
+# F0 and triton; the n5 capture failed). The same cell passed in
+# bfloat16, and in S1 (no F0 graph) its triton and float graphs passed.
+# probes/graph_crash_probe.py (docstring) runs the parts:
+# - probe-a: each candidate of the cell alone in its own process, with
+#   CUDA_LAUNCH_BLOCKING=1: the eager calls and their check against the
+#   float64 oracle (G1, G2), the capture, 20 replays and the same check.
+#   Then single-layer graphs of the parts of each candidate (the
+#   dequantize and the matmul of F0, the Triton kernel alone).
+# - probe-b: the candidates in one process in the S1r order (the flow of
+#   rows.py `_cell`), at M 64 and 256; rows.py itself on the modes
+#   int4_g128 and gptq of the same shape and dtype. After a crash: the
+#   flow with CUDA_LAUNCH_BLOCKING=1, and with one candidate or graph
+#   left out at a time.
+# - probe-c: probe-a for triton at M 65, 128 and 256, shapes 4096x14336
+#   and 14336x4096, float16 and bfloat16, gptq, gptq_act and awq.
+# - probe-d: compute-sanitizer --tool memcheck on the case that crashed,
+#   if the image has it (S0: the image has no CUDA toolkit tools).
+# - probe-e: when no part crashed, rows.py with the command of the S1r
+#   stage gt-triton-prefill, until the stage deadline.
+# A crash ends only the child process of its case. A part exits 1 when a
+# case crashed with a CUDA error (a result, shown by KPROF and KLOG
+# lines), 2 on an error of the probe. The route crash gates no other
+# stage.
+# Job 1 (jobs-v2/S1x-jax.txt), on fork branch kbench-s1x-a = kbench-s1r
+# (320cfb22a: 600f09d16 + the pod files) + the same fork-only commit:
+# the parts 3, 4, 5 and 6 of the JAX "require" suite of S1r.txt (S1r ran
+# parts 1 and 2 only).
+# Card: RTX 4090 secure $0.89/h; RTX 4090 community $0.34/h.
+# Budget 1.3 h. Session deadline 117 min (1.5 x budget). Margin cost at
+# the secure price: 1.5 x 1.3 h x ($0.89 + $0.011) = $1.76.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL
+# 102 min, KHARD_UNTIL 107 min. global_timeout 24 caps job 0, so that
+# job 1 (timeout at most 45 min) ends inside the budget of 78 min
+# (SESSION.md section 10.4): boot and installs about 3 min + 24 + 45 +
+# the reads and the delete = 75 min.
+# Expected: probe-a 3 min, probe-b 3 min (7 with the variants after a
+# crash), probe-c 5 min, probe-d none (no compute-sanitizer), probe-e
+# what is left of the 24 min.
+# Format: SESSION.md, "Session files".
+session S1x
+venvs torch jax-new
+install_timeout 12
+global_timeout 24
+deadline 117
+grace_s 300
+l2_mb 72
+loop yes
+idle_stop_s 600
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check probe-env crash torch any 2 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py env
+
+prof probe-a crash torch any 5 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py drive --part=a
+prof probe-b crash torch any 7 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py drive --part=b
+prof probe-c crash torch any 7 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py drive --part=c
+prof probe-d crash torch any 4 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py drive --part=d
+prof probe-e crash torch any 12 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/graph_crash_probe.py drive --part=e

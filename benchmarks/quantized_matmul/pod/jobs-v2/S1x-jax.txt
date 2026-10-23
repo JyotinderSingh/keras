@@ -1,0 +1,24 @@
+# S1x job 1 (run s1x-20261024-1): the parts 3, 4, 5 and 6 of the JAX
+# "require" suite of S1r.txt (stages require-jax-3 to require-jax-6). S1r
+# ran parts 1 and 2 (676 passed, 0 failures with the first 36% of part
+# 3); on its host a part took 13-15 min, so the stage deadline cut parts
+# 3-6. Fork branch kbench-s1x-a = kbench-s1r (320cfb22a: the
+# quantization-43 head 600f09d16 + the pod files) + the fork-only commit
+# of S1x.
+# probes/require_parts.py runs the four parts at the same time, each in
+# its own process: the "require" runner with KSHARD=<part>/6 and the
+# shard plugin, the files and the deselections of S1r.txt, and
+# XLA_PYTHON_CLIENT_PREALLOCATE=false (as the V2a stage existing-require,
+# which ran two suites on one GPU). So each part holds the tests of its
+# S1r stage and has the whole job time. Near the stage limit a part that
+# runs gets SIGINT: pytest prints its summary and writes its junit file.
+# `-v` in place of the `-q` of S1r: the output names the result of each
+# test, also of a part that the limit stops.
+# Push with a timeout of at most 45 min and at most the budget left
+# (SESSION.md section 10.4).
+# - require-jax-3456: the four parts on the GPU.
+# - parts-cpu: the CPU stand-in for the dry run: the six parts of a fast
+#   subset at the same time hold each test once (as the S1r stage
+#   shard-cpu).
+check require-jax-3456 require-jax jax-new gpu 45 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/require_parts.py --parts=3,4,5,6 --of=6 -- -v -rf --tb=line -p no:cacheprovider -p no:logging keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse
+check parts-cpu require-jax jax-new cpu 5 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/require_parts.py --parts=1,2,3,4,5,6 --of=6 --runner=pytest --check_whole -- -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py -k "ReshapeCompatibleTest or StrategyRegistryTest"
