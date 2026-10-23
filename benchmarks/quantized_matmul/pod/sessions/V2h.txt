@@ -1,0 +1,62 @@
+# V2h: sm_90 (H100 SXM). The correctness of the stack tip 41, then the
+# guard A/B jobs and the float16 decode row of V2 (SESSION.md section 8,
+# V2). Loop mode (SESSION.md section 10). It runs at the same time as
+# V2a (RTX 4090, PARALLEL.md).
+# Job 0 (this file) runs on the measurement commit of fork branch
+# kbench-v2-41: code bb5205253 (refs/fix quantization-41) + the torch
+# custom-gradient device fix 8759b67e7 (cherry-pick) + the pod files.
+# The later jobs are in jobs-v2/V2h-*.txt; the push order and the
+# measurement SHAs are in SESSION.md section 8 (V2).
+# Questions, in priority order (the job order): Q4 the correctness of the
+# 41 tip on sm_90 (job 0; the first sm_90 run of both K-packed kernels);
+# Q2 the group guard, 37 against 41, interleaved 37, 41, 37, 41 (jobs
+# 1-4); Q5 the 9.0 float16 decode row (job 4). No "require" suite and no
+# Triton timing here: the H100 costs $3.99/h.
+# Card: H100 SXM secure $3.99/h (community $2.69 when it has stock). The
+# 9.0 rows take the SM count of the SXM (132), so no other card.
+# Budget 1.2 h. Session deadline 108 min (1.5 x budget). Margin cost at
+# the 2026-10-23 price: 1.5 x 1.2 h x ($3.99 + $0.011 for the 80 GB
+# disk) = $7.20.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 93
+# min, KHARD_UNTIL 98 min.
+# Expected times (H0, O2h): boot and installs 3 min (H0: image pull 133
+# s); job 0 about 15 min (H0: mosaic-k1 292 s, mosaic-k1-floor 301 s,
+# triton-k1 98 s; the logits modules about 1.5 min each); jobs 1-4 about
+# 21 min and 4 gaps of about 0.8 min. In total about 42 min.
+# global_timeout 30 caps job 0. The stage minutes add up to more than
+# global_timeout, so the stage deadline cuts the last stage first.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session V2h
+loop yes
+idle_stop_s 600
+venvs torch jax-new jax-floor
+install_timeout 12
+global_timeout 30
+deadline 108
+grace_s 300
+# The L2 of the H100.
+l2_mb 50
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+# nsys for the later jobs (S0: installed and tested in about 64 s). The
+# route `nsys` gates no stage of job 0; each later job checks it again.
+check prof-nsys nsys jax-new gpu 8 $PROF probe --install --require nsys
+
+# --- Correctness of the 41 tip (Q4). A failure prints KFAIL <route>.
+# `-rf --tb=line` keeps one line per failure, and `-p no:logging` keeps
+# the torch.compile DEBUG lines out of the 200-line log tail. ---
+# Triton K1 and Triton K-packed: the whole modules under "require", as in
+# the GPU require step (V1: 126 and 100 tests).
+check triton-k1 triton torch gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py
+check triton-logits triton-logits torch gpu 6 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py
+# Mosaic GPU K1 (24 tests) and Mosaic GPU K-packed (32 tests): GPUTest
+# under "require" on JAX 0.12.0 and 0.11.2. The `_routes` of both modules
+# set "auto" for each case (branch 36 now pins it for the logits module
+# too: V1-FOLLOWUPS item 2), so each case runs the configuration of the
+# test. A failure writes the error maps of SESSION.md section 3.3.
+check mosaic-k1 mosaic jax-new gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-k1-floor mosaic-floor jax-floor gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-logits mosaic-logits jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+check mosaic-logits-floor mosaic-logits-floor jax-floor gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"

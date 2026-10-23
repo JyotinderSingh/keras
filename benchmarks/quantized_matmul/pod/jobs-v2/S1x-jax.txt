@@ -1,0 +1,52 @@
+# S1x job 1 (run s1x-20261024-1). Fork branch kbench-s1x-a2 = the
+# quantization-43 head 6420fe0c3 (the new stack: branch 31 N5 makes no
+# host tensor per call; branch 43 GateTest runs the real mosaic_gpu route
+# on a GPU host) + one fork-only commit with the pod files of this folder.
+# 1. The parts 3, 4, 5 and 6 of the JAX "require" suite of S1r.txt (stages
+#    require-jax-3 to require-jax-6). S1r ran parts 1 and 2 (676 passed,
+#    0 failures with the first 36% of part 3); on its host a part took
+#    13-15 min, so the stage deadline cut parts 3-6.
+#    probes/require_parts.py runs the four parts at the same time, each in
+#    its own process: the "require" runner with KSHARD=<part>/6 and the
+#    shard plugin, the files and the deselections of S1r.txt, and
+#    XLA_PYTHON_CLIENT_PREALLOCATE=false (as the V2a stage
+#    existing-require, which ran two suites on one GPU). So each part
+#    holds the tests of its S1r stage and has the time of the stage. Near
+#    the stage limit a part that runs gets SIGINT: pytest prints its
+#    summary and writes its junit file. `-v` in place of the `-q` of S1r:
+#    the output names the result of each test, also of a part that the
+#    limit stops.
+# 2. The new GPU checks of the stack fixes (LOG.md of
+#    audits/rows-2026-10-23, "N5 host scalars and GPU row tests"), after
+#    the parts:
+#    - env-jax-floor: the device check of jax-floor (job 0 installs it but
+#      has no stage of it).
+#    - rows-gpu-jax-new, rows-gpu-jax-floor: GateTest
+#      test_rows_run_with_their_configuration of quantized_test.py and
+#      quantized_logits_test.py. S1r: 12 subtests failed on both JAX
+#      versions ("Interpret mode does not support copy_gmem_to_smem
+#      without a barrier"). On a GPU host the new 43 runs the real route
+#      for the rows of the host device class (cuda-sm89) and skips the
+#      other rows: the test must pass.
+#    - n5-host-torch: kernels_test.py
+#      N5Test.test_torch_call_makes_no_host_tensor (int4 G32, int4 per
+#      channel, GPTQ G128, AWQ G128) on CUDA.
+#    - n5-graph: probes/n5_graph_probe.py: N5 at 4096x4096, M = 1,
+#      bfloat16, in a CUDA graph: AWQ G128 and GPTQ with one group must
+#      capture and replay with the bits of the eager call; GPTQ G128 (its
+#      group guard reads a host predicate) and int4 G128 (the control) are
+#      recorded.
+# Times: require-jax-3456 34 min, so that the five checks after it (about
+# 1-2 min each) fit in the job timeout. Push with a timeout of at most 45
+# min and at most the budget left (SESSION.md section 10.4).
+# - parts-cpu: the CPU stand-in for the dry run: the six parts of a fast
+#   subset at the same time hold each test once (as the S1r stage
+#   shard-cpu). The five checks of item 2 are mode "any", so the dry run
+#   runs them on the CPU (interpret mode, torch CPU, no capture).
+check require-jax-3456 require-jax jax-new gpu 34 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/require_parts.py --parts=3,4,5,6 --of=6 -- -v -rf --tb=line -p no:cacheprovider -p no:logging keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse
+check parts-cpu require-jax jax-new cpu 5 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/require_parts.py --parts=1,2,3,4,5,6 --of=6 --runner=pytest --check_whole -- -q -p no:cacheprovider keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py -k "ReshapeCompatibleTest or StrategyRegistryTest"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check rows-gpu-jax-new rows-jax jax-new any 6 PYTHONPATH=. python -m pytest -v -rfEs --tb=short -p no:cacheprovider -p no:logging --junitxml=$KSTAGE_OUT/junit.xml keras/src/backend/jax/ops/quantized_test.py keras/src/backend/jax/ops/quantized_logits_test.py -k "test_rows_run_with_their_configuration"; rc=$?; KRC=$rc python -c 'import json, os, xml.etree.ElementTree as ET; out = os.environ["KSTAGE_OUT"]; root = ET.parse(out + "/junit.xml").getroot(); suites = list(root.iter("testsuite")); totals = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}; failed = [dict(test=c.get("classname", "") + "::" + c.get("name", ""), kind=e.tag, message=(e.get("message") or "")[:600], text=(e.text or "")[-1200:]) for c in root.iter("testcase") for e in c if e.tag in ("failure", "error")]; json.dump(dict(totals, rc=int(os.environ["KRC"]), failed=failed), open(out + "/failures.json", "w"), indent=1); print("failures.json:", totals)' || echo "failures.json: not written"; exit $rc
+check rows-gpu-jax-floor rows-jax jax-floor any 6 PYTHONPATH=. python -m pytest -v -rfEs --tb=short -p no:cacheprovider -p no:logging --junitxml=$KSTAGE_OUT/junit.xml keras/src/backend/jax/ops/quantized_test.py keras/src/backend/jax/ops/quantized_logits_test.py -k "test_rows_run_with_their_configuration"; rc=$?; KRC=$rc python -c 'import json, os, xml.etree.ElementTree as ET; out = os.environ["KSTAGE_OUT"]; root = ET.parse(out + "/junit.xml").getroot(); suites = list(root.iter("testsuite")); totals = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}; failed = [dict(test=c.get("classname", "") + "::" + c.get("name", ""), kind=e.tag, message=(e.get("message") or "")[:600], text=(e.text or "")[-1200:]) for c in root.iter("testcase") for e in c if e.tag in ("failure", "error")]; json.dump(dict(totals, rc=int(os.environ["KRC"]), failed=failed), open(out + "/failures.json", "w"), indent=1); print("failures.json:", totals)' || echo "failures.json: not written"; exit $rc
+check n5-host-torch n5-host torch any 4 PYTHONPATH=. python -m pytest -v -rfEs --tb=short -p no:cacheprovider -p no:logging --junitxml=$KSTAGE_OUT/junit.xml keras/src/quantizers/kernels_test.py -k "test_torch_call_makes_no_host_tensor"; rc=$?; KRC=$rc python -c 'import json, os, xml.etree.ElementTree as ET; out = os.environ["KSTAGE_OUT"]; root = ET.parse(out + "/junit.xml").getroot(); suites = list(root.iter("testsuite")); totals = {k: sum(int(s.get(k, 0)) for s in suites) for k in ("tests", "failures", "errors", "skipped")}; failed = [dict(test=c.get("classname", "") + "::" + c.get("name", ""), kind=e.tag, message=(e.get("message") or "")[:600], text=(e.text or "")[-1200:]) for c in root.iter("testcase") for e in c if e.tag in ("failure", "error")]; json.dump(dict(totals, rc=int(os.environ["KRC"]), failed=failed), open(out + "/failures.json", "w"), indent=1); print("failures.json:", totals)' || echo "failures.json: not written"; exit $rc
+check n5-graph n5-graph torch any 4 PYTHONPATH=. python benchmarks/quantized_matmul/pod/probes/n5_graph_probe.py

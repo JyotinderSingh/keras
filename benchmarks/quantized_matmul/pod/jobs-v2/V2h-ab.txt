@@ -1,0 +1,22 @@
+# V2h jobs 1, 2 and 3: the Mosaic GPU K1 guard A/B on sm_90 (question Q2
+# of SESSION.md section 8, V2). Card: the V2h pod (H100 SXM).
+# Commits: jobs 1 and 3 on fork branch kbench-v2-37 = code e1d652e89 +
+# the torch custom-gradient device fix 8759b67e7 (cherry-pick) + the pod
+# files; job 2 on fork branch kbench-v2-41 = code bb5205253 + the same
+# fix + the pod files. Job 4 (V2h-ab-rows.txt) runs these lines again on
+# kbench-v2-41. The measurement SHAs and the push order: SESSION.md
+# section 8 (V2).
+# Push (from quant-tooling/kernels/pod/):
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-37 jobs-v2/V2h-ab.txt 10
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-41 jobs-v2/V2h-ab.txt 10
+# Expected time: about 4 min (smoke 0.5, nsys check 0.3, chain A/B 1.5,
+# chain nsys 1.5). The H100 costs $3.99/h, so these jobs have no bench
+# chain and no tune.py stage. The lines are the same as in the V2a job
+# files; their meaning: V2a-ab-old.txt. With l2_mb 50 a 4096x4096 chain
+# has 24 layers (35 on the RTX 4090).
+
+check mosaic-smoke mosaic jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+check prof-nsys nsys jax-new gpu 5 $PROF probe --install --require nsys
+
+prof ab-chain mosaic jax-new any 8 export PYTHONUNBUFFERED=1; C=""; if [ "$KMODE" = cpu ]; then C="--interpret --shape=256x512 --layers=2 --calls=2 --warmup=1"; fi; rc=0; for c in int4_g128:4096x4096:float,shipped,noguard gptq:4096x4096:shipped,noguard awq:4096x4096:shipped,noguard int4_pc:4096x4096:shipped,noguard int4_g128:14336x4096:float,shipped,noguard int4_g128:4096x14336:float,shipped,noguard; do IFS=: read -r mode shape cands <<< "$c"; echo "$(date -u +%H:%M:%S) cell $mode $shape $cands"; python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cands --l2_mb=$KL2_MB --out="$KSTAGE_OUT/chain_ab.jsonl" $C || { echo "cell $mode $shape failed"; rc=1; }; done; bash -c 'exit $0' $rc
+prof ab-chain-nsys mosaic+nsys jax-new gpu 8 NSYS=$(python -c "from benchmarks.quantized_matmul.pod.prof import find_tool; print(find_tool('nsys'))"); rc=0; for run in int4_g128:4096x4096:shipped int4_g128:4096x4096:noguard gptq:4096x4096:shipped awq:4096x4096:shipped int4_pc:4096x4096:shipped int4_g128:14336x4096:shipped int4_g128:4096x14336:shipped int4_g128:4096x4096:float; do IFS=: read -r mode shape cand <<< "$run"; t="$KSTAGE_OUT/$mode-$shape-$cand"; echo "$(date -u +%H:%M:%S) run $run"; "$NSYS" profile --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o "$t" python -m benchmarks.quantized_matmul.pod.chain_split run --mode=$mode --shape=$shape --m=1 --structure=sequential --candidates=$cand --calls=20 --warmup=3 --gap_ms=2 --l2_mb=$KL2_MB --out="$t.jsonl" > "$t.log" 2>&1 && "$NSYS" export --type=sqlite --force-overwrite=true -o "$t.sqlite" "$t.nsys-rep" > /dev/null 2>&1 && python benchmarks/quantized_matmul/pod/chain_split.py report "$t.sqlite" --meta="$t.jsonl" --calls=20 > "$t.split.json" || { echo "run $run failed"; rc=1; }; rm -f "$t.nsys-rep" "$t.sqlite"; done; bash -c 'exit $0' $rc
