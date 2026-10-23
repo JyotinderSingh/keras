@@ -8,6 +8,7 @@ torch backend tests the Triton route.
 
 import contextlib
 import functools
+import itertools
 import warnings
 
 import ml_dtypes
@@ -403,17 +404,19 @@ def _matrix_logits(layer, table, orientation, inputs, config):
 
 @contextlib.contextmanager
 def _lookup_routes(rows, **sources):
-    """Adds `sources` to the reverse lookup routes and `rows` to their
-    allow-list."""
+    """Adds `sources` to the reverse lookup routes and sets their
+    allow-list to `rows`. The tables are as before when the block ends."""
+    allow_list = dict(kernels._LOOKUP_ALLOW_LIST)
     kernels._LOOKUP_ROUTES.update(sources)
+    kernels._LOOKUP_ALLOW_LIST.clear()
     kernels._LOOKUP_ALLOW_LIST.update(rows)
     try:
         yield
     finally:
         for name in sources:
             del kernels._LOOKUP_ROUTES[name]
-        for key in rows:
-            del kernels._LOOKUP_ALLOW_LIST[key]
+        kernels._LOOKUP_ALLOW_LIST.clear()
+        kernels._LOOKUP_ALLOW_LIST.update(allow_list)
 
 
 def _row_key(dtype, bucket):
@@ -429,6 +432,20 @@ def _counts(layer, x):
     kernels.route_counts.clear()
     layer(x, reverse=True)
     return dict(kernels.route_counts)
+
+
+def _first_tested_lookup_route(routes):
+    """The first route of a reverse lookup row that this process has, with
+    its library version in its tested range, else `"reference"`."""
+    for name, _ in routes:
+        source = kernels._LOOKUP_ROUTES.get(name)
+        if source is None:
+            continue
+        if source.version is None or kernels.tested(
+            source.version(), source.tested_versions
+        ):
+            return name
+    return "reference"
 
 
 class ReverseLookupRouteTest(testing.TestCase):
@@ -673,6 +690,63 @@ class ReverseLookupRouteTest(testing.TestCase):
         with kernels.policy("auto"):
             self.assertEqual(_counts(layer, x), {"reference": 1})
             self.assertAllEqual(layer(x, reverse=True), expected)
+
+    def test_rows_of_this_platform(self):
+        """Under `"auto"`, each reverse lookup row of this backend and
+        device runs its first route that this process has in its tested
+        version range, for a tied and an untied table, and the logits
+        equal a direct call of the route (G8). With no such route, the
+        reference path runs. The table passes the shape gates of every
+        route: `D = V = 256` and groups of 128."""
+        platform_key = _row_key("float32", "1-16")[:2]
+        rows = {
+            key: routes
+            for key, routes in kernels._LOOKUP_ALLOW_LIST.items()
+            if key[:2] == platform_key
+        }
+        if not rows:
+            self.skipTest("The allow-list has no row for this platform.")
+        policy = {"bfloat16": "mixed_bfloat16", "float16": "mixed_float16"}
+        m = {"1-16": 4, "17-64": 33, "65-256": 130, "257+": 300}
+        rng = np.random.default_rng(0)
+        for ((_, _, dtype, bucket), routes), tie_weights in itertools.product(
+            rows.items(), (True, False)
+        ):
+            with self.subTest(dtype=dtype, bucket=bucket, tied=tie_weights):
+                layer = layers.ReversibleEmbedding(
+                    256,
+                    256,
+                    tie_weights=tie_weights,
+                    dtype=policy.get(dtype, dtype),
+                )
+                layer.build()
+                layer._embeddings.assign(rng.normal(size=(256, 256)))
+                if not tie_weights:
+                    layer.reverse_embeddings.assign(rng.normal(size=(256, 256)))
+                config = Int4QuantizationConfig(block_size=128)
+                layer.quantize("int4", config=config)
+                x = _random((m[bucket], 256), 1)
+                expected = _first_tested_lookup_route(routes)
+                # Only `"auto"` reads the allow-list.
+                with kernels.policy("auto"):
+                    self.assertEqual(_counts(layer, x), {expected: 1})
+                    logits = layer(x, reverse=True)
+                    if expected != "reference":
+                        stored, orientation = _stored(layer)
+                        with AutocastScope(layer.compute_dtype):
+                            stored = stored.with_tensors(stored.read_tensors())
+                            inputs = ops.cast(x, layer.compute_dtype)
+                            route = kernels.select_lookup_route(
+                                layer, stored, orientation, inputs
+                            )
+                            direct = kernels.run_lookup_route(
+                                route, layer, stored, orientation, inputs
+                            )
+                        self.assertAllEqual(_bits(logits), _bits(direct))
+                if expected == "reference":
+                    with kernels.policy("off"):
+                        expected_logits = layer(x, reverse=True)
+                    self.assertAllEqual(_bits(logits), _bits(expected_logits))
 
     @pytest.mark.skipif(
         backend.backend() != "numpy",
