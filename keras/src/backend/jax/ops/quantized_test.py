@@ -323,6 +323,23 @@ def _real(**changes):
     )
 
 
+def _row_route():
+    """`(host, route, sources)` for a test of the allow-list rows.
+
+    On a GPU host, `host` is its device class, and the real route
+    `"mosaic_gpu"` runs. Interpret mode fails there below compute
+    capability 9.0: the pipeline copies from GMEM to SMEM with no barrier
+    (`cp.async`), which interpret mode does not support. On another host,
+    `host` is `None`, and `sources` add the route `"real"`: the values of
+    the real route with the kernel of the interpret route. As in
+    `GPUTest`, the real route needs an equal jax and jaxlib version in
+    `MOSAIC_GPU_TESTED_JAX`.
+    """
+    if jax.devices()[0].platform == "gpu":
+        return kernels._device_class(None), "mosaic_gpu", {}
+    return None, "real", {"real": _real()}
+
+
 def _config(m, n, block_n, split, block_m=16, stages=3):
     """A configuration with `BNH = block_n`, by default a decode one, whose
     split-K rule gives `split` for `M = m` and `N = n`."""
@@ -987,6 +1004,38 @@ class GateTest(testing.TestCase):
         row = _row("bfloat16", 3, "gated")
         with _routes(row, gated=gated):
             self.assertEqual(_counts(layer, _random((3, 256))), {expected: 1})
+
+    def test_rows_run_with_their_configuration(self):
+        """Each Mosaic GPU row of the allow-list leaves the configuration
+        to `MOSAIC_GPU_CONFIGS`, which has a row for the compute
+        capability, the compute dtype and the M bucket of the row. With
+        that configuration, a call in the bucket of the row runs the
+        kernel and passes G1, G2 and G4: on a CPU host, through the values
+        of the real route in interpret mode, and on a GPU host, through
+        the real route, for the rows of its device class only."""
+        rows = [
+            (key, routes)
+            for key, routes in kernels._ALLOW_LIST.items()
+            if any(name == "mosaic_gpu" for name, _ in routes)
+        ]
+        self.assertNotEqual(rows, [])
+        host, route, sources = _row_route()
+        for (_, device_class, dtype, bucket), routes in rows:
+            with self.subTest(device_class=device_class, dtype=dtype):
+                self.assertIn(("mosaic_gpu", None), routes)
+                number = device_class.removeprefix("cuda-sm")
+                capability = f"{number[:-1]}.{number[-1]}"
+                key = (capability, dtype, bucket)
+                config = quantized.MOSAIC_GPU_CONFIGS[key]
+                if host not in (None, device_class):
+                    self.skipTest(f"A row of {device_class} on {host}.")
+                m = BUCKET_ROWS[bucket]
+                layer = _layer(CASES["dense"], "int4", 128, f"mixed_{dtype}")
+                x = _random((m, 256))
+                with _routes(_row(dtype, m, route, config), **sources):
+                    self.assertEqual(_counts(layer, x), {route: 1})
+                    y = layer(x)
+                _check_accuracy(self, layer, x, y)
 
     def test_versions(self):
         source = kernels._ROUTES["mosaic_gpu"]
