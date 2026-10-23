@@ -1,0 +1,82 @@
+# V2a: sm_89 (RTX 4090). The correctness of the stack tip 41, then the
+# A/B jobs of V2 (SESSION.md section 8, V2). Loop mode (SESSION.md
+# section 10). It runs at the same time as V2h (H100 SXM, PARALLEL.md).
+# Job 0 (this file) runs on the measurement commit of fork branch
+# kbench-v2-41: code bb5205253 (refs/fix quantization-41) + the torch
+# custom-gradient device fix 8759b67e7 (cherry-pick) + the pod files.
+# The later jobs are in jobs-v2/V2a-*.txt; the push order and the
+# measurement SHAs are in SESSION.md section 8 (V2).
+# Questions, in priority order (the job order): Q4 the correctness of the
+# 41 tip (job 0); Q1 Mosaic GPU K1 on old 35 (717b9912f, the M1 code of
+# O2) against the new 35-37 code (e1d652e89), interleaved old, 37, old,
+# 37 (jobs 1, 2, 4, 5); Q2 the group guard, 37 against 41 (jobs 2, 3,
+# 5); Q3 Triton K1 CONTIGUOUS, 37 against 41 (jobs 2, 3, 5); Q5 the 8.9
+# rows 65-256 and 257+ on the Variant A kernel (job 6); Q6 (optional)
+# the F0 barrier probe (job 6).
+# Card: RTX 4090 secure $0.89/h (community $0.34 when it has stock). The
+# sm_89 rows target the RTX 4090, so no other card.
+# Budget 1.6 h. Session deadline 144 min (1.5 x budget). Margin cost at
+# the 2026-10-23 price: 1.5 x 1.6 h x ($0.89 + $0.011 for the 80 GB
+# disk) = $2.16.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 129
+# min, KHARD_UNTIL 134 min.
+# Expected times on a normal host (O1, O2, T1b, T2b): boot and installs
+# 2.5 min; job 0 about 35 min (the kernel checks and the nsys install 10
+# min; the two "require" suites in parallel about 25 min: T1b took 811 s
+# for the torch files and T2b 1372 s for almost the same JAX files);
+# jobs 1-6 about 49 min and 6 gaps of about 0.8 min. In total about 91
+# min. V1 had a host with a slow CPU (2-3x on the compile-heavy stages):
+# there job 0 needs about 60 min, and the budget rule of SESSION.md
+# section 10.4 cuts the last jobs. global_timeout 60 caps job 0. The
+# stage minutes add up to more than global_timeout, so the stage
+# deadline cuts the last stage first.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session V2a
+loop yes
+idle_stop_s 600
+venvs torch jax-new jax-floor
+install_timeout 12
+global_timeout 60
+deadline 144
+grace_s 300
+# The L2 of the RTX 4090. The torch timing stages read the L2 of the card;
+# the JAX timing stages take --l2_mb.
+l2_mb 72
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+# nsys for the later jobs (S0: installed and tested in about 64 s). The
+# route `nsys` gates no stage of job 0; each later job checks it again.
+check prof-nsys nsys jax-new gpu 8 $PROF probe --install --require nsys
+
+# --- Correctness of the 41 tip (Q4). A failure prints KFAIL <route>.
+# `-rf --tb=line` keeps one line per failure, and `-p no:logging` keeps
+# the torch.compile DEBUG lines out of the 200-line log tail. ---
+# Triton K1 and Triton K-packed: the whole modules under "require", as in
+# the GPU require step (V1: 126 and 100 tests).
+check triton-k1 triton torch gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py
+check triton-logits triton-logits torch gpu 6 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py
+# Mosaic GPU K1 (24 tests) and Mosaic GPU K-packed (32 tests): GPUTest
+# under "require" on JAX 0.12.0 and 0.11.2. The `_routes` of both modules
+# set "auto" for each case (branch 36 now pins it for the logits module
+# too: V1-FOLLOWUPS item 2), so each case runs the configuration of the
+# test. A failure writes the error maps of SESSION.md section 3.3.
+check mosaic-k1 mosaic jax-new gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-k1-floor mosaic-floor jax-floor gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-logits mosaic-logits jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+check mosaic-logits-floor mosaic-logits-floor jax-floor gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+
+# --- The existing tests under "require" (Q4, V2a only), as one stage:
+# the torch files in the torch venv in the background, and the same files
+# in the jax-new venv in the foreground. The two suites share the GPU
+# (JAX without preallocation) and run in about the time of the JAX suite
+# alone. The two torch op modules run in triton-k1 and triton-logits
+# above, so this stage names no torch op module: collection imports no
+# torch in the jax-new venv (V1-FOLLOWUPS item 4; V1 ran no JAX test).
+# The two JAX deselects import TensorFlow (the jax-new venv has none).
+# junit-torch.xml and junit-jax.xml hold the results; failures.json gets
+# the totals and each failure and error of both suites with its message;
+# torch.log is the torch output. The route `require` gates no stage. The
+# stage fails when either suite fails. ---
+check existing-require require jax-new gpu 45 T=$(dirname "$(dirname "$(dirname "$(command -v python)")")")/torch/bin/python; F="keras/src/quantizers keras/src/layers/core/dense_test.py keras/src/layers/core/einsum_dense_test.py"; R=".github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging"; KERAS_BACKEND=torch KERAS_HOME=$PWD/.github/workflows/config/torch PYTHONPATH=. "$T" $R --junitxml=$KSTAGE_OUT/junit-torch.xml $F > $KSTAGE_OUT/torch.log 2>&1 & P=$!; XLA_PYTHON_CLIENT_PREALLOCATE=false PYTHONPATH=. python $R --junitxml=$KSTAGE_OUT/junit-jax.xml $F --deselect keras/src/quantizers/kernels_test.py::FallbackTest::test_export_traces_the_reference_path --deselect keras/src/layers/core/dense_test.py::DenseTest::test_dense_sparse; J=$?; wait $P; TR=$?; echo "torch suite (torch venv, log torch.log): rc=$TR"; grep -aE '^(FAILED|ERROR) |^=+ .*(passed|failed|error)' $KSTAGE_OUT/torch.log | tail -n 80; echo "jax suite (jax-new venv, above): rc=$J"; KJ=$J KT=$TR python -c 'import json, os, xml.etree.ElementTree as ET; out = os.environ["KSTAGE_OUT"]; parse = lambda root: dict({k: sum(int(s.get(k, 0)) for s in root.iter("testsuite")) for k in ("tests", "failures", "errors", "skipped")}, failed=[dict(test=c.get("classname", "") + "::" + c.get("name", ""), kind=e.tag, message=(e.get("message") or "")[:600], text=(e.text or "")[-1200:]) for c in root.iter("testcase") for e in c if e.tag in ("failure", "error")]); res = {s: (parse(ET.parse(p).getroot()) if os.path.exists(p) else dict(missing=True)) for s, p in ((s, out + "/junit-" + s + ".xml") for s in ("jax", "torch"))}; res["rc"] = dict(jax=int(os.environ["KJ"]), torch=int(os.environ["KT"])); json.dump(res, open(out + "/failures.json", "w"), indent=1); print("failures.json:", {s: {k: v for k, v in r.items() if k != "failed"} for s, r in res.items()})' || echo "failures.json: not written"; exit $((J || TR))
