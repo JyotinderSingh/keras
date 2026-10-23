@@ -1,0 +1,73 @@
+# T2: sm_89, the configuration sweep of Mosaic GPU K1 (tune.py; plan_v3.md
+# 8.9; SESSION.md sections 3.4 and 8). The sm_89 rows of
+# `MOSAIC_GPU_CONFIGS` come from it. If the Mosaic GPU stop rule of plan 8.3
+# applied after S1, T2 does not run.
+# Cards: RTX 4090 secure $0.89; RTX 4090 community $0.34. No other card: the
+# rows of the table key on the compute capability only, and the sm_89 rows
+# target the RTX 4090 (`_SMS["8.9"]` = 128, so `min_blocks` 256 = 2 x the
+# SMs of the 4090). tune.py writes the card name into each record and into
+# the summary. Check it before a row goes into the table.
+# Budget 3.2 h. Session deadline 288 min (1.5 x budget). Margin cost at the
+# 2026-10-22 prices: 1.5 x 3.2 h x ($0.89 + $0.011 for the 80 GB disk) =
+# $4.32 (community: $1.68).
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 273 min,
+# KHARD_UNTIL 278 min.
+# Not a loop session: the pod runs the stages once, sends the results and
+# stops after the grace time.
+# Stage minutes, from the compile and run times of 2026-10-22
+# (quant-tooling/kernels/probes/tune/):
+# - Build. tune.py lowers one (configuration, cell) in 0.40 s for cuda,
+#   with the inner jit, at R = 1 and R = 35 copies (jax 0.12.0 on this Mac;
+#   the old form took 10.45 s at R = 35). On the S0 pod (RTX 4090), an
+#   eager Mosaic GPU call took 0.77-0.82 s: it traces, lowers and compiles
+#   the kernel. The estimate is 1.2 s per measurement with the outer jit.
+# - Run. 10 samples of at least 20 ms, a warm-up sample and the check runs:
+#   about 0.3 s per measurement.
+# - Decode slice: 32 of the 48 configurations fit the SMEM estimate. 1,344
+#   grid and 144 baseline measurements x 1.5 s = 37 min. The confirmation
+#   pass: 48 cells x (1 s + 6 x (1.2 s + 30 x 20 ms)) = 10 min. Stage: 50
+#   min.
+# - Prefill: 30 of the 54 configurations fit. Per slice (M = 256, then
+#   M = 2048): 528 measurements x 1.3 s = 11 min, and 3 min of confirmation.
+#   Each slice has its own deadline (tune.py). Stage: 32 min.
+# A stage that runs out of time has measured an even sample of the grid; its
+# `slice` lines give the share.
+# Results: about 8,000 records, about 100 chunks.
+# Format: SESSION.md, "Session files". Stage order is priority order.
+session T2
+venvs jax-new
+install_timeout 12
+global_timeout 190
+deadline 288
+grace_s 300
+# The L2 of the RTX 4090. JAX has no L2 size: tune.py takes --l2_mb.
+l2_mb 72
+
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+
+# --- Correctness first. A failure prints KFAIL mosaic, writes the error
+# maps of SESSION.md section 3.3, and skips the sweep.
+# Mosaic GPU K1: GPUTest (24 tests: G3 exact data and the oracle, decode
+# and prefill, int4, int4 per channel and GPTQ, bfloat16 and float16)
+# through the "require" runner, with the MOSAIC_GPU_CONFIGS row of the card.
+check mosaic-k1 mosaic jax-new gpu 20 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+# CPU stand-in for the dry run: the lowering (40 tests) and interpret mode
+# (42 tests).
+check mosaic-cpu mosaic jax-new cpu 15 python -m pytest -q -p no:cacheprovider keras/src/backend/jax/ops/quantized_test.py -k "LoweringTest or InterpretTest"
+
+# --- The sweep (tune.py; SESSION.md section 3.4). ---
+# The full grid of each M bucket (BM, BNH, stages, split of the K steps) at
+# K = N = 4096 and the keras-hub shapes of plan 8.1, for int4 g128, GPTQ
+# and AWQ g128 and int4 per channel. A configuration above the SMEM
+# estimate of plan 4.3 (on sm_89: every BNH 128) gets a skip record. Each
+# other configuration passes G1, G2, G4 and G5 against the float64 oracle
+# before it is timed alone (an outer jit that calls the inner jit of the
+# kernel once per copy of the weights, 4x the L2 in total). Then the
+# confirmation pass: the 5 fastest table rows (BM, BNH, stages, min_blocks)
+# and the default row, interleaved, 30 samples each. The KPROF lines give
+# `table_row` per key of MOSAIC_GPU_CONFIGS, with the speedups over the
+# default row, F0 and N5. Decode first.
+prof tune-bf16-decode mosaic jax-new any 50 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=bfloat16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=1,4,16 --grid=full --l2_mb=$KL2_MB
+prof tune-f16-decode mosaic jax-new any 50 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=float16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=1,4,16 --grid=full --l2_mb=$KL2_MB
+prof tune-bf16-prefill mosaic jax-new any 32 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=bfloat16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=256,2048 --grid=full --l2_mb=$KL2_MB
+prof tune-f16-prefill mosaic jax-new any 32 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=float16 --modes=int4_g128,gptq,awq,int4_pc --shapes=4096x4096,4096x14336,14336x4096,2304x9216 --m=256,2048 --grid=full --l2_mb=$KL2_MB
