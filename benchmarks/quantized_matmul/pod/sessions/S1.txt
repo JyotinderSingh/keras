@@ -1,0 +1,120 @@
+# S1: sm_89 (RTX 4090), the allow-list rows of P8b and P12b (plan_v3.md
+# 6.4, 8.3, 8.4 and 9; SESSION.md section 8, the row sessions). It also
+# holds the old S5: the code is the frozen stack tip 41, so these are the
+# final sm_89 numbers, and the Mosaic GPU checks on JAX 0.12.0 and 0.11.2
+# confirm MOSAIC_GPU_TESTED_JAX. The existing tests under "require" run on
+# a second RTX 4090 at the same time (S1r.txt).
+# Measurement commit: fork branch kbench-rows = refs/fix
+# quantization-41-variable-assign-checks (3f90d4d0d, on upstream master
+# 184cdcb83, which holds the torch custom-gradient device fix #24045) +
+# the pod files.
+# Card: RTX 4090 secure $0.89/h (community $0.34 when it has stock). The
+# sm_89 rows target the RTX 4090 (the Mosaic GPU rows take its 128 SMs),
+# so no other card.
+# Budget 1.6 h (the old S1 1.5 h; S5 merged in). Session deadline 144 min.
+# Margin cost at the secure price: 1.5 x 1.6 h x ($0.89 + $0.011 for the
+# 80 GB disk) = $2.16.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 129
+# min, KHARD_UNTIL 134 min.
+# Expected stage times (normal host / slow host as V1 and V2a): the env
+# checks 0.3 min; the kernel checks 9 / 19 min (V2a: 1135 s); rows-triton
+# 8 / 12 + 4 / 6 + 4 / 6 min; rows-mosaic 10 / 16 + 5 / 8 + 5 / 8 min;
+# the N5 stages 8 / 12 + 3 / 5 + 7 / 11 min; nsys 6 / 8 min. In total
+# about 75 / 115 min. The stage minutes add up to more than
+# global_timeout, so on a slow host the stage deadline cuts the last
+# stages first: nsys, then the TF N5 rows.
+#
+# Rows (rows.py; the rule of each route is in its docstring and in
+# SESSION.md section 8). Each `rows-*` stage prints one KPROF verdict per
+# row: (backend, device class, dtype, M bucket) -> pass, complete, the
+# worst cells. Method: stream timing (calls back to back, one sync). On
+# torch the reference path does not capture in a CUDA graph (per-call host
+# copies in packing.py), so every torch row compares eager stream times;
+# the graph time of the route is recorded and decides nothing. M per
+# bucket: 1 and 16 (1-16), 64 (17-64), 256 (65-256), 2048 (257+).
+# - rows-triton-decode, rows-triton-prefill: _ALLOW_LIST (torch,
+#   cuda-sm89, {bfloat16, float16, float32}, every bucket), route triton
+#   (<= 0.95 x min(F0, N5)) and n5 (<= 0.90 x F0). gptq_act reports the
+#   general path against F0 and decides nothing.
+# - rows-triton-logits: _LOOKUP_ALLOW_LIST (torch, cuda-sm89, {bfloat16,
+#   float16, float32}, {1-16, 17-64}), route triton (<= 0.90 x F0 at 1-16,
+#   0.95 x at 17-64), the five tables of plan 4.4.1.
+# - rows-mosaic-decode, rows-mosaic-prefill: _ALLOW_LIST (jax, cuda-sm89,
+#   {bfloat16, float16}, every bucket), route mosaic_gpu (<= 0.90 x
+#   min(F0, F1, F3) at 1-16, 0.95 x elsewhere), and n5 on JAX 0.12.0.
+# - rows-mosaic-logits: _LOOKUP_ALLOW_LIST (jax, cuda-sm89, {bfloat16,
+#   float16}, {1-16, 17-64}), route mosaic_gpu.
+# - rows-n5-jax-ci: n5 on JAX 0.10.2 (jax, cuda-sm89, {bfloat16, float16,
+#   float32}, every bucket). A JAX row carries n5 only where it passes on
+#   both JAX venvs (the key holds no version).
+# - rows-n5-jax-new-f32: n5 on JAX 0.12.0 in float32 (Mosaic GPU has no
+#   float32 form).
+# - rows-n5-tf: (tensorflow, gpu, {bfloat16, float16, float32}, every
+#   bucket). The TF device class is "gpu" for every card, so a TF row
+#   needs a pass on sm_89 (S1), sm_90 (S3) and sm_86 (S4).
+# - nsys-triton, nsys-mosaic: the device time per layer (chain_split.py
+#   report) of the reference, N5 or F3, and the kernel at int4 g128
+#   4096x4096, M 1 and 2048: the check that a stream time measures the
+#   GPU. They decide nothing.
+# Format: SESSION.md, "Session files". Stage order is priority order. Not
+# a loop session.
+session S1
+venvs jax-ci jax-new jax-floor torch tf
+install_timeout 12
+global_timeout 120
+deadline 144
+grace_s 300
+# The L2 of the RTX 4090 (72 MB). rows.py builds chains of at least 4x it.
+l2_mb 72
+
+check env-jax-ci env jax-ci any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-new env jax-new any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-jax-floor env jax-floor any 3 python -c "import jax, os; d = jax.devices(); print(jax.__version__, d); assert os.environ['KMODE'] == 'cpu' or d[0].platform == 'gpu'"
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check env-tf env tf any 3 python -c "import os, tensorflow as tf; g = tf.config.list_physical_devices('GPU'); print(tf.__version__, g); assert os.environ['KMODE'] == 'cpu' or g"
+
+# --- Correctness (G1-G8 of the kernels). A failure prints KFAIL <route>
+# and skips the rows of that route. `-rf --tb=line` keeps one line per
+# failure, and `-p no:logging` keeps the torch.compile DEBUG lines out of
+# the 200-line log tail. ---
+# Triton K1 and Triton K-packed: the whole modules under "require", as in
+# the GPU require step (V2a: 130 and 100 tests).
+check triton-k1 triton torch gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py
+check triton-logits triton-logits torch gpu 6 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py
+# Mosaic GPU K1 (24 tests) and Mosaic GPU K-packed (32 tests): GPUTest
+# under "require" on JAX 0.12.0 and 0.11.2 (MOSAIC_GPU_TESTED_JAX). A
+# failure writes the error maps of SESSION.md section 3.3.
+check mosaic-k1 mosaic jax-new gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-k1-floor mosaic-floor jax-floor gpu 10 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest"
+check mosaic-logits mosaic-logits jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+check mosaic-logits-floor mosaic-logits-floor jax-floor gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "GPUTest"
+# CPU stand-ins for the dry run: the test modules import in their venvs.
+check triton-k1-cpu triton torch cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py -k "test_config_table or test_fit_config or test_gate"
+check triton-logits-cpu triton-logits torch cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py -k "test_gate"
+check mosaic-cpu mosaic jax-new cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "ConfigTest or GateTest"
+check mosaic-logits-cpu mosaic-logits jax-new cpu 5 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_logits_test.py -k "ConfigTest or GateTest"
+
+# --- The rows: Triton K1 and Triton K-packed (P8b). ---
+prof rows-triton-decode triton torch any 14 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,gptq_act,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096,4096x14336,8192x8192,2304x9216,2304x2304 --m=1,16 --l2_mb=$KL2_MB
+prof rows-triton-prefill triton torch any 10 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,gptq_act,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof rows-triton-logits triton-logits torch any 8 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --level=logits --timing=stream,graph --modes=int4_g128,int4_pc --dtypes=bfloat16,float16,float32 --logits_shapes=gemma2-2b,gemma3-1b,llama3.2-1b,llama3-8b,mistral-7b-v0.3 --logits_m=1,16,64 --l2_mb=$KL2_MB
+
+# --- The rows: Mosaic GPU K1 and Mosaic GPU K-packed (P12b), with N5 on
+# JAX 0.12.0. ---
+prof rows-mosaic-decode mosaic jax-new any 18 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336,8192x8192,2304x9216,2304x2304 --m=1,16 --l2_mb=$KL2_MB
+prof rows-mosaic-prefill mosaic jax-new any 10 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof rows-mosaic-logits mosaic-logits jax-new any 10 python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --level=logits --modes=int4_g128,int4_pc --dtypes=bfloat16,float16 --logits_shapes=gemma2-2b,gemma3-1b,llama3.2-1b,llama3-8b,mistral-7b-v0.3 --logits_m=1,16,64 --l2_mb=$KL2_MB
+
+# --- The N5 rows on NVIDIA (P8b): JAX 0.10.2, JAX 0.12.0 in float32, and
+# TF eager. Route `base`: rows.py applies G1, G2, G4 and G5 to N5 in each
+# cell, and the require suites of S1r run kernels_test.py. ---
+prof rows-n5-jax-ci base jax-ci any 12 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=float,F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096,4096x14336 --m=1,16,64,256,2048 --l2_mb=$KL2_MB
+prof rows-n5-jax-new-f32 base jax-new any 6 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=float,F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096,14336x4096,4096x14336 --m=1,16,64,256,2048 --l2_mb=$KL2_MB
+prof rows-n5-tf base tf any 12 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16,float32 --shapes=4096x4096,14336x4096 --m=1,16,64,256,2048 --l2_mb=$KL2_MB
+
+# --- nsys: the device time per layer at two cells (decides nothing; cut
+# first). One candidate per process; rows.py sleeps 2 ms before each
+# timed call, so chain_split.py report finds one burst per call. ---
+check prof-nsys nsys torch gpu 5 $PROF probe --install --require nsys
+prof nsys-triton triton+nsys torch gpu 6 NSYS=$(python -c "from benchmarks.quantized_matmul.pod.prof import find_tool; print(find_tool('nsys'))"); rc=0; for run in F0:1 n5:1 triton:1 F0:2048 n5:2048 triton:2048; do IFS=: read -r cand m <<< "$run"; t="$KSTAGE_OUT/int4_g128-4096x4096-m$m-$cand"; echo "$(date -u +%H:%M:%S) run $run"; "$NSYS" profile --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o "$t" python -m benchmarks.quantized_matmul.pod.rows run --route=triton --candidates=$cand --gap_ms=2 --modes=int4_g128 --dtypes=bfloat16 --shapes=4096x4096 --m=$m --warmup=3 --calls=20 --l2_mb=$KL2_MB --out="$t.jsonl" > "$t.log" 2>&1 && "$NSYS" export --type=sqlite --force-overwrite=true -o "$t.sqlite" "$t.nsys-rep" > /dev/null 2>&1 && python benchmarks/quantized_matmul/pod/chain_split.py report "$t.sqlite" --meta="$t.jsonl" --calls=20 > "$t.split.json" || { echo "run $run failed"; rc=1; }; rm -f "$t.nsys-rep" "$t.sqlite"; done; bash -c 'exit $0' $rc
+prof nsys-mosaic mosaic+nsys jax-new gpu 6 NSYS=$(python -c "from benchmarks.quantized_matmul.pod.prof import find_tool; print(find_tool('nsys'))"); rc=0; for run in F0:1 F3:1 mosaic_gpu:1 F0:2048 F3:2048 mosaic_gpu:2048; do IFS=: read -r cand m <<< "$run"; t="$KSTAGE_OUT/int4_g128-4096x4096-m$m-$cand"; echo "$(date -u +%H:%M:%S) run $run"; "$NSYS" profile --trace=cuda --sample=none --cpuctxsw=none --cuda-graph-trace=node --force-overwrite=true -o "$t" python -m benchmarks.quantized_matmul.pod.rows run --route=mosaic_gpu --candidates=$cand --gap_ms=2 --modes=int4_g128 --dtypes=bfloat16 --shapes=4096x4096 --m=$m --warmup=3 --calls=20 --l2_mb=$KL2_MB --out="$t.jsonl" > "$t.log" 2>&1 && "$NSYS" export --type=sqlite --force-overwrite=true -o "$t.sqlite" "$t.nsys-rep" > /dev/null 2>&1 && python benchmarks/quantized_matmul/pod/chain_split.py report "$t.sqlite" --meta="$t.jsonl" --calls=20 > "$t.split.json" || { echo "run $run failed"; rc=1; }; rm -f "$t.nsys-rep" "$t.sqlite"; done; bash -c 'exit $0' $rc

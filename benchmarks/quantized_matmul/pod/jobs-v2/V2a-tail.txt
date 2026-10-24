@@ -1,0 +1,30 @@
+# V2a job 6 (the last; cut it first when the budget is short): the 8.9
+# Mosaic GPU rows of the M buckets 65-256 and 257+ on the Variant A
+# kernel (Q5), then the F0 barrier probe (Q6, optional). SESSION.md
+# section 8 (V2). Card: the V2a pod (RTX 4090).
+# Commit: fork branch kbench-v2-41 = code bb5205253 + the torch
+# custom-gradient device fix 8759b67e7 (cherry-pick) + the pod files.
+# tune.py calls the kernel directly, and the kernel of 41 is the kernel
+# of 37 (Variant A).
+# Push (from quant-tooling/kernels/pod/):
+#   ./push_job.sh --done <last id> <RUN_ID> kbench-v2-41 jobs-v2/V2a-tail.txt 12
+# Expected time: about 8 min on a normal host (smoke 0.5, q5 6, q6 1.5).
+#
+# - q5-rows-prefill: tune.py as T2a ran it (the sweep, then the
+#   confirmation pass: the 5 fastest table rows and the shipped row,
+#   interleaved, 30 samples each), at M 256 (bucket 65-256) and 2048
+#   (257+), bfloat16, the full prefill grid, int4 g128 and per channel
+#   at 4096x4096 and 14336x4096. The shipped rows (32,32,2,1024) and
+#   (32,32,2,1) are the default rows of the slices. The `table` KPROF
+#   lines give table_row and vs_default of each bucket.
+# - q6-refbarrier: refbarrier.py. An 8-layer F0 chain (the reference
+#   path under the policy "off"), bfloat16 at 1024x1024 and 4096x4096
+#   and float32 at 1024x1024 (the red-team case), M = 1: temp_bytes and
+#   the times without and with an optimization barrier over the inputs
+#   and the weight tensors. Route `base`: F0 is a baseline, so the stage
+#   needs no check.
+
+check mosaic-smoke mosaic jax-new gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/jax/ops/quantized_test.py -k "GPUTest and test_exact_data_decode_int4_bfloat16"
+
+prof q5-rows-prefill mosaic jax-new any 10 python -m benchmarks.quantized_matmul.pod.tune --kernel=mosaic --dtypes=bfloat16 --modes=int4_g128,int4_pc --shapes=4096x4096,14336x4096 --m=256,2048 --grid=full --l2_mb=$KL2_MB
+prof q6-refbarrier base jax-new any 5 export PYTHONUNBUFFERED=1; C=""; if [ "$KMODE" = cpu ]; then C="--shapes=256x512 --calls=5 --warmup=2"; fi; rc=0; python -m benchmarks.quantized_matmul.pod.refbarrier --modes=int4_g128,int4_pc --shapes=1024x1024,4096x4096 --layers=8 --m=1 --dtype=bfloat16 --out="$KSTAGE_OUT/refbarrier.jsonl" $C || rc=1; python -m benchmarks.quantized_matmul.pod.refbarrier --modes=int4_g128,int4_pc --shapes=1024x1024 --layers=8 --m=1 --dtype=float32 --out="$KSTAGE_OUT/refbarrier.jsonl" $C || rc=1; bash -c 'exit $0' $rc

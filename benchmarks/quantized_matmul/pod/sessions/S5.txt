@@ -1,0 +1,14 @@
+# S5: retired on 2026-10-23 (merged into S1). Do not run it.
+# S5 was the final sm_89 session on frozen code: the final numbers of the
+# four GPU kernels and the Mosaic GPU correctness on JAX 0.11.2 and 0.12.0
+# for MOSAIC_GPU_TESTED_JAX. The row session S1 now runs on the frozen
+# stack tip 41 with both JAX venvs, so S1 gives both (S1.txt; SESSION.md
+# section 8). The old stage list is in the fork commit f672d28ab
+# (benchmarks/quantized_matmul/pod/sessions/S5.txt).
+session S5
+venvs jax-new
+install_timeout 1
+global_timeout 1
+deadline 10
+grace_s 300
+l2_mb 72

@@ -1,0 +1,77 @@
+# S6: x86 CPU, the N5 rows of torch, TF and JAX on x86 for P8b (plan_v3.md
+# 5.4, 8.3, 8.4 and 9; SESSION.md section 8, the row sessions). The
+# header line `kmode cpu` makes pod_env.py set KMODE=cpu: CPU wheels of
+# JAX, torch and TF; the "cpu" and "any" stages run.
+# Measurement commit: as S1 (fork branch kbench-rows).
+# Pod: RunPod CPU pod, cpu3c, 8 vCPU, $0.24/h (0.03 per vCPU-hour, 16 GB
+# RAM), 20 GB disk.
+# Budget 0.75 h (SESSION.md section 8: 0.5 h; JAX on CPU and three
+# dtypes add stages). Session deadline 68 min. Margin cost: 1.5 x 0.75 h
+# x ($0.24 + $0.003 for the 20 GB disk) = $0.27.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 53
+# min, KHARD_UNTIL 58 min. Installs of the CPU wheels about 3-5 min.
+# Expected stage times: the N5 checks 3 min; the float32 stages 3 x 3
+# min; the bfloat16 and float16 stages 3 + 3 min each when the CPU has a
+# fast bfloat16 GEMM, and up to their limits when it has none (on the
+# M1 Pro of this Mac, torch takes 6.3 s for 8 bfloat16 layers of 4096 x
+# 4096 at M = 16 in the reference path); JAX 0.10.2 2 min. In total
+# about 30 min, at most about 47 min. The stage deadline cuts the last
+# stages first.
+#
+# Rows (rows.py, route n5: <= 0.90 x the reference path F0, with G1, G2,
+# G4 and G5; stream timing, which is one call after the other on a CPU).
+# No float candidate (the rule does not read it). The chain has 8 layers
+# (l2_mb 0). M per bucket: 1 and 16 (1-16), 64 (17-64), 256 (65-256); no
+# 257+ row (a float32 M = 2048 call at 4096 x 14336 takes about 1 s on 8
+# vCPU).
+# - rows-*-f32, rows-*-f32-mid: _ALLOW_LIST (torch | tensorflow | jax, cpu-x86_64,
+#   float32, {1-16, 17-64, 65-256}): 3 shapes at 1-16, 4096x4096 at 64
+#   and 256.
+# - rows-*-bf16: the same keys in bfloat16, at 1-16 (2 shapes) and 17-64.
+# - rows-*-f16: float16 at 1-16 (4096x4096).
+# - rows-n5-jax-ci: JAX 0.10.2 at 1-16 in float32 and bfloat16. Plan 3.4
+#   keeps XLA CPU on the reference path (F3 at 0.74x and 0.38x of today
+#   at M 1 and 16 on this Mac); the JAX stages check it on x86 with the
+#   barrier of 20f2add2c. A JAX row needs a pass on both venvs.
+# TF serves only eager calls on CPU (gate 5).
+# Format: SESSION.md, "Session files". Stage order is priority order. Not
+# a loop session.
+session S6
+venvs jax-ci jax-new torch tf
+install_timeout 10
+global_timeout 48
+deadline 68
+grace_s 300
+kmode cpu
+l2_mb 0
+
+check env-jax-ci env jax-ci any 3 python -c "import jax; print(jax.__version__, jax.devices())"
+check env-jax-new env jax-new any 3 python -c "import jax; print(jax.__version__, jax.devices())"
+check env-torch env torch any 3 python -c "import torch; print(torch.__version__, torch.get_num_threads())"
+check env-tf env tf any 3 python -c "import tensorflow as tf; print(tf.__version__, tf.config.list_physical_devices())"
+
+# N5 correctness on each backend: N5Test and GroupIndexTest of
+# kernels_test.py (N5 through `force_route("n5")`, G1-G5, the group
+# guard). This Mac: 12 s (torch), 33 s (TF), 119 s (JAX).
+check n5-tests-torch n5 torch any 6 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/quantizers/kernels_test.py -k "N5Test or GroupIndexTest"
+check n5-tests-tf n5-tf tf any 6 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/quantizers/kernels_test.py -k "N5Test or GroupIndexTest"
+check n5-tests-jax n5-jax jax-new any 6 python -m pytest -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/quantizers/kernels_test.py -k "N5Test or GroupIndexTest"
+
+# float32: 3 samples of 3 calls; M 1 and 16 on three shapes, then M 64
+# and 256 on 4096x4096 (`-mid`).
+prof rows-n5-torch-f32 n5 torch any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096,4096x14336,2304x9216 --m=1,16 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-torch-f32-mid n5 torch any 3 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096 --m=64,256 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-tf-f32 n5-tf tf any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096,4096x14336,2304x9216 --m=1,16 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-tf-f32-mid n5-tf tf any 3 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096 --m=64,256 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-jax-f32 n5-jax jax-new any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096,4096x14336,2304x9216 --m=1,16 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-jax-f32-mid n5-jax jax-new any 3 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32 --shapes=4096x4096 --m=64,256 --warmup=2 --samples=3 --calls=3 --copy_mb=256 --l2_mb=$KL2_MB
+# bfloat16 and float16: 2 samples of 2 calls (a CPU with no fast bfloat16
+# GEMM makes the reference path slow). A stage that reaches its limit
+# writes its verdicts; an incomplete row is not decided.
+prof rows-n5-torch-bf16 n5 torch any 6 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,2304x9216 --m=1,16,64 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-tf-bf16 n5-tf tf any 6 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,2304x9216 --m=1,16,64 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-jax-bf16 n5-jax jax-new any 5 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16 --shapes=4096x4096,2304x9216 --m=1,16,64 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-torch-f16 n5 torch any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float16 --shapes=4096x4096 --m=1,16 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-tf-f16 n5-tf tf any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float16 --shapes=4096x4096 --m=1,16 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-jax-f16 n5-jax jax-new any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float16 --shapes=4096x4096 --m=1,16 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
+prof rows-n5-jax-ci n5-jax jax-ci any 4 python -m benchmarks.quantized_matmul.pod.rows run --route=n5 --candidates=F0,n5 --modes=int4_g128,int4_pc,gptq,awq --dtypes=float32,bfloat16 --shapes=4096x4096 --m=1,16 --warmup=1 --samples=2 --calls=2 --copy_mb=256 --l2_mb=$KL2_MB
