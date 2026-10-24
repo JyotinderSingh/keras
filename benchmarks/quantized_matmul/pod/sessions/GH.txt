@@ -1,0 +1,47 @@
+# GH: sm_89 (RTX 4090), run gh-20261024-1. Not a loop session: the
+# stages run once, then KDONE.
+# The GPU run of the CUDA-graph capture fix (cuda_graph.py; the cause is
+# in logs/sx-20261024-1/REPORT.md). The fork branch kbench-gh = the new
+# quantization-43-mosaic-gpu-rows head c0762c1b5 (bench.py with the
+# same capture) + the cherry-pick of fix-torch-quantizer-host-scalars
+# (6b8fc4cb6; the two test-file conflicts resolved as in kbench-sx-b2)
+# + one fork-only commit with the pod files of this folder.
+# - gt-triton-prefill: the full stage of S1r-hs.txt, with the same
+#   command. On the tip before the fix it stopped in cell 17 (SX job 1)
+#   with a CUDA launch failure. Here it must measure all 72 cells with
+#   no crash, and each first graph replay must give the bits of an eager
+#   call (rows.py: graph_same_as_eager; rows_summary.json: graph_differs
+#   empty; exit 1 when a replay differs).
+# - gt-f16-decode: the 8 float16 2304x2304 cells that the stage limit of
+#   S1r gt-triton-decode left out, with the flags of that stage.
+# - gt-f16-prefill-rest: the 17 float16 cells that the S1r prefill crash
+#   left out (gptq 14336x4096 M 256 and 2048, awq 14336x4096, all of
+#   4096x14336), as one grid of 24 cells. It runs only when
+#   gt-triton-prefill did not finish (no rows_summary.json, or a stop at
+#   the stage deadline); else it prints one line.
+# The graph medians give the GPU time (S1r: they match the nsys device
+# times). The rule of rows.py on the graph medians gives the GPU-time
+# verdicts on this Mac.
+# Card: RTX 4090 community $0.34/h if it has stock, else secure $0.89/h.
+# Budget 0.6 h. Session deadline 54 min (1.5 x budget). Margin cost at
+# the secure price: 1.5 x 0.6 h x ($0.89 + $0.011) = $0.81.
+# Times from the create (pod_env.py): KSTART_BY 15 min, KSTAGES_UNTIL 39
+# min, KHARD_UNTIL 44 min. global_timeout 28: boot and install about 2.5
+# min + 28 + the reads and the delete 2 = 32.5 min of the 36.
+# Expected: checks 1.5 min; gt-triton-prefill 10 (S1r: 500 s for 55
+# cells); gt-f16-decode 1.5; gt-f16-prefill-rest 0 (4 when it runs).
+# Format: SESSION.md, "Session files".
+session GH
+venvs torch
+install_timeout 8
+global_timeout 28
+deadline 54
+grace_s 300
+l2_mb 72
+
+check env-torch env torch any 3 python -c "import os, torch, triton; print(torch.__version__, triton.__version__, torch.cuda.is_available()); assert os.environ['KMODE'] == 'cpu' or torch.cuda.is_available()"
+check host-data host-data torch any 5 PYTHONPATH=. python -m pytest -q -rf --tb=short -p no:cacheprovider -p no:logging keras/src/quantizers/quantizers_test.py -k HostDataTest
+check triton-smoke triton torch gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py -k "W4A16MatmulTest and test_matches_the_oracle_int4_g128_dense_decode_bfloat16"
+prof gt-triton-prefill triton torch any 15 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof gt-f16-decode triton torch any 5 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=float16 --shapes=2304x2304 --m=1,16 --l2_mb=$KL2_MB
+prof gt-f16-prefill-rest triton torch any 6 grep -qs '"stopped": null' $KOUT/stages/gt-triton-prefill/rows_summary.json && echo "gt-triton-prefill finished: no cell left" || python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=float16 --shapes=14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB

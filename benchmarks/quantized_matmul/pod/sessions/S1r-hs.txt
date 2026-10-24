@@ -1,0 +1,35 @@
+# S1r job 1 (run s1r-20261023-2): the GPU-time half of the torch sm_89
+# rows of 42 (P8b). Fork branch kbench-s1r-hs = kbench-s1r (the new
+# quantization-43-mosaic-gpu-rows head + the pod files) + the cherry-pick
+# of fix-torch-quantizer-host-scalars (6b8fc4cb6): no per-call host copy
+# in the quantizer helpers, so the reference path F0 and grouped N5 can
+# be captured in a CUDA graph.
+# The S1 rows stages decided the torch rows on eager stream times only:
+# F0 did not capture (S1: 342 F0 and 108 N5 graph records failed with
+# "Cannot copy between CPU and CUDA tensors during CUDA graph capture").
+# Here rows.py runs the cells and the flags of the S1 stages
+# rows-triton-prefill, rows-triton-decode and rows-triton-logits, with
+# the dtypes and modes of the rows (bfloat16 and float16; int4_g128,
+# int4_pc, gptq and awq; no float32 row, and gptq_act decides nothing).
+# --timing=stream,graph: each candidate gets a stream record (the rule of
+# rows.py) and a graph record (CUDA graph replays: the GPU time). The
+# graph verdicts come from the records on this Mac (the rule of rows.py
+# on the graph medians). A graph record with "skipped" names a candidate
+# that does not capture.
+# Order: prefill first (the 65-256 and 257+ rows have no GPU time against
+# F0), then decode, then logits. Push with a timeout of at most 30 min and
+# at most the budget left (SESSION.md section 10.4); the timeout cuts the
+# last stage first.
+# Expected on a normal host: the checks 1 min; prefill 8, decode 7,
+# logits 6 min (S1: 566, 664 and 414 s with float32 and gptq_act too).
+# - host-data: HostDataTest of the cherry-picked fix (no host data in the
+#   unpack, the activation quantizer and the float8 step; on CUDA also no
+#   CPU tensor). Mode any: on a CPU it checks the lift_fresh ops.
+# - triton-smoke, triton-logits-smoke: one test of each Triton module
+#   under "require" (the route gate of the prof stages).
+check host-data host-data torch any 5 PYTHONPATH=. python -m pytest -q -rf --tb=short -p no:cacheprovider -p no:logging keras/src/quantizers/quantizers_test.py -k HostDataTest
+check triton-smoke triton torch gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_matmul_test.py -k "W4A16MatmulTest and test_matches_the_oracle_int4_g128_dense_decode_bfloat16"
+check triton-logits-smoke triton-logits torch gpu 5 PYTHONPATH=. python .github/workflows/scripts/pytest_require_kernels.py -q -rf --tb=line -p no:cacheprovider -p no:logging keras/src/backend/torch/ops/quantized_logits_test.py -k "TritonLogitsRouteTest and test_require_runs_the_kernel_on_cuda"
+prof gt-triton-prefill triton torch any 11 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336 --m=64,256,2048 --l2_mb=$KL2_MB
+prof gt-triton-decode triton torch any 10 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --modes=int4_g128,int4_pc,gptq,awq --dtypes=bfloat16,float16 --shapes=4096x4096,14336x4096,4096x14336,8192x8192,2304x9216,2304x2304 --m=1,16 --l2_mb=$KL2_MB
+prof gt-triton-logits triton-logits torch any 9 python -m benchmarks.quantized_matmul.pod.rows run --route=triton --timing=stream,graph --level=logits --modes=int4_g128,int4_pc --dtypes=bfloat16,float16 --logits_shapes=gemma2-2b,gemma3-1b,llama3.2-1b,llama3-8b,mistral-7b-v0.3 --logits_m=1,16,64 --l2_mb=$KL2_MB
