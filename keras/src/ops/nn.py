@@ -2058,6 +2058,137 @@ def binary_crossentropy(target, output, from_logits=False):
     )
 
 
+# Cross-entropy from logits without "softmax collapse" or "softmax
+# cancellation" (Barron, 2026). The usual form computes the gradient as
+# `softmax(z) - target`. Once the top logit leads the others by about
+# `-log(eps)`, its softmax rounds to exactly 1: the top logit gets a zero
+# gradient while the other logits keep small nonzero gradients, and Adam
+# amplifies those. The functions below compute the top entry from the logit
+# margin with `softplus`, and give gradients that sum to zero.
+
+
+def _margin_log_softmax(x):
+    """`log_softmax` over the last axis that keeps the top entry accurate."""
+    np_ = backend.ops.numpy
+    num_classes = backend.ops.core.shape(x)[-1]
+    i_max = np_.argmax(x, axis=-1, keepdims=True)
+    x_max = np_.take_along_axis(x, i_max, axis=-1)
+    is_max = np_.equal(np_.arange(num_classes), i_max)
+    # An exact 0 at the top entry, so it does not cancel against itself.
+    shifted = np_.where(is_max, 0.0, np_.subtract(x, x_max))
+    others = np_.where(is_max, float("-inf"), shifted)
+    margin = -backend.ops.math.logsumexp(others, axis=-1, keepdims=True)
+    return np_.subtract(shifted, backend.ops.nn.softplus(-margin))
+
+
+def _margin_categorical_crossentropy(target, output, axis=-1):
+    np_ = backend.ops.numpy
+    target = backend.ops.core.convert_to_tensor(target)
+    output = backend.ops.core.convert_to_tensor(output)
+    if len(target.shape) != len(output.shape) or any(
+        t is not None and o is not None and t != o
+        for t, o in zip(target.shape, output.shape)
+    ):
+        raise ValueError(
+            "Arguments `target` and `output` must have the same shape. "
+            "Received: "
+            f"target.shape={target.shape}, output.shape={output.shape}"
+        )
+    if len(target.shape) < 1:
+        raise ValueError(
+            "Arguments `target` and `output` must be at least rank 1. "
+            "Received: "
+            f"target.shape={target.shape}, output.shape={output.shape}"
+        )
+    if axis not in (-1, len(output.shape) - 1):
+        target = np_.moveaxis(target, axis, -1)
+        output = np_.moveaxis(output, axis, -1)
+    if not backend.is_float_dtype(target.dtype):
+        target = backend.ops.core.cast(target, output.dtype)
+    return _projected_crossentropy(target, output)
+
+
+def _projected_crossentropy(target, output):
+    """Cross-entropy over the last axis of logits `output`."""
+    np_ = backend.ops.numpy
+    sg = backend.ops.core.stop_gradient
+    log_q = _margin_log_softmax(output)
+    q = np_.exp(log_q)
+    # The exact gradient `q * sum(target) - target` sums to zero. Removing
+    # the rounded sum along `q` restores the top logit's gradient when `q`
+    # rounds to 1 there, and keeps the usual accuracy everywhere else.
+    u = q * np_.sum(target, axis=-1, keepdims=True) - target
+    g = sg(u - q * np_.sum(u, axis=-1, keepdims=True))
+    # `where` keeps logits masked with -inf from turning `0 * -inf` into NaN.
+    loss = -np_.sum(np_.where(target == 0, 0.0, target * sg(log_q)), axis=-1)
+    # Adds 0 to the loss and `g` to its gradient with respect to `output`.
+    linear = np_.where(g == 0, 0.0, g * (output - sg(output)))
+    return loss + np_.sum(linear, axis=-1)
+
+
+def _margin_sparse_categorical_crossentropy(target, output, axis=-1):
+    np_ = backend.ops.numpy
+    target = backend.ops.core.convert_to_tensor(target, dtype="int32")
+    output = backend.ops.core.convert_to_tensor(output)
+    if len(target.shape) == len(output.shape) and target.shape[-1] == 1:
+        target = np_.squeeze(target, axis=-1)
+    if len(output.shape) < 1:
+        raise ValueError(
+            "Argument `output` must be at least rank 1. "
+            f"Received: output.shape={output.shape}"
+        )
+    if axis not in (-1, len(output.shape) - 1):
+        output = np_.moveaxis(output, axis, -1)
+    if len(target.shape) != len(output.shape) - 1 or any(
+        t is not None and o is not None and t != o
+        for t, o in zip(target.shape, output.shape[:-1])
+    ):
+        raise ValueError(
+            "Arguments `target` and `output` must have the same shape "
+            "up until the last dimension: "
+            f"target.shape={target.shape}, output.shape={output.shape}"
+        )
+    num_classes = backend.ops.core.shape(output)[-1]
+    is_target = np_.equal(
+        np_.arange(num_classes), np_.expand_dims(target, axis=-1)
+    )
+    return _projected_crossentropy(
+        backend.ops.core.cast(is_target, output.dtype), output
+    )
+
+
+def _soft_target_categorical_crossentropy(target_logits, output, axis=-1):
+    """Cross-entropy between `softmax(target_logits)` and `softmax(output)`.
+
+    The gradient with respect to `output` is `softmax(output) -
+    softmax(target_logits)`. It is computed from the logit difference, so it
+    is exactly zero when `output == target_logits`. The usual form subtracts
+    two separately rounded softmaxes and gives nonzero gradients there.
+    """
+    np_ = backend.ops.numpy
+    sg = backend.ops.core.stop_gradient
+    target_logits = backend.ops.core.convert_to_tensor(target_logits)
+    output = backend.ops.core.convert_to_tensor(output)
+    if axis not in (-1, len(output.shape) - 1):
+        target_logits = np_.moveaxis(target_logits, axis, -1)
+        output = np_.moveaxis(output, axis, -1)
+    log_q = _margin_log_softmax(output)
+    q = np_.exp(log_q)
+    p = np_.exp(_margin_log_softmax(target_logits))
+    delta = sg(np_.subtract(output, target_logits))
+    # Center the difference under `p`.
+    d = delta - np_.sum(p * delta, axis=-1, keepdims=True)
+    # `s = log(q / p)`.
+    s = d - np_.log1p(np_.sum(p * np_.expm1(d), axis=-1, keepdims=True))
+    # `u = q - p`, accurate when `q` is close to `p`.
+    u = np_.where(np_.abs(s) < 1, p * np_.expm1(s), q - p)
+    # Make the gradients sum to zero.
+    g = u - q * np_.sum(u, axis=-1, keepdims=True)
+    loss = -np_.sum(p * sg(log_q), axis=-1)
+    # Adds 0 to the loss and `g` to its gradient with respect to `output`.
+    return loss + np_.sum(sg(g) * (output - sg(output)), axis=-1)
+
+
 class CategoricalCrossentropy(Operation):
     def __init__(self, from_logits=False, axis=-1, *, name=None):
         super().__init__(name=name)
@@ -2065,6 +2196,8 @@ class CategoricalCrossentropy(Operation):
         self.axis = axis
 
     def call(self, target, output):
+        if self.from_logits:
+            return _margin_categorical_crossentropy(target, output, self.axis)
         return backend.ops.nn.categorical_crossentropy(
             target, output, from_logits=self.from_logits, axis=self.axis
         )
@@ -2140,6 +2273,8 @@ def categorical_crossentropy(target, output, from_logits=False, axis=-1):
         return CategoricalCrossentropy(
             from_logits=from_logits, axis=axis
         ).symbolic_call(target, output)
+    if from_logits:
+        return _margin_categorical_crossentropy(target, output, axis)
     return backend.ops.nn.categorical_crossentropy(
         target, output, from_logits=from_logits, axis=axis
     )
@@ -2152,6 +2287,10 @@ class SparseCategoricalCrossentropy(Operation):
         self.axis = axis
 
     def call(self, target, output):
+        if self.from_logits:
+            return _margin_sparse_categorical_crossentropy(
+                target, output, self.axis
+            )
         return backend.ops.nn.sparse_categorical_crossentropy(
             target, output, from_logits=self.from_logits, axis=self.axis
         )
@@ -2229,6 +2368,8 @@ def sparse_categorical_crossentropy(target, output, from_logits=False, axis=-1):
         return SparseCategoricalCrossentropy(
             from_logits=from_logits, axis=axis
         ).symbolic_call(target, output)
+    if from_logits:
+        return _margin_sparse_categorical_crossentropy(target, output, axis)
     return backend.ops.nn.sparse_categorical_crossentropy(
         target, output, from_logits=from_logits, axis=axis
     )
