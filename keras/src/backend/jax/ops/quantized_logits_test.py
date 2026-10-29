@@ -33,6 +33,7 @@ from keras.src import ops
 from keras.src import testing
 from keras.src.backend.common import AutocastScope
 from keras.src.backend.jax.ops import quantized
+from keras.src.backend.jax.ops.quantized_test_utils import kernel_record
 from keras.src.backend.jax.ops.quantized_test_utils import mosaic_gpu_lowering
 from keras.src.backend.jax.ops.quantized_test_utils import mosaic_gpu_routes
 from keras.src.quantizers import kernels
@@ -698,7 +699,7 @@ class GateTest(testing.TestCase):
         class and a compute dtype that the kernel supports, and
         `MOSAIC_GPU_LOGITS_CONFIGS` has a row for its compute capability,
         compute dtype and M bucket."""
-        (kernel,) = quantized.KERNELS
+        kernel = kernel_record("mosaic_gpu")
         rows = [
             key
             for key, routes in kernels._MEASURED_LOGITS_ROWS.items()
@@ -740,7 +741,7 @@ class GateTest(testing.TestCase):
         """The shape check of the logits: blocks of 128 columns of `V`,
         then the alignment of the matmul for `K = D` and `N = V`. The
         device check is separate (`supports_device`)."""
-        (kernel,) = quantized.KERNELS
+        kernel = kernel_record("mosaic_gpu")
         available = kernel.logits_available("cuda-sm89", 3, d, v, group, "")
         self.assertEqual(available, expected)
 
